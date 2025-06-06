@@ -1,3 +1,24 @@
+import tensorflow as tf
+import tensorflow.keras as keras
+import tensorflow_probability as tfp
+tfb = tfp.bijectors
+from tensorflow_probability.python import math as tfp_math
+from tensorflow_probability.python.internal import prefer_static
+import sonnet as snt
+import numpy as np
+import astropy.io.fits as fits
+import scipy
+import time
+import json
+from tqdm.auto import tqdm
+
+physical_devices = tf.config.list_physical_devices('GPU')
+try:
+    for device in physical_devices:
+        tf.config.experimental.set_memory_growth(device, True)
+except:
+    # Invalid device or cannot modify virtual devices once initialized.
+    pass
 
 class CatMLP(snt.Module):
     """
