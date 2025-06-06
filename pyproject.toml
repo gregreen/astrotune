@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+#requires = ["hatchling"]
+#build-backend = "hatchling.build"
+
+[project]
+name = "astrotune"
+version = "1.0.0"
+dependencies = [
+  "scipy",
+  "numpy",
+  "matplotlib",
+  "astropy",
+  "dill",
+  "tensorflow",
+]
+requires-python = ">=3.9"
+#requires-python = ">=3.11"
+authors = [
+  {name = "Gregory M. Green", email = "gregorymgreen@gmail.com"},
+]
+maintainers = [
+  {name = "Gregory M. Green", email = "gregorymgreen@gmail.com"},
+]
+description = "Harmonize stellar parameters"
+readme = "README.rst"
+license = {file = "LICENSE"}
+keywords = ["spectroscopy", "abundances", "calibration"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python"
+]
+
+[project.optional-dependencies]
+gui = ["PyQt5"]
+cli = [
+  "rich",
+  "click",
+]
+
+[project.urls]
+#Homepage = "https://example.com"
+Documentation = "https://readthedocs.org"
+Repository = "https://github.com/gregreen/astrotune"
+#Issues = "https://github.com/gregreen/astrotune/issues"
+#Changelog = "https://github.com/me/spam/blob/master/CHANGELOG.md"
