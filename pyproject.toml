@@ -14,6 +14,10 @@ dependencies = [
   "astropy",
   "dill",
   "tensorflow",
+  "tensorflow_probability",
+  "tf_keras",
+  "graphs",
+  "dm-sonnet",
 ]
 requires-python = ">=3.9"
 #requires-python = ">=3.11"
