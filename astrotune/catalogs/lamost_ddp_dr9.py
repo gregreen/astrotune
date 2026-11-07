@@ -9,8 +9,9 @@ Zenodo: https://zenodo.org/records/15254859
 Notes
 -----
 The catalog has no Gaia identifiers, so a DR3 crossmatch is generated once and
-cached in ``data/interim/lamost_ddp_dr9/`` as the *crossmatch table*
-(``match_idx`` etc.), which is then applied to the catalog.
+the *matched catalog* is cached in ``data/interim/lamost_ddp_dr9/``. Caching
+the matched table rather than the crossmatch table means the 3.4 GB FITS is
+only read on the first run.
 
 A handful of abundances carry the sentinel value -99 without being flagged;
 those flags are set to 98 before the alpha elements are averaged.
@@ -41,7 +42,7 @@ FILENAME = "LMDR9_DDPAYNE_recommend_202505.fits"
 SOURCES = (f"https://zenodo.org/records/15254859/files/{FILENAME}?download=1",)
 HDU = 1
 
-CROSSMATCH_FILE = "crossmatch.h5"
+CACHE_FILE = "crossmatched.h5"
 MAX_SEPARATION = 0.5 * units.arcsec
 
 ID_COL = "gdr3_source_id"
@@ -75,21 +76,24 @@ def total_snr(t: Table) -> np.ndarray:
 
 
 def load(ctx) -> Table:
+    cache = ctx.interim_dir / CACHE_FILE
+    if cache.exists() and not ctx.force:
+        return Table.read(cache)
+
     with fits.open(ctx.raw_dir / FILENAME, mode="readonly") as f:
         catalog = Table(f[HDU].data)
 
-    cache = ctx.interim_dir / CROSSMATCH_FILE
-    if cache.exists() and not ctx.force:
-        crossmatch = Table.read(cache)
-    else:
-        crossmatch = gaia_crossmatch_batched(
-            catalog["RA"], catalog["DEC"], max_separation=MAX_SEPARATION,
-            max_batch_size=1024 * 1024,
-        )
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        crossmatch.write(cache, overwrite=True)
+    crossmatch = gaia_crossmatch_batched(
+        catalog["RA"],
+        catalog["DEC"],
+        max_separation=MAX_SEPARATION,
+        max_batch_size=1024 * 1024,
+    )
+    matched = apply_crossmatch(catalog, crossmatch)
 
-    return apply_crossmatch(catalog, crossmatch)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    matched.write(cache, serialize_metadata=True, overwrite=True)
+    return matched
 
 
 def prepare_columns(t: Table, ctx) -> Table:
