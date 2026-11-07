@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astrotune"
+version = "0.1.0"
+description = "Bringing disparate stellar parameter catalogs into harmony"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy<2.1",
+    "scipy",
+    "astropy",
+    "h5py",
+    "matplotlib",
+    "pandas",
+    "tqdm",
+    "requests",
+    "astroquery",
+    "pyyaml",
+    "seaborn",
+    "distinctipy",
+]
+
+[project.optional-dependencies]
+train = [
+    "tensorflow[and-cuda]==2.18.1",
+    "tf-keras==2.18.0",
+    "tensorflow-probability==0.25.0",
+    "dm-sonnet==2.0.2",
+]
+dev = ["pytest"]
+
+[project.scripts]
+astrotune-prepare = "astrotune.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["astrotune*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

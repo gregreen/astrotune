@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# Astrotune -- files that should never be tracked
+# ---------------------------------------------------------------------------
+
+# Previous git history (kept for reference, not part of this repo)
+.git.old/
+
+# Virtual environments
+.venv/
+venv/
+
+# Data: everything under data/ is either downloaded by scripts or generated
+data/
+
+# Legacy output locations (superseded by data/training/)
+training_data/
+
+# Legacy sources kept on disk only for reference while porting
+merge_coordinates.ipynb
+plot_utils.py
+plot_utils_old.py
+*.bak
+
+# Generated diagnostics, figures, animations, checkpoints
+diagnostic_plots/
+figures/
+frames/
+videos/
+models/
+models_*.tar
+loss_history.json
+*.mp4
+*.mp3
+*.pdf
+*.svg
+
+# Data-bearing file types that may appear outside data/
+*.fits
+*.fits.gz
+*.h5
+*.hdf5
+*.vot
+*.vot.gz
+*.tar
+*.tar.gz
+*.tar.gz.bak*
+*.dat.gz
+*.csv
+*.tsv
+*.npy
+*.npz
+*.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
