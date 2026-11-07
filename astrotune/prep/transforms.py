@@ -55,9 +55,16 @@ PARAM_UNC_TRANSF: tuple[Callable, ...] = (
 
 # --- Array helpers ----------------------------------------------------------
 def unmask(values, fill=np.nan) -> np.ndarray:
-    """Return a plain ndarray, filling masked entries."""
+    """Return a plain ndarray, filling masked entries.
+
+    Integer columns are promoted to float when a NaN fill is requested, since
+    NaN is not representable as an integer.
+    """
     if isinstance(values, (astropy.table.MaskedColumn, np.ma.MaskedArray)):
-        values = values.filled(fill)
+        try:
+            values = values.filled(fill)
+        except (TypeError, ValueError):
+            values = values.astype("f8").filled(fill)
     return np.asarray(values)
 
 

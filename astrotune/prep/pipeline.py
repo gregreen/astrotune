@@ -74,6 +74,13 @@ def build_table(t: Table, mask: np.ndarray, module, ctx: Context) -> Table:
     if hasattr(module, "param_errs"):
         param_errs = module.param_errs(t, ctx)
 
+    # Catalogs may rescale the statistical uncertainties before the floors are
+    # applied (e.g. SLAM's over-estimated Teff errors).
+    if hasattr(module, "unc_transf"):
+        unc_funcs = module.unc_transf(d)
+    else:
+        unc_funcs = transforms.PARAM_UNC_TRANSF[:d]
+
     return transforms.extract_table(
         t,
         module.ID_COL,
@@ -81,9 +88,7 @@ def build_table(t: Table, mask: np.ndarray, module, ctx: Context) -> Table:
         module.UNC_COLS,
         getattr(module, "EXTRA_COLS", ()),
         param_transf=transforms.PARAM_TRANSF[:d],
-        param_unc_transf=transforms.apply_err_floors(
-            transforms.PARAM_UNC_TRANSF[:d], floors[:d]
-        ),
+        param_unc_transf=transforms.apply_err_floors(unc_funcs, floors[:d]),
         param_errs=param_errs,
         mask=mask,
     )
@@ -125,6 +130,8 @@ def prepare(
     )
 
     table = build_table(t, mask, module, ctx)
+    if hasattr(module, "finalize"):
+        table = module.finalize(table, ctx)
 
     problems = io.validate_table(table, key=key, n_params=module.N_PARAMS)
     if problems:
@@ -164,7 +171,10 @@ def _write_diagnostics(t, mask, table, module, ctx: Context, cut_counts: dict) -
 
     written.append(plots.plot_catalog_params(table, ctx.diagnostic_dir))
     written.append(plots.plot_catalog_uncertainties(table, ctx.diagnostic_dir))
-    written.append(plots.plot_kiel(table, ctx.diagnostic_dir))
+    if getattr(module, "HAS_LOGG", True):
+        written.append(plots.plot_kiel(table, ctx.diagnostic_dir))
+    else:
+        written.append(plots.plot_teff_feh(table, ctx.diagnostic_dir))
     written.append(plots.plot_feh_alpha(table, ctx.diagnostic_dir))
     written.append(plots.plot_sky(table, ctx.diagnostic_dir))
 

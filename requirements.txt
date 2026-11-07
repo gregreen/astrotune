@@ -6,6 +6,7 @@ astropy==6.0.1
 h5py==3.14.0
 matplotlib==3.9.4
 pandas==2.3.3
+tables==3.9.2
 tqdm==4.70.1
 requests==2.32.5
 astroquery==0.4.11

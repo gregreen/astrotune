@@ -30,17 +30,17 @@ CATALOGS: Tuple[CatalogSpec, ...] = (
     CatalogSpec("lamost_hotpayne", "LAMOST HotPayne", "astrotune.catalogs.lamost_hotpayne", 4, "lamost_hotpayne.h5"),
     CatalogSpec("galah_dr4", "GALAH (DR4)", "astrotune.catalogs.galah_dr4", 4, "galah_dr4.h5"),
     CatalogSpec("lamost_ddp_dr9", "LAMOST DD-Payne (DR9)", "astrotune.catalogs.lamost_ddp_dr9", 4, "lamost_ddp_dr9.h5"),
-    CatalogSpec("lamost_mstar_ding2022", "LAMOST M-Stars (Ding)", "astrotune.catalogs.lamost_mstar_ding2022", 4, "lamost_mstar_ding2022.h5"),
-    CatalogSpec("vmp_stars_li2022", "VMP (Li)", "astrotune.catalogs.vmp_stars_li2022", 4, "vmp_stars_li2022.h5"),
-    CatalogSpec("lamost_csn_dr10", "LAMOST M-Dwarfs (Zhang)", "astrotune.catalogs.lamost_csn_dr10", 4, "lamost_csn_dr10.h5"),
+    CatalogSpec("lamost_mstar_ding2022", "LAMOST M-Stars (Ding)", "astrotune.catalogs.lamost_mstar_ding2022", 3, "lamost_mstar_ding2022.h5"),
+    CatalogSpec("vmp_stars_li2022", "VMP (Li)", "astrotune.catalogs.vmp_stars_li2022", 3, "vmp_stars_li2022.h5"),
+    CatalogSpec("lamost_csn_dr10", "LAMOST M-Dwarfs (Zhang)", "astrotune.catalogs.lamost_csn_dr10", 3, "lamost_csn_dr10.h5"),
     CatalogSpec("desi_dr1", "DESI (DR1)", "astrotune.catalogs.desi_dr1", 4, "desi_dr1.h5"),
     CatalogSpec("desi_ddp", "DESI (Zhang)", "astrotune.catalogs.desi_ddp", 4, "desi_ddp.h5"),
     CatalogSpec("sdssv_aspcap", "SDSS-V (ASPCAP)", "astrotune.catalogs.sdssv_aspcap", 4, "sdssv_aspcap.h5"),
     CatalogSpec("sdssv_bossnet", "SDSS-V (BOSSNet)", "astrotune.catalogs.sdssv_bossnet", 3, "sdssv_bossnet.h5"),
     CatalogSpec("rave_dr6", "RAVE (DR6)", "astrotune.catalogs.rave_dr6", 4, "rave_dr6.h5"),
-    CatalogSpec("pristine_pigs", "PIGS", "astrotune.catalogs.pristine_pigs", 4, "pristine_pigs.h5"),
-    CatalogSpec("sdssv_slam", "SDSS-V (SLAM)", "astrotune.catalogs.sdssv_slam", 3, "sdssv_slam.h5"),
-    CatalogSpec("sdssv_mdc", "SDSS-V (MDw Cannon)", "astrotune.catalogs.sdssv_mdc", 3, "sdssv_mdc.h5"),
+    CatalogSpec("pristine_pigs", "PIGS", "astrotune.catalogs.pristine_pigs", 3, "pristine_pigs.h5"),
+    CatalogSpec("sdssv_slam", "SDSS-V (SLAM)", "astrotune.catalogs.sdssv_slam", 4, "sdssv_slam.h5"),
+    CatalogSpec("sdssv_mdc", "SDSS-V (MDw Cannon)", "astrotune.catalogs.sdssv_mdc", 4, "sdssv_mdc.h5"),
 )
 
 INDEX = {spec.key: i for i, spec in enumerate(CATALOGS)}

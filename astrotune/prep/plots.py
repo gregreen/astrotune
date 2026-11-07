@@ -298,6 +298,19 @@ def plot_kiel(table, outdir, name="kiel"):
     return save(fig, outdir, name)
 
 
+def plot_teff_feh(table, outdir, name="teff_feh"):
+    """Teff-[Fe/H] plane, for catalogs that do not measure logg."""
+    x = np.asarray(table["x"], dtype="f8")
+    fig, ax = plt.subplots(figsize=(5, 4), layout="constrained")
+    ax.hist2d(x[:, 0], x[:, 1], bins=100, norm=LogNorm(), rasterized=True)
+    ax.invert_xaxis()
+    _set_teff_ticks(ax)
+    ax.set_ylabel(PARAM_LATEX[1])
+    ax.grid(True, alpha=0.2)
+    ax.set_title(f"{len(table):,} stars")
+    return save(fig, outdir, name)
+
+
 def plot_feh_alpha(table, outdir, name="feh_alpha"):
     x = np.asarray(table["x"], dtype="f8")
     if x.shape[1] < 4:
