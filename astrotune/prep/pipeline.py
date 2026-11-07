@@ -203,3 +203,7 @@ def _report_parity(key: str, table: Table) -> None:
     report = io.parity_report(table, reference)
     for line in io.format_parity(report).splitlines():
         log.info("[%s] parity | %s", key, line)
+
+    exempt = getattr(registry.get_module(key), "PARITY_EXEMPT", None)
+    if exempt:
+        log.warning("[%s] deliberate deviation from the legacy table: %s", key, exempt)

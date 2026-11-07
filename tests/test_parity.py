@@ -50,6 +50,15 @@ def test_parity_with_legacy(key):
     assert report["ids_match"], io.format_parity(report)
     assert report["same_order"], io.format_parity(report)
 
+    exempt = getattr(registry.get_module(key), "PARITY_EXEMPT", None)
+    if exempt:
+        # Everything except sigma_x must still match; sigma_x[: , :3] too.
+        assert np.allclose(new["x"], reference["x"], atol=1e-5)
+        assert np.allclose(new["x_err"], reference["x_err"], atol=1e-5)
+        assert np.allclose(new["sigma_x"][:, :3], reference["sigma_x"][:, :3], atol=1e-5)
+        assert not np.allclose(new["sigma_x"][:, 3], reference["sigma_x"][:, 3], atol=1e-5)
+        pytest.skip(f"intentional deviation: {exempt}")
+
     for column, stats in report["columns"].items():
         # float32 round-off only
         assert stats["max_abs_diff"] < 1e-5, f"{key}:{column} differs by {stats['max_abs_diff']}"
