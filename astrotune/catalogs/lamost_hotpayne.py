@@ -47,6 +47,8 @@ X_ERR = (0.05, 0.2, 0.1, 0.5)
 PARITY_EXEMPT = (
     "sigma_x[:, 3] uses e_[alpha/Fe]; the legacy table used [alpha/Fe] by mistake"
 )
+#: Columns of the table that differ from the legacy one, and which parameters.
+PARITY_DIFFERS = {"sigma_x": (3,)}
 
 SNR_MIN = 16.0
 FEH_MIN = -3.95

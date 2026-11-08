@@ -22,3 +22,4 @@ tensorflow[and-cuda]==2.18.1
 tf-keras==2.18.0
 tensorflow-probability==0.25.0
 dm-sonnet==2.0.2
+imageio-ffmpeg

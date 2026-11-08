@@ -30,6 +30,12 @@ TRAINING_DIR = DATA_DIR / "training"
 
 DIAGNOSTIC_DIR = _env_path("ASTROTUNE_DIAGNOSTIC_DIR", PROJECT_ROOT / "diagnostic_plots")
 
+# Training pairs + control points, built from the per-catalog tables
+PAIRS_PATH = DATA_DIR / "pairs_and_ctrl_points.h5"
+
+# Trained models: models/<run-name>/
+MODELS_DIR = PROJECT_ROOT / "models"
+
 # Read-only location of the outputs produced by the original monolithic
 # notebook. Used by the parity checks, never written to.
 LEGACY_TRAINING_DIR = PROJECT_ROOT / "training_data"

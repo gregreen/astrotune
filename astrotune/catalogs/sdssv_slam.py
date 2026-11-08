@@ -37,7 +37,12 @@ PARAM_COLS = ("teff", "fe_h", "logg", "alpha_fe")
 UNC_COLS = ("e_teff", "e_fe_h", "e_logg", "e_alpha_fe")
 EXTRA_COLS = ("ra", "dec")
 
-X_ERR = (0.2, 0.2, 0.2, 0.2)
+#: The [alpha/Fe] regularization error was raised from the legacy 0.2 to 0.4 on
+#: purpose (SLAM's [alpha/Fe] differs from nearly all other surveys), so the
+#: parity check is allowed to differ on ``x_err[:, 3]`` only.
+X_ERR = (0.2, 0.2, 0.2, 0.4)
+PARITY_EXEMPT = "x_err[:, 3] is 0.4; the legacy table used 0.2"
+PARITY_DIFFERS = {"x_err": (3,)}
 
 #: Per-parameter multiplier applied to the statistical uncertainties.
 UNC_SCALES = (0.2, 1.0, 1.0, 1.0)

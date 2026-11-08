@@ -11,7 +11,7 @@ from astropy.table import Table
 from astrotune import config, registry
 from astrotune.prep import io
 
-BUILT = [spec.key for spec in registry.CATALOGS if config.catalog_path(spec.key).exists()]
+BUILT = [spec.key for spec in registry.CATALOGS if spec.legacy_file and config.catalog_path(spec.key).exists()]
 
 
 def test_at_least_one_catalog_built():
@@ -50,13 +50,20 @@ def test_parity_with_legacy(key):
     assert report["ids_match"], io.format_parity(report)
     assert report["same_order"], io.format_parity(report)
 
-    exempt = getattr(registry.get_module(key), "PARITY_EXEMPT", None)
+    module = registry.get_module(key)
+    exempt = getattr(module, "PARITY_EXEMPT", None)
     if exempt:
-        # Everything except sigma_x must still match; sigma_x[: , :3] too.
-        assert np.allclose(new["x"], reference["x"], atol=1e-5)
-        assert np.allclose(new["x_err"], reference["x_err"], atol=1e-5)
-        assert np.allclose(new["sigma_x"][:, :3], reference["sigma_x"][:, :3], atol=1e-5)
-        assert not np.allclose(new["sigma_x"][:, 3], reference["sigma_x"][:, 3], atol=1e-5)
+        # A deliberate deviation must say exactly which parameters of which
+        # columns differ; everything else must still match, and the declared
+        # differences must be real.
+        differs = getattr(module, "PARITY_DIFFERS", None)
+        assert differs, f"{key} declares PARITY_EXEMPT but not PARITY_DIFFERS"
+        for column in ("x", "x_err", "sigma_x"):
+            declared = list(differs.get(column, ()))
+            kept = [i for i in range(new[column].shape[1]) if i not in declared]
+            assert np.allclose(new[column][:, kept], reference[column][:, kept], atol=1e-5), column
+            for i in declared:
+                assert not np.allclose(new[column][:, i], reference[column][:, i], atol=1e-5), (column, i)
         pytest.skip(f"intentional deviation: {exempt}")
 
     for column, stats in report["columns"].items():

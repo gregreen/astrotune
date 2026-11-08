@@ -28,11 +28,17 @@ train = [
     "tf-keras==2.18.0",
     "tensorflow-probability==0.25.0",
     "dm-sonnet==2.0.2",
+    "imageio-ffmpeg",
 ]
 dev = ["pytest"]
 
 [project.scripts]
 astrotune-prepare = "astrotune.cli:main"
+astrotune-pairs = "astrotune.training_data:main"
+astrotune-train = "astrotune.train:main"
+astrotune-evaluate = "astrotune.evaluate:main"
+astrotune-videos = "astrotune.videos:main"
+astrotune-overlaps = "astrotune.prep.overlaps:main"
 
 [tool.setuptools.packages.find]
 include = ["astrotune*"]
