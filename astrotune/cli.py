@@ -71,6 +71,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"{'idx':>3}  {'key':<24} {'n_par':>5}  label")
         for i, spec in enumerate(registry.CATALOGS):
             print(f"{i:>3}  {spec.key:<24} {spec.n_params:>5}  {spec.label}")
+        for spec in registry.CANDIDATES:
+            print(f"{'-':>3}  {spec.key:<24} {spec.n_params:>5}  {spec.label}  (candidate: not in the model)")
         return 0
 
     if args.all:
@@ -82,10 +84,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         build_parser().print_help()
         return 2
 
-    unknown = [k for k in selected if k not in registry.INDEX]
+    unknown = [k for k in selected if k not in registry.INDEX and k not in registry.candidate_keys()]
     if unknown:
         print(f"Unknown catalog(s): {', '.join(unknown)}", file=sys.stderr)
-        print(f"Known: {', '.join(registry.keys())}", file=sys.stderr)
+        print(f"Known: {', '.join(registry.keys() + registry.candidate_keys())}", file=sys.stderr)
         return 2
 
     failures = {}

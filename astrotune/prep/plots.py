@@ -220,14 +220,29 @@ def plot_alpha_abundances(
 
 
 # --- Table-level diagnostics ------------------------------------------------
+#: A statistical uncertainty at or above this marks a parameter that is not
+#: measured (for a whole catalog, or for individual stars): its placeholder
+#: value must not appear in the figures.
+MISSING_SIGMA = 1e6
+
+
+def _measured(table) -> np.ndarray:
+    """``(n, d)`` boolean: is this parameter measured for this star?"""
+    x = np.asarray(table["x"])
+    if "sigma_x" not in table.colnames:
+        return np.ones(x.shape, dtype=bool)
+    return np.asarray(table["sigma_x"], dtype="f8") < MISSING_SIGMA
+
+
 def plot_catalog_params(table, outdir, names: Sequence[str] = PARAM_NAMES):
     """Histogram of every parameter column."""
     x = np.asarray(table["x"], dtype="f8")
+    measured = _measured(table)
     n = x.shape[1]
     fig, axes = plt.subplots(1, n, figsize=(2.6 * n, 2.6), layout="constrained")
 
     for i, ax in enumerate(np.atleast_1d(axes)):
-        values = x[:, i]
+        values = x[measured[:, i], i]
         lo, hi = choose_lim(values, pct=(0.1, 99.9), expand=0.1)
         ax.hist(values, bins=100, range=(lo, hi), histtype="step", log=True)
         ax.set_xlabel(PARAM_LATEX[i] if i < len(PARAM_LATEX) else names[i])
@@ -242,6 +257,7 @@ def plot_catalog_uncertainties(table, outdir, names: Sequence[str] = PARAM_NAMES
     """Uncertainties as a function of position in the Kiel diagram, plus histograms."""
     x = np.asarray(table["x"], dtype="f8")
     sigma = np.asarray(table["sigma_x"], dtype="f8")
+    sigma = np.where(sigma < MISSING_SIGMA, sigma, np.nan)  # not measured: not plotted
     n = sigma.shape[1]
 
     xlim = choose_lim(x[:, 0], expand=0.35)
@@ -315,7 +331,8 @@ def plot_feh_alpha(table, outdir, name="feh_alpha"):
     x = np.asarray(table["x"], dtype="f8")
     if x.shape[1] < 4:
         return None
-    good = np.isfinite(x[:, 1]) & np.isfinite(x[:, 3])
+    measured = _measured(table)
+    good = np.isfinite(x[:, 1]) & np.isfinite(x[:, 3]) & measured[:, 1] & measured[:, 3]
     fig, ax = plt.subplots(figsize=(4.5, 4), layout="constrained")
     ax.hist2d(x[good, 1], x[good, 3], bins=100, norm=LogNorm(), rasterized=True)
     ax.set_xlabel(PARAM_LATEX[1])

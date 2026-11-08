@@ -41,9 +41,39 @@ CATALOGS: Tuple[CatalogSpec, ...] = (
     CatalogSpec("pristine_pigs", "PIGS", "astrotune.catalogs.pristine_pigs", 3, "pristine_pigs.h5"),
     CatalogSpec("sdssv_slam", "SDSS-V (SLAM)", "astrotune.catalogs.sdssv_slam", 4, "sdssv_slam.h5"),
     CatalogSpec("sdssv_mdc", "SDSS-V (MDw Cannon)", "astrotune.catalogs.sdssv_mdc", 4, "sdssv_mdc.h5"),
+    # Added after the notebook (no legacy table). Models trained before these
+    # were added use the first 16 entries only (see run_keys).
+    CatalogSpec("desi_nagaraj2026", "DESI (Nagaraj)", "astrotune.catalogs.desi_nagaraj2026", 4, ""),
+    CatalogSpec("sdssv_clam", "SDSS-V (CLAM)", "astrotune.catalogs.sdssv_clam", 4, ""),
+    CatalogSpec("lamost_mstar_li2025", "LAMOST M-Stars (Li)", "astrotune.catalogs.lamost_mstar_li2025", 4, ""),
 )
 
 INDEX = {spec.key: i for i, spec in enumerate(CATALOGS)}
+
+#: Catalogs that can be prepared (``astrotune-prepare KEY``) but are **not yet
+#: part of the model**: they have no category index, and training, evaluation
+#: and the videos ignore them. Adding a catalog to :data:`CATALOGS` changes the
+#: number of categories, so a model trained with N catalogs cannot be loaded
+#: once N+1 are registered. To promote a candidate, append it to
+#: :data:`CATALOGS` (never insert) and retrain.
+#: Currently empty: the first three candidates were promoted (19 catalogs).
+CANDIDATES: Tuple[CatalogSpec, ...] = ()
+
+
+def run_keys(run_dir) -> Tuple[str, ...]:
+    """The catalogs a trained run was built with (from its ``config.json``).
+
+    Runs made before the registry grew were trained on a prefix of
+    :data:`CATALOGS`; for those the first 16 are returned.
+    """
+    import json
+    from pathlib import Path
+
+    try:
+        with open(Path(run_dir) / "config.json") as f:
+            return tuple(json.load(f)["catalogs"])
+    except (OSError, KeyError):
+        return keys()[:16]
 
 
 def keys() -> Tuple[str, ...]:
@@ -60,10 +90,16 @@ def category_index(key: str) -> int:
 
 
 def get_spec(key: str) -> CatalogSpec:
-    for spec in CATALOGS:
+    """Look up a catalog (including candidates that are not yet in the model)."""
+    for spec in CATALOGS + CANDIDATES:
         if spec.key == key:
             return spec
-    raise KeyError(f"Unknown catalog {key!r}. Known: {', '.join(keys())}")
+    known = ", ".join(keys() + candidate_keys())
+    raise KeyError(f"Unknown catalog {key!r}. Known: {known}")
+
+
+def candidate_keys() -> Tuple[str, ...]:
+    return tuple(spec.key for spec in CANDIDATES)
 
 
 def get_module(key: str):
