@@ -30,6 +30,7 @@ astrotune/
   training_plots.py    progress figures written during training
   evaluate.py          catalog agreement before/after harmonization
   videos.py            Kiel-diagram videos of the transformation (`astrotune-videos`)
+  apply.py, merge.py   harmonize every catalog and merge by Gaia id (`astrotune-apply`)
 data/
   raw/<catalog>/       downloaded source catalogs (never tracked)
   interim/<catalog>/   derived caches, e.g. Gaia crossmatch tables
@@ -154,6 +155,22 @@ astrotune-videos --run-dir models/my_run --no-plain --plane param1v1_diff --all-
 ```
 
 The encoder is `ffmpeg` from `PATH`, else the static binary of `imageio-ffmpeg`.
+
+### Merging the harmonized estimates
+
+```
+astrotune-apply --run-dir models/my_run
+```
+
+maps every catalog to the harmonized space (propagating each entry's covariance
+through the Jacobian), combines the entries of each Gaia DR3 source (product of
+Gaussians, iterated with chi² outlier rejection) and writes to
+`models/my_run/harmonized/`: `merged_catalog.h5` (one row per star, with a
+`params_source` bit mask saying which catalogs contributed), `individual_estimates.h5`
+(each catalog's harmonized entries), `metadata.json` (which catalog is which bit,
+merge settings, counts, training provenance) and `summary.png`. Read the merged
+catalog with `astrotune.apply.read_merged`. See `porting_project.md` §9.9 for the
+format, the unmeasured-parameter convention and the fixes to the notebook's merge.
 
 ## Catalog module contract
 

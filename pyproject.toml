@@ -39,6 +39,7 @@ astrotune-train = "astrotune.train:main"
 astrotune-evaluate = "astrotune.evaluate:main"
 astrotune-videos = "astrotune.videos:main"
 astrotune-overlaps = "astrotune.prep.overlaps:main"
+astrotune-apply = "astrotune.apply:main"
 
 [tool.setuptools.packages.find]
 include = ["astrotune*"]

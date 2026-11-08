@@ -3,8 +3,9 @@
 Status: **the catalog layer is complete (16 legacy catalogs built and verified,
 plus 3 new ones promoted into the model on 2026-11-08: 19 in total);
 the training layer is ported and working (model, pairs/control points, training
-loop with resume, evaluation, videos) and is being tuned; `apply.py` (applying
-the model and merging catalogs) and most of the paper-figure diagnostics are not
+loop with resume, evaluation, videos) and is being tuned; `apply.py`/`merge.py`
+(applying the model and merging by Gaia id) are written and tested but have not
+yet been run on the full catalogs; most of the paper-figure diagnostics are not
 ported yet.**
 
 This document is the main hand-off document. It is meant to let a new agent (or
@@ -114,7 +115,9 @@ astrotune/
   train.py           TrainConfig, Trainer, resume      (`astrotune-train`)
   evaluate.py        agreement before/after harmonization (`astrotune-evaluate`)
   training_plots.py  figures written during training
-  videos.py          Kiel / [Fe/H]-[alpha/Fe] videos   (`astrotune-videos`)
+  videos.py          Kiel / [Fe/H]-[alpha/Fe] / param1v1 videos (`astrotune-videos`)
+  apply.py           harmonize each catalog, merge by Gaia id (`astrotune-apply`)
+  merge.py           combination of Gaussian estimates + outlier rejection (NumPy only)
   prep/
     download.py      cached HTTP downloads, SDSS-V auth via env/prompt
     transforms.py    Teff transform, error floors, unmask(), extract_table()
@@ -813,7 +816,7 @@ the catalog layer:
 | `astrotune/evaluate.py` | (new) | agreement before/after harmonization |
 | `astrotune/training_plots.py` | 378, 382–383 | figures written during training |
 | `astrotune/videos.py` | 424–448 | Kiel and [Fe/H]–[α/Fe] videos |
-| `astrotune/apply.py` | 461–488 | **not ported**: transform catalogs + merge |
+| `astrotune/apply.py`, `astrotune/merge.py` | 461–488 | transform catalogs, merge by Gaia id (§9.9) |
 | `astrotune/diagnostics.py` | 419–453, 456–460, 526–544 | **mostly not ported** |
 
 ### 9.1 Data for training
@@ -1095,6 +1098,95 @@ reduced, not removed) and (b) longer training (the 8-epoch run, in progress).
 Later, the DESI/other-survey overlap at low temperature may improve with more
 data (§10).
 
+### 9.9 Applying the model and merging by star (`astrotune-apply`)
+
+```
+astrotune-apply --run-dir models/my_run          # -> models/my_run/harmonized/
+astrotune-apply --run-dir models/my_run --only sdssv_slam sdssv_mdc   # quick test
+```
+
+`apply.py` (TensorFlow: transform, I/O, summary figure) and `merge.py` (NumPy
+only: the combination, tested in `tests/test_merge.py`). Steps: (1) each
+catalog's `x`, `sigma_x` go through the bijector of the catalog's category and
+the covariance through its Jacobian, `C_y = J diag(σ²) Jᵀ` (first order);
+(2) entries of the same Gaia DR3 id are combined as a product of Gaussians,
+`C = (Σ (C_i + e²I)⁻¹)⁻¹`, `y = C Σ (C_i + e²I)⁻¹ y_i`, `e = 0.03`, then entries
+with chi² > 30 against the combined estimate (notebook: 25; raised by the owner
+because typical chi² values are ~15) are dropped and the combination is
+repeated, 3 times (chi² is always computed for *all* entries, so a dropped entry
+can come back); (3) stars with non-finite values or outside `PARAM_LIMS` are
+removed. Options: `--dedupe first` (one row per id per catalog; the default keeps
+repeated spectra as independent entries, as the notebook did), `--eps-err`,
+`--chi2-max`, `--n-iter`. Every run caches the transformed estimates in
+`<out-dir>/transform_cache_<dedupe>/` (the slow GPU step); `--reuse-transform`
+reloads them (rows are checked against the tables), so merge settings can be
+changed in minutes. Only valid for the same model: delete the cache or use a
+different `--out-dir` if the model changes.
+
+Output in `<run>/harmonized/`:
+
+- `merged_catalog.h5` (table at path `data`; `apply.read_merged(path)` returns
+  `(table, metadata)`): `gdr3_source_id` (sorted), `params_est` (4),
+  `params_err` (4), `params_cov` (4,4), `lndet_cov`, `params_source` (uint32 bit
+  mask: bit *i* = catalog *i* contributed; `merge.catalogs_in(mask, i)`),
+  `n_estimates`, `chi2_max_used` (largest chi² among the entries used: large =
+  the entries disagree; consider cutting), `params_measured` (4, bool).
+- `individual_estimates.h5`: one table `catalog_<i>` per catalog (`params_orig`,
+  `params_err_orig`, `params_harm`, `params_cov_harm`, `measured`,
+  `chi2_merged`, `used`).
+- `metadata.json` (also stored in the tables' metadata): schema version, run and
+  full training config, parameter names and the Teff transform, the merge
+  settings and counts, the rejected-fraction history, and `surveys`: for each
+  catalog its **index and bit, key, label, reference**, parameters it measures,
+  numbers of entries/unique stars/entries used/stars contributing (before and
+  after the final cuts), rejection fractions and the provenance of its prepared
+  table. `summary.png` is an overview.
+
+**Unmeasured parameters** (catalogs without [α/Fe]; MDw Cannon logg; CLAM
+`flag_warn` stars' [α/M]; anything with `sigma_x > 1e6`) are fed to the map as 0,
+contribute nothing to `C_y`, and are stored as `value 0, C_pp = 1e9`, zero
+off-diagonal. A merged star for which no contributing entry measured a
+parameter has exactly that encoding and `params_measured = False`: **do not use
+the value** (the Kiel plots must mask on `params_measured`).
+
+**Math errors and bugs found in the notebook's merge (fixed here; the legacy
+`merged_params_catalog_clean.h5` contains them):**
+
+1. `params_err = sqrt(C_ii² + e²)`: the variance was squared. In the legacy file
+   this reproduces to 1e-7 and the median error is 0.030 for all three
+   parameters, i.e. the floor, although the median `sqrt(C_ii)` is 0.034 /
+   0.041 / 0.078. Errors above 1 were overstated, those below 1 understated.
+   Now `sqrt(C_ii + e²)`.
+2. **Missing parameters inflated the whole covariance.** The notebook zeroed
+   the uncertainty of a missing [α/Fe] for the transformation, but not of the
+   MDw Cannon logg (`σ = 1e9`), so every MDC entry had covariance ~1e14 on all
+   four parameters (verified in `transformed_data.h5`: median diag
+   4e14, 1e14, 1e18, 1e14) and the catalog carried no weight in the merge.
+   Handled per element now (`sigma_x > 1e6`), so MDC (and CLAM warn stars)
+   contribute their measured parameters.
+3. **Zero estimates.** If outlier rejection left one entry of a star that had
+   several, `combine_parameters` took neither the single-entry nor the
+   multi-entry branch: estimate 0, covariance 0, `lndet_cov = -inf`. The legacy
+   catalog has 15 such rows. Now a single remaining entry is copied.
+4. **Rejection could remove every entry** of a star (one wild entry drags the first
+   mean so that all fail chi²); the star then flipped between NaN and all entries
+   across iterations. The best-matching entry of each star is now never
+   rejected. This changes which stars survive relative to the notebook.
+5. `lndet_cov` included `ln(1e9)` for stars with an unmeasured parameter; it is
+   now computed over the measured parameters.
+6. `params_source` was `uint16`, which overflows at 16 catalogs (19 now);
+   it is `uint32`.
+
+**Caveats, not changed:** the combination treats the entries as independent
+(repeated spectra of a star and catalogs sharing training labels, e.g. DD-Payne
+and Li+2025 trained on APOGEE, are not); the covariance is the product of
+Gaussians, so entries that disagree beyond their errors still give a small
+covariance (use `chi2_max_used`); the `e = 0.03` floor enters the weights and is
+added again, in quadrature, in `params_err` (as in the notebook), so `params_err`
+is not simply `sqrt(C_ii)`. Matmuls run in TF32 on the A100, so propagated
+covariances are accurate to ~1e-3 relative. Entries with a single catalog never
+go through a chi² test (chi² = 0).
+
 ### 9.8 Gotchas for whoever continues
 
 - **Number of categories is per run, not global.** `load_bijector` reads the
@@ -1126,9 +1218,9 @@ data (§10).
 2. `training_data.py` — ported `extract_pairs` and the control-point sampler
    verbatim, then verified against the legacy pairs file (§9.1).
 3. `train.py` — ported `grad_step` last, after the data matched.
-4. `apply.py`, then `diagnostics.py` are next. The legacy artefacts to compare
-   against are `transformed_data.h5` and `merged_params_catalog_clean.h5` in the
-   repo root.
+4. `apply.py` and `merge.py` are written (§9.9); `diagnostics.py` is next. The
+   legacy artefacts to compare against are `transformed_data.h5` and
+   `merged_params_catalog_clean.h5` in the repo root.
 
 ## 10. What remains
 
@@ -1157,12 +1249,12 @@ In rough priority order:
    `--pair-path-in-loss` / `--freeze-after-frac`.
 4. **Optional:** zero noise on unknown axes in the loss so training matches
    evaluation (§9.6; small effect).
-5. **`apply.py`** (cells 461–488) and **`diagnostics.py`** (cells 419–453,
-   456–460, 526–544): transform each catalog and merge the estimates into
-   `merged_params_catalog_clean.h5`; the paper's figures. The notebook bugs
-   listed below for those cells must be fixed, not copied. Legacy artefacts to
-   compare against: `transformed_data.h5`, `merged_params_catalog_clean.h5` in
-   the repo root.
+5. **`apply.py`** (cells 461–488): **done** (§9.9), but run it on the full
+   catalogs with the final model (≈ 100 min for 12.9 M entries on a shared GPU).
+   **`diagnostics.py`** (cells 419–453, 456–460, 526–544; the paper's figures) is
+   still to do. The notebook bugs listed below must be fixed, not copied. Legacy
+   artefacts to compare against: `transformed_data.h5`,
+   `merged_params_catalog_clean.h5` in the repo root.
 6. **New data** (from `TODO.md`; each is a new catalog module: follow the
    two-stage procedure in §5.6, then append to the registry and retrain — see the
    `load_bijector` gotcha, §9.8):
@@ -1212,7 +1304,8 @@ rest are still open: they belong to the `apply.py`/`diagnostics.py` stage.
   function returns a dict.
 - Cell 519: `lndet_cov` is undefined there; it lives in the results dict.
 - Cell 536: `v[..., 0].ndim` with `v` undefined.
-- Cell 464: relies on the global `n_params` (= 4) and on `tables`.
+- Cell 464: relies on the global `n_params` (= 4) and on `tables`. (Fixed in
+  `apply.py`; see §9.9 for the *math* errors in cells 463–488.)
 
 ### Open decisions
 
