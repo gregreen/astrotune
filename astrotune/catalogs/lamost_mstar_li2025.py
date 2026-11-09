@@ -33,6 +33,11 @@ Notes
   catalogs in excess of its high-SNR plateau (an estimate of the random error)
   is 1.3-3.4 times the quoted error, depending on the parameter. They are
   scaled by :data:`UNC_SCALES` before the error floors are added.
+  ``astrotune-error-scale lamost_mstar_li2025`` fits the scale against CLAM, MDw
+  Cannon, ASPCAP and APOGEE (the last two are not independent). In the harmonized
+  space the fitted scale is 0.7-1.6 (Teff 0.7-1.4, [M/H] 1.2-1.6, logg 1.2, [alpha/M]
+  0.9-1.3). The project owner chose to leave the errors unscaled (1) and to fix the
+  scaling post hoc, after the bijections are learned (2026-11-09).
 
 Cuts (chosen by looking at the Kiel and [M/H]-[alpha/M] diagrams and at the
 stars shared with APOGEE, ASPCAP, SLAM, MDw Cannon, DESI and LAMOST DD-Payne):
@@ -87,7 +92,7 @@ SNR_MIN = 30.0
 MAX_ERR = {"teff_err": 300.0, "logg_err": 0.5, "m_h_err": 0.4, "alpha_m_err": 0.15}
 
 #: Factors applied to the catalog uncertainties before the error floors
-UNC_SCALES = (2.0, 2.0, 2.0, 2.0)
+UNC_SCALES = (1.0, 1.0, 1.0, 1.0)
 
 #: Regularization errors: a first guess, like the other M-star catalogs
 #: (SLAM, MDw Cannon 0.2; Ding 0.2/0.4; Zhang 0.1). Not tuned.

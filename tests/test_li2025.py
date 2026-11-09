@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from astropy.table import Table
 
-from astrotune import registry
+from astrotune import config, registry
 from astrotune.catalogs import lamost_mstar_li2025 as li
 from astrotune.prep import pipeline
 from astrotune.prep.transforms import teff_err_to_x, teff_to_x
@@ -80,8 +80,9 @@ def test_parameter_mapping_and_scaled_uncertainties():
     _, _, _, table = _run([_row(0)])
     x, sigma = table["x"][0], table["sigma_x"][0]
     assert x == pytest.approx([teff_to_x(3800.0), -0.2, 4.8, 0.05], abs=1e-5)  # [M/H] -> slot 1
-    floors = (0.01, 0.01, 0.04, 0.05)
+    floors = tuple(config.ERROR_FLOORS)
     quoted = (teff_err_to_x(3800.0, 20.0), 0.05, 0.05, 0.015)
+    assert li.UNC_SCALES == (1.0,) * 4
     expected = [np.hypot(li.UNC_SCALES[i] * quoted[i], floors[i]) for i in range(4)]
     assert sigma == pytest.approx(expected, rel=1e-4)
     # All four parameters are measured for every star

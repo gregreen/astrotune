@@ -23,7 +23,12 @@ Notes
   APOGEE/GALAH/ASPCAP at SNR 10-30 is 5-8 times the quoted error (3-5 times once
   the systematic floor measured at high SNR is subtracted). They are therefore
   scaled by :data:`UNC_SCALES` before the error floors are added (this keeps the
-  SNR dependence).
+  SNR dependence). ``astrotune-error-scale sdssv_clam`` fits the scale and a
+  systematic plateau to the scatter against APOGEE, ASPCAP and GALAH; compared in the
+  harmonized space (``--run-dir``) the scale is about 3 for Teff, [Fe/H] and logg and
+  4-4.5 for [alpha/M]. The project owner chose a scale of 3 for all parameters and the
+  default error floors (2026-11-09): the plateau in the harmonized space differs between
+  partners (0.06-0.07 against APOGEE and ASPCAP, none against GALAH).
 * **Flags.** ``flag_bad`` (the catalog's own bad-fit flags, 43% of the rows)
   removes the star. ``flag_warn`` (``IN_OB`` or ``FE_H_ALPHA_SUSPECT``: every
   star above 6500 K, plus stars of the OB target program at any Teff) means that
@@ -103,7 +108,7 @@ ALPHA_RANGE = (-0.35, 0.75)
 MAX_ERR = {"e_teff": 300.0, "e_logg": 0.4, "e_fe_h": 0.25, "e_alpha_m": 0.15}
 
 #: Factors applied to the catalog uncertainties before the error floors
-UNC_SCALES = (4.0, 4.0, 4.0, 4.0)
+UNC_SCALES = (3.0, 3.0, 3.0, 3.0)
 
 #: Regularization errors: a first guess, as for the other BOSS-based catalogs
 #: (SLAM 0.2, BOSSNet 0.3), larger for Teff and [Fe/H] above HOT_START, where

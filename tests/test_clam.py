@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from astropy.table import Table
 
-from astrotune import registry
+from astrotune import config, registry
 from astrotune.catalogs import sdssv_clam as clam
 from astrotune.prep import pipeline
 from astrotune.prep.transforms import teff_err_to_x
@@ -94,10 +94,11 @@ def test_warn_can_also_drop_feh(monkeypatch):
 
 def test_uncertainties_are_scaled_before_the_floors():
     _, _, table = _run([_row(0)])
-    floor = 0.01  # default [Fe/H] floor, in quadrature
-    expected_feh = np.hypot(clam.UNC_SCALES[1] * 0.02, floor)
+    floors = tuple(config.ERROR_FLOORS)  # the default floors, in quadrature
+    assert not hasattr(clam, "ERROR_FLOORS") and clam.UNC_SCALES == (3.0,) * 4
+    expected_feh = np.hypot(clam.UNC_SCALES[1] * 0.02, floors[1])
     assert table["sigma_x"][0][1] == pytest.approx(expected_feh, rel=1e-4)
-    expected_teff = np.hypot(clam.UNC_SCALES[0] * teff_err_to_x(5000.0, 20.0), floor)
+    expected_teff = np.hypot(clam.UNC_SCALES[0] * teff_err_to_x(5000.0, 20.0), floors[0])
     assert table["sigma_x"][0][0] == pytest.approx(expected_teff, rel=1e-4)
 
 
