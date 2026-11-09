@@ -30,7 +30,7 @@ def gaia_crossmatch_batched(
     max_batch_size=1024 * 256,
     verbose=False,
 ) -> Table:
-    """Nearest-neighbour match to ``gaiadr3.gaia_source`` for arbitrary coordinates."""
+    """Nearest-neighbor match to ``gaiadr3.gaia_source`` for arbitrary coordinates."""
     from astroquery.gaia import Gaia
 
     ra = np.asarray(ra, dtype="f8")

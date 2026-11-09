@@ -10,7 +10,7 @@ Partial release (170,111 stars) on Zenodo: https://doi.org/10.5281/zenodo.218165
 Notes
 -----
 * The catalog is a Payne-style neural-network fit to the flux-calibrated,
-  *un-normalised* DESI spectra, so it is independent of the official DESI
+  *un-normalized* DESI spectra, so it is independent of the official DESI
   pipelines (:mod:`~astrotune.catalogs.desi_dr1`, :mod:`~astrotune.catalogs.desi_ddp`)
   although it uses the same spectra, i.e. many of the same stars.
 * **Only a partial release (~5% of the 3.2 million stars) is available at the
@@ -91,7 +91,7 @@ MAX_ERR = {"TEFF_ERR": 150.0, "LOGG_ERR": 0.4, "FEH_ERR": 0.2, "ALPHA_FE_ERR": 0
 #: Drop the stars fit without a Gaia XP initial guess (the "global" fit)
 REQUIRE_GAIA_GUESS = False
 
-#: Micro-turbulence is not optimised away from its starting value (the centre of
+#: Micro-turbulence is not optimized away from its starting value (the center of
 #: its range) when the "global" fit gets stuck at a node of the starting grid.
 #: Those fits have NaN uncertainties (removed by the finite-uncertainty cut);
 #: this removes the few that do not.

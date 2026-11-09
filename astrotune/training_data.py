@@ -3,7 +3,7 @@
 *Pairs* anchor the catalogs to one another: a star in catalogs ``j`` and ``k``
 should be mapped to the same place in the harmonized space. *Control points*
 are sampled from each catalog (and from a wide Gaussian covering the whole
-parameter space) and are used to regularise the transformations.
+parameter space) and are used to regularize the transformations.
 
 Everything here is NumPy/astropy only (no TensorFlow). The builder reproduces
 cells 347-357 of the reference notebook, including the stateful RNG, so that
@@ -37,13 +37,13 @@ N_PARAMS = config.N_PARAMS
 PAIR_KEYS = ("x0", "x1", "xe0", "xe1", "xs0", "xs1", "c0", "c1")
 CTRL_KEYS = ("x_control", "xe_control", "c_control", "from_catalog")
 
-#: Regularisation error substituted for "unknown" (>1e6) values when loading
+#: Regularization error substituted for "unknown" (>1e6) values when loading
 UNKNOWN_XE = 0.05
 
 #: ``x_err`` stored for a parameter that a catalog does not measure
 MISSING_XE = 1e9
 
-#: Regularisation error of the dispersed control points in the legacy analysis
+#: Regularization error of the dispersed control points in the legacy analysis
 LEGACY_DISPERSED_XE = 0.2
 
 #: How the ``x_err`` of the dispersed control points is chosen
@@ -163,7 +163,7 @@ def count_pairs_per_catalog(pair_dict, n_cat) -> np.ndarray:
 
 
 def dispersed_x_err(tables, keys: Optional[Sequence[str]] = None) -> List[np.ndarray]:
-    """Regularisation error of the dispersed points of each catalog, ``(4,)`` each.
+    """Regularization error of the dispersed points of each catalog, ``(4,)`` each.
 
     The dispersed points are the prior in the part of parameter space where a
     catalog has no data, so they use one value per catalog and parameter, not a
@@ -322,7 +322,7 @@ def load_training_data(
 ) -> Tuple[dict, dict]:
     """Load ``(pair_dict, ctrl_dict)``.
 
-    With ``fix_unknown_errors`` (the training default), regularisation errors
+    With ``fix_unknown_errors`` (the training default), regularization errors
     ``> 1e6`` (placeholders for missing parameters) are replaced by 0.05.
     ``ctrl_dict["missing_control"]`` (boolean, ``(n, n_dim)``) always records
     which control-point parameters were placeholders.

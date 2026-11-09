@@ -11,7 +11,7 @@ Notes
 The three per-program tables (bright, dark, backup) are stacked and Gaia DR3
 identifiers are read from the ``GAIA`` HDU of each file.
 
-The regularization error grows both for hot stars and towards the
+The regularization error grows both for hot stars and toward the
 cool-dwarf edge of the parameter space, where the DESI parameters are less
 reliable (see the ``teff_edge`` metric below).
 """

@@ -18,7 +18,7 @@ def enable_memory_growth() -> None:
     for device in tf.config.list_physical_devices("GPU"):
         try:
             tf.config.experimental.set_memory_growth(device, True)
-        except RuntimeError:  # already initialised
+        except RuntimeError:  # already initialized
             pass
 
 

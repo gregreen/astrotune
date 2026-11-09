@@ -43,9 +43,9 @@ stars shared with APOGEE, GALAH, ASPCAP and the cool-star catalogs):
 * Finite, positive-variance uncertainties and loose upper limits on them.
 * Teff > 3400 K, a cut just inside the cool edge of the sample. Below ~3500 K
   the distribution drops steeply and the agreement with SLAM/MDC/DESI degrades
-  towards it (the [alpha/M] offset grows from ~0 at 3600-3700 K to +0.11 below
+  toward it (the [alpha/M] offset grows from ~0 at 3600-3700 K to +0.11 below
   3400 K). That trend is measured in bins of CLAM's own noisy Teff, so part of
-  it is an edge/selection effect and the cut is a judgement call; 3400 K rather
+  it is an edge/selection effect and the cut is a judgment call; 3400 K rather
   than 3500 K keeps ~530 SLAM anchors (3400-3500 K) and removes only the sparse
   tail (33 shared stars).
 * **No upper Teff cut**, at the project owner's request: ``flag_bad`` and

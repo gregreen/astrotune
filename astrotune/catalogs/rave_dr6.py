@@ -43,7 +43,7 @@ SOURCES = tuple(f"{URL_BASE}/{fn}" for fn in FNAMES)
 CROSSMATCH_FILE = "crossmatched.h5"
 JOIN_KEY = "rave_obs_id"
 
-#: Wide search radius, then a tighter cut on the nearest neighbour.
+#: Wide search radius, then a tighter cut on the nearest neighbor.
 SEARCH_SEPARATION = 1.0 * units.arcsec
 MAX_SEPARATION = 0.3 * units.arcsec
 

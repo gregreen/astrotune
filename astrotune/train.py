@@ -19,7 +19,7 @@ with ``astrotune-train --run-name my_run --resume``.
 
 The loss is the pair term (chi^2 of the star's position in catalog ``k`` when
 mapped there from catalog ``j`` through the harmonized space) plus
-regularisation terms on control points. See ``TrainConfig`` for the
+regularization terms on control points. See ``TrainConfig`` for the
 hyperparameters, which default to the values of the reference notebook.
 
 The notebook's learned error model (``ln_err_model``), which fitted a
@@ -70,7 +70,7 @@ class TrainConfig:
     ode_rtol: float = 1e-5
     ode_atol: float = 1e-5
 
-    # Optimisation
+    # Optimization
     batch_size: int = 1024
     n_epochs: int = 32
     val_frac: float = 1 / 8
@@ -570,7 +570,7 @@ def _set_memory_growth() -> None:
     for device in tf.config.list_physical_devices("GPU"):
         try:
             tf.config.experimental.set_memory_growth(device, True)
-        except RuntimeError:  # already initialised
+        except RuntimeError:  # already initialized
             pass
 
 

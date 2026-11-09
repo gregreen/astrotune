@@ -1,6 +1,6 @@
 """Figures used to monitor training.
 
-A single figure summarises the state of a run: the loss history (top row) and
+A single figure summarizes the state of a run: the loss history (top row) and
 the catalogs before and after the learned transformation (bottom, 2x2).
 """
 

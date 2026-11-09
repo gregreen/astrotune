@@ -49,7 +49,7 @@ class VectorNetwork(snt.Module):
           hidden_size: number of neurons in each hidden layer.
           embed_dim: embedding size; defaults to ``ceil(log2(n_cat))``.
           activation: activation applied after each hidden layer.
-          output_scale: stddev of the output-layer weight initialisation. A
+          output_scale: stddev of the output-layer weight initialization. A
             small value makes the initial velocity field ~0, i.e. the
             bijection starts out as the identity.
           output_bias: initial value of the output bias.
