@@ -156,6 +156,17 @@ astrotune-videos --run-dir models/my_run --no-plain --plane param1v1_diff --all-
 
 The encoder is `ffmpeg` from `PATH`, else the static binary of `imageio-ffmpeg`.
 
+### Are the quoted uncertainties (and their scalings) right?
+
+```
+astrotune-error-scale sdssv_clam --run-dir models/my_run   # observed vs quoted error, harmonized space
+astrotune-error-scale lamost_mstar_li2025 --run-dir models/my_run --partners sdssv_clam sdssv_mdc
+```
+
+Fits a scale and a plateau to the scatter against other catalogs (in the harmonized space of the
+run; without `--run-dir` it uses the input coordinates, which include systematic offsets) and writes figures and a summary to `diagnostic_plots/<key>/error_scale*`. See `porting_project.md`
+§5.7. The default error floors are in `astrotune/config.py` ([α/Fe]: 0.02).
+
 ### Catalog connectivity figure
 
 ```

@@ -43,6 +43,7 @@ astrotune-apply = "astrotune.apply:main"
 astrotune-delta-diagnose = "astrotune.delta.diagnostics:main"
 astrotune-delta-train = "astrotune.delta.train:main"
 astrotune-catalog-graph = "astrotune.catalog_graph:main"
+astrotune-error-scale = "astrotune.prep.error_scale:main"
 
 [tool.setuptools.packages.find]
 include = ["astrotune*"]
