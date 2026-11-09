@@ -156,6 +156,29 @@ astrotune-videos --run-dir models/my_run --no-plain --plane param1v1_diff --all-
 
 The encoder is `ffmpeg` from `PATH`, else the static binary of `imageio-ffmpeg`.
 
+### Catalog connectivity figure
+
+```
+astrotune-catalog-graph [--layout spring|circle] [--min-shared 1000] [--top-k 3] [--straight-edges]
+```
+
+Draws the catalogs as circles (radius ~ log rows, color = family of spectra) joined
+by edges (width and opacity ~ log shared stars; pairs with at least `--min-shared`
+shared stars, plus every catalog's `--top-k` strongest links), plus a matrix of every pair, to
+`diagnostic_plots/catalog_graph/` (PNG and PDF; the counts are in
+`catalog_overlaps.json`). No trained model is needed.
+
+### Learned extra uncertainties (post hoc; experimental)
+
+```
+astrotune-delta-diagnose --run-dir models/my_run   # how well calibrated are the errors? (needs astrotune-apply first)
+astrotune-delta-train --run-dir models/my_run      # learn extra variances per catalog entry
+```
+
+Both write to `models/my_run/delta/`. See `porting_project.md` §9.10 for the
+method, the findings and the open issues. The model is not yet used by
+`astrotune-apply`.
+
 ### Merging the harmonized estimates
 
 ```

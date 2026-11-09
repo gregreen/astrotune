@@ -4,9 +4,11 @@ Status: **the catalog layer is complete (16 legacy catalogs built and verified,
 plus 3 new ones promoted into the model on 2026-11-08: 19 in total);
 the training layer is ported and working (model, pairs/control points, training
 loop with resume, evaluation, videos) and is being tuned; `apply.py`/`merge.py`
-(applying the model and merging by Gaia id) are written and tested but have not
-yet been run on the full catalogs; most of the paper-figure diagnostics are not
-ported yet.**
+(applying the model and merging by Gaia id) are done and have been run on all 16
+catalogs of `models/turnover50_8ep`; a new post-hoc error-calibration package
+(`astrotune/delta/`, §9.10) and a catalog-connectivity figure (§9.11) exist but the
+learned uncertainties are not yet used by the merge; most of the paper-figure
+diagnostics (`diagnostics.py`) are not ported yet.**
 
 This document is the main hand-off document. It is meant to let a new agent (or
 person) pick up the work without re-deriving context. Read it top to bottom,
@@ -14,7 +16,7 @@ then go to [§9 The training layer](#9-the-training-layer) for the current state
 of the work and [§10 What remains](#10-what-remains) for the to-do list.
 
 Two kinds of knowledge are recorded here: things that are **verified** (with the
-evidence) and things that are **hypotheses**; they are labelled as such.
+evidence) and things that are **hypotheses**; they are labeled as such.
 
 ---
 
@@ -31,9 +33,9 @@ dx/dt = v_c(t, x),   x(0) = x,   y = x(1)
 ```
 
 where the velocity field `v_c` is a neural network conditioned on a categorical
-embedding of the catalog. Training minimises a pairwise consistency loss
+embedding of the catalog. Training minimizes a pairwise consistency loss
 (does a star get mapped to the same place from either catalog?) plus
-regularisation terms (path length, distance from identity, divergence, weight
+regularization terms (path length, distance from identity, divergence, weight
 decay).
 
 Available knowledge:
@@ -91,7 +93,7 @@ Do not `module load` anything for GPU work.
 Useful commands:
 
 ```bash
-.venv/bin/python -m astrotune.cli --list          # catalogue registry
+.venv/bin/python -m astrotune.cli --list          # catalog registry
 .venv/bin/python -m astrotune.cli apogee_dr17     # build one catalog
 .venv/bin/python -m astrotune.cli --all           # build all sixteen
 .venv/bin/python -m astrotune.cli --all --no-plots
@@ -118,6 +120,8 @@ astrotune/
   videos.py          Kiel / [Fe/H]-[alpha/Fe] / param1v1 videos (`astrotune-videos`)
   apply.py           harmonize each catalog, merge by Gaia id (`astrotune-apply`)
   merge.py           combination of Gaussian estimates + outlier rejection (NumPy only)
+  delta/             post-hoc learned extra uncertainties (§9.10): pairs.py, diagnostics.py
+                     (`astrotune-delta-diagnose`), model.py, train.py (`astrotune-delta-train`)
   prep/
     download.py      cached HTTP downloads, SDSS-V auth via env/prompt
     transforms.py    Teff transform, error floors, unmask(), extract_table()
@@ -163,7 +167,7 @@ Every prepared catalog is an `astropy.table.Table` written with
 | `id` | `(n,) int64` | Gaia DR3 `source_id`; rows with `id <= 0` dropped |
 | `x` | `(n, d) float32` | transformed parameters, `d` = 3 or 4 |
 | `sigma_x` | `(n, d) float32` | statistical uncertainties (incl. error floors); `1e9` = "no measurement" |
-| `x_err` | `(n, d) float32` | **regularisation** errors (paper App. A); `1e9` for dummy axes |
+| `x_err` | `(n, d) float32` | **regularization** errors (paper App. A); `1e9` for dummy axes |
 | extras | `(n,)` | `ra`/`dec` (names vary per catalog, see each module's `EXTRA_COLS`) |
 
 Parameter order is fixed: `(5*ln(Teff/5000 K), [Fe/H], logg, [alpha/Fe])`.
@@ -174,7 +178,7 @@ A `.meta.json` sidecar records row counts per cut, source URLs, git commit,
 package versions — use it to regenerate the numbers quoted in Appendix A.
 
 **`sigma_x` vs `x_err`**: `sigma_x` is statistical and drives the pair chi²;
-`x_err` is the regularisation scale that says how much the transformation is
+`x_err` is the regularization scale that says how much the transformation is
 allowed to move along each axis. They are not interchangeable.
 
 ---
@@ -260,7 +264,7 @@ weighting for that catalog relative to the published run.
 
 - **Duplicate Gaia ids are real and large**: 53,403 in APOGEE DR17, 134,120 in
   DESI DR1, 36,583 in ASPCAP. They reproduce the legacy tables exactly, so the
-  current per-catalog behaviour was preserved. This matters for the *join*:
+  current per-catalog behavior was preserved. This matters for the *join*:
   `astropy.table.join(..., keys='id', join_type='inner')` is many-to-many and
   will explode those rows into all pairwise combinations. **Decide a
   deduplication policy before building pairs.**
@@ -294,7 +298,7 @@ use it, so old runs still load and evaluate (give them their own `--pairs-path`)
 The sections below describe how each catalog was made and why.
 
 **`desi_nagaraj2026` — DESI (Nagaraj)**, Nagaraj et al. 2026 (arXiv 2610.04294),
-a neural-network (Payne-style) fit to the un-normalised DESI SEDs. Raw file:
+a neural-network (Payne-style) fit to the un-normalized DESI SEDs. Raw file:
 `data/raw/desi_nagaraj2026/desi_dr1_nagaraj2026.fits` (Zenodo record 21816591;
 the downloader fetches it and was **verified byte-identical** to a manual
 `wget`). Prepared table: `data/training/desi_nagaraj2026/` (**80,455 stars**).
@@ -341,7 +345,7 @@ module docstring:
 - Micro-turbulence has a floor (0.75 km/s) on which ~6% of the selected stars
   sit, but
   they follow the main sequence and the [Fe/H]–[α/Fe] relation normally, so
-  **no cut is applied** (a judgement call: with only 27 matched stars the
+  **no cut is applied** (a judgment call: with only 27 matched stars the
   comparison surveys cannot say).
 - Reported uncertainties are small relative to the real scatter against other
   surveys (median TEFF_ERR 33 K, LOGG_ERR 0.09, FEH_ERR 0.04, [α/Fe] err 0.03,
@@ -362,7 +366,7 @@ Cannon**. Only 43% of Nagaraj's stars are in the DESI DR1 files used by
 `desi_dr1` (`rvpix-main-*`; the cuts of `desi_dr1` hardly matter: 34,513 before,
 34,462 after); the paper used the merged `mwsall` catalog covering all DESI
 programs, which is the likely reason (not verified). The 34,462 stars shared
-with DESI DR1 are the *same spectra* analysed by a different pipeline, so those
+with DESI DR1 are the *same spectra* analyzed by a different pipeline, so those
 pairs are not independent measurements. **Implication for the SLAM/MDC/DESI
 [α/Fe] problem (§9.7): this catalog cannot help the M-dwarf regime at all** (it
 has no stars < 4050 K and zero overlap with SLAM/MDC); at most it adds K-star
@@ -390,7 +394,7 @@ Choices, all in the module docstring:
   wide-binary test gives σ[Fe/H] ≈ 0.15 and σ[α/M] ≈ 0.06 at SNR = 10 against
   0.04 and 0.019 quoted (3–4×). They are therefore **multiplied by 4** (`UNC_SCALES`, in the style of
   `sdssv_slam`'s `unc_transf`) before the default floors are added; this keeps
-  the SNR dependence. A judgement call; the Nagaraj catalog is *not* scaled (no
+  the SNR dependence. A judgment call; the Nagaraj catalog is *not* scaled (no
   such external evidence). Raw scatter against other catalogs (~0.1 in
   5 ln Teff, 0.09 in [Fe/H], 0.2 in logg, 0.057 in [α/M] even at high SNR) is
   dominated by systematics between catalogs, which is what the bijector is for,
@@ -420,8 +424,8 @@ Choices, all in the module docstring:
     15–20, 20–30, 30–50). SNR 15 was chosen over 20 because 20 removes a third
     of the cool DESI anchors (4,958 → 3,240 below 4000 K) and 14% of the SLAM
     ones; with the scaled errors the noisy stars get little weight anyway.
-  - **Cool edge** (a judgement call): the sample falls off steeply below
-    ≈ 3500 K (peak at 3620 K), and agreement degrades towards the edge (the
+  - **Cool edge** (a judgment call): the sample falls off steeply below
+    ≈ 3500 K (peak at 3620 K), and agreement degrades toward the edge (the
     [α/M] offset: ≈ 0 at 3600–3700 K, +0.03, +0.07, +0.11 below 3400 K). That
     trend is measured in bins of CLAM's *own* noisy Teff at a steeply falling
     edge, so part of it is a selection effect. The first version cut at 3500 K;
@@ -531,7 +535,7 @@ unique stars; 117,499 duplicate-id rows kept**; 538,232 dwarfs, 37,632 giants).
   precision) and too small: the scatter in excess of the high-SNR plateau (an
   estimate of the random error) is 1.3–3.4× the quoted value (Teff 1.9, [M/H]
   1.6–1.7, logg 1.3–1.6, [α/M] 2.3–3.4), so they are **multiplied by 2**
-  (`UNC_SCALES`; a judgement call, to be reviewed with the other catalogs; the
+  (`UNC_SCALES`; a judgment call, to be reviewed with the other catalogs; the
   default [α/Fe] floor of 0.05 dominates the final [α/M] error anyway). Median
   quoted errors: 23 K, 0.055 in logg and [M/H], 0.016 in [α/M].
 - Regularization errors `X_ERR = (0.2,)*4`: a first guess, untuned.
@@ -679,7 +683,7 @@ Stage A is reused as is. The consequences, all verified in the code:
   `config.json`; `evaluate`/`videos`/`train` take the number of categories from
   the pairs file they are given. Always pass the run's own `--pairs-path`.
 - **Rebuild the pairs file:** `astrotune-pairs` (all catalogs, shared stateful
-  RNG: the pairs of the *old* catalogs are re-randomised too, so the file no
+  RNG: the pairs of the *old* catalogs are re-randomized too, so the file no
   longer matches the legacy `training_data/pairs_and_ctrl_points.h5`; the
   parity statement in §9.1 holds only for the 16-catalog build). Back up the old
   `data/pairs_and_ctrl_points.h5` first: `--resume` of an old run requires the
@@ -695,7 +699,7 @@ Stage A is reused as is. The consequences, all verified in the code:
 - **Evaluate before believing it:** train, then run `astrotune-evaluate` *and*
   the per-pair checks of §9.7. A new catalog can make previously good catalogs
   worse (that is how the cool-star problem was found), and a catalog with no
-  overlap in some regime is only regularised there.
+  overlap in some regime is only regularized there.
 
 ---
 
@@ -743,7 +747,7 @@ model is not ported, among other things).
    **(Not ported: the error model and the importance-sampling term are
    skipped, §9.3.)**
 3. Penalties: path length (`l1_path`, `l2_path`) on pairs and control points;
-   distance of control points from identity normalised by `xe_ctrl`;
+   distance of control points from identity normalized by `xe_ctrl`;
    divergence `weight_div * log((s/s')² + eps)²`; weight l2 (`l2_weights`).
 4. Adam with `PiecewiseConstantDecay` halving `1e-3` eight times; global-norm
    clipping at 100; 32 epochs, batch 1024, `val_frac = 1/8` (validation = the
@@ -761,7 +765,7 @@ model is not ported, among other things).
 - Per-catalog results go to `transformed_data.h5` groups `catalog_{i}` with
   `params_orig/params_err_orig/params_harm/params_cov_harm/gdr3_source_id`.
 - `combine_parameters` merges multiple estimates of the same Gaia source by
-  inverse-covariance summation (with a 0.03 dex diagonal regulariser), tracking
+  inverse-covariance summation (with a 0.03 dex diagonal regularizer), tracking
   a `params_source` bitmask; a few iterations drop entries with chi² > 25 (or
   > 9 in the later variant).
 - Final product `merged_params_catalog_clean.h5` with
@@ -779,7 +783,7 @@ model is not ported, among other things).
 - Data, models, plots and the legacy notebook are **never tracked**; see
   `.gitignore`. The old git history lives in `.git.old/` (also ignored).
 - Logging via the `logging` module; the CLI configures the format.
-- Every stage must be able to prove it reproduces the legacy artefact, or must
+- Every stage must be able to prove it reproduces the legacy artifact, or must
   declare its deviation in code near the thing that deviates.
 
 ---
@@ -817,6 +821,8 @@ the catalog layer:
 | `astrotune/training_plots.py` | 378, 382–383 | figures written during training |
 | `astrotune/videos.py` | 424–448 | Kiel and [Fe/H]–[α/Fe] videos |
 | `astrotune/apply.py`, `astrotune/merge.py` | 461–488 | transform catalogs, merge by Gaia id (§9.9) |
+| `astrotune/delta/` | (new) | post-hoc learned extra uncertainties and calibration diagnostics (§9.10; not in the notebook, which trained a joint error model that was not ported) |
+| `astrotune/catalog_graph.py` | (new) | catalog size/connectivity figure for the paper (§9.11) |
 | `astrotune/diagnostics.py` | 419–453, 456–460, 526–544 | **mostly not ported** |
 
 ### 9.1 Data for training
@@ -898,7 +904,7 @@ Loss as implemented (per step): add Gaussian noise to `x0` (scale
 `clip(xs0, 1e-5, 1)`); map `x0` forward with catalog `c0`, then backward with
 `c1`; pair term = log-space chi² of the result against `x1` with the reported
 `sigma_x`, softened to `T*arcsinh(chi²/T)`; plus control-point penalties (path
-length, distance from identity normalised by `xe_ctrl`, divergence) and weight
+length, distance from identity normalized by `xe_ctrl`, divergence) and weight
 decay. Adam, learning rate 1e-3 halved at seven evenly spaced steps, global-norm
 clip 100, batch 1024, validation = the first 1/8 of rows.
 
@@ -959,15 +965,48 @@ catalog_j − catalog_k, "scatter" is 1.4826·MAD; before → after harmonizatio
 |---|---|---|---|---|---|
 | `models/test30` | turnover 15, 1 epoch (24 min) | \|off\| 0.108→0.038 · σ 0.094→0.089 | 0.072→0.039 · 0.132→0.124 | 0.115→0.054 · 0.162→0.148 | 0.115→0.015 · 0.112→0.102 |
 | `models/turnover50` | turnover 50, 1 epoch | 0.108→0.036 · 0.094→0.089 | 0.072→0.038 · 0.132→0.123 | 0.115→0.049 · 0.162→0.147 | 0.115→0.017 · 0.112→0.097 |
-| `models/turnover50_8ep_19cat` | turnover 50, 8 epochs (19,766 steps), **19 catalogs**, `data/pairs_19cat.h5` (3,585,330 pairs, 2,891,485 control points; per-catalog dispersed `x_err`, SLAM [α/Fe] x_err 0.4) | *in progress* (started 2026-11-08 07:05; ~1.5 s/step with the other run, ETA ~8 h). Not directly comparable with the rows above: different catalogs and pairs, and the dispersed-`x_err` change is confounded with it. | | | |
-| `models/turnover50_8ep` | turnover 50, 8 epochs (12,147 steps) | *in progress* (started 2026-11-08 ~02:00; ~1.7 s/step under GPU contention, ETA several hours) | | | |
+| `models/turnover50_8ep` | 16 catalogs, turnover 50, 8 epochs (12,147 steps), batch 1,024 | 0.107→0.022 · 0.094→0.079 | 0.072→0.027 · 0.132→0.114 | 0.115→0.021 · 0.162→0.132 | 0.115→0.008 · 0.112→0.072 |
 
-Reading this: **the surveys do come into alignment** (the main acceptance test
-the owner asked for): systematic offsets shrink 2–8×; scatter barely changes
-(it is mostly measurement noise, which a smooth map cannot remove). Turnover 50
-is marginally better than 15 on aggregate and reduces the SLAM regression below
-by a third to a half without removing it. The new model does not need to match
-the legacy `models/bijector`; it has not been compared with it.
+**19-catalog runs** (`data/pairs_19cat.h5`: 3,585,330 pairs, 2,891,485 control points; per-catalog
+dispersed `x_err`; SLAM [α/Fe] `x_err` 0.4; averages over 68/68/64/45 catalog pairs, so not
+comparable with the rows above). "chi²" is the final-stage training chi²; all runs have
+turnover 50, `val-every 4`. Batch size × epochs = steps; lr is the initial value (7 halvings).
+
+| Run | Settings | chi² | Teff | [Fe/H] | logg | [α/Fe] |
+|---|---|---|---|---|---|---|
+| `models/turnover50_8ep_19cat` | batch 1,024, 8 ep (19,766 steps), lr 1e-3 | 20.11 | 0.099→0.014 · 0.095→0.073 | 0.074→0.018 · 0.134→0.113 | 0.114→0.014 · 0.164→0.127 | 0.079→0.011 · 0.083→0.060 |
+| `models/turnover50_16ep_16kbatch_19cat` | batch 16,384, 16 ep (2,470 steps), lr 2e-3 | 20.99 | 0.099→0.016 · 0.095→0.073 | 0.074→0.026 · 0.134→0.119 | 0.114→0.018 · 0.164→0.132 | 0.079→0.009 · 0.083→0.067 |
+| `models/turnover50_16ep_16kbatch_19cat_div0p3` | same, `weight_div` 0.3 (was 3) | 20.95 | 0.099→0.015 · 0.095→0.073 | 0.074→0.026 · 0.134→0.120 | 0.114→0.017 · 0.164→0.133 | 0.079→0.009 · 0.083→0.066 |
+| `models/turnover50_64ep_16kbatch_19cat` | batch 16,384, 64 ep (9,883 steps), lr 2e-3 | 19.47 | 0.099→0.010 · 0.095→0.069 | 0.074→0.015 · 0.134→0.113 | 0.114→0.016 · 0.164→0.122 | 0.079→0.013 · 0.083→0.059 |
+| `models/turnover50_64ep_16kbatch_19cat_weakdivctrl` | same, `weight_div` 0.3 and `l1/l2_total`, `l1/l2_path` 0.01 (was 0.1) | 18.80 | 0.099→0.011 · 0.095→0.069 | 0.074→0.020 · 0.134→0.115 | 0.114→0.020 · 0.164→0.127 | 0.079→0.022 · 0.083→0.059 |
+
+Reading this (all single runs, no seed-to-seed variance measured; the cool-star pairs of §9.7
+have **not** been re-checked for the 19-catalog runs):
+
+* **The surveys do come into alignment** (the main acceptance test the owner asked for):
+  systematic offsets shrink 4–15×; scatter shrinks a little (mostly measurement noise, which a
+  smooth map cannot remove). Turnover 50 is marginally better than 15 on aggregate and reduces
+  the SLAM regression of §9.7 by a third to a half without removing it. The new model does not
+  need to match the legacy `models/bijector`; it has not been compared with it.
+* **Batch size.** On the shared A100 a step takes about the same at batch 1,024, 4,096 and
+  16,384 (≈ 1.0–1.3 s), so large batches are almost free. At 1,024, 43–100 % of the steps are
+  clipped (gradient norm ≈ 100); at 16,384 none after the early stage (norm ≈ 34). The
+  16-epoch / 16k runs end at chi² 21.0, worse than the 8-epoch / 1k run (20.1). The loss had
+  flattened in both, so the difference is probably the 4× smaller total learning-rate budget
+  (sum of lr over steps: 1.2 against 4.9), not noise or overfitting (train ≈ validation). This
+  is inferred, not tested.
+* **Matching the budget helps:** 64 epochs at 16k (9,883 steps, ≈ 3.5 h on the shared GPU, against
+  ≈ 9 h) reach chi² 19.5, better than the 8-epoch / 1k run, with better Teff and [Fe/H]
+  agreement and slightly worse [α/Fe] bias (0.013 against 0.011).
+* **The div penalty is not the cause of the kinks in the DESI log g curve:** with `weight_div`
+  0.3 the penalty term drops 7.6× but chi² (20.95 against 20.99) and the agreement metrics hardly
+  move, and the DESI DR1 log g shift curve in `evaluation/param_shifts.png` has the same shape in
+  both runs (a steep ramp from −0.37 at log g 3.4 to −0.15 at 4.0, a drop above 4.2). The kinks look
+  data-driven.
+* **Weakening the div and control penalties together (÷10) gives the lowest chi² (18.8) but
+  worse agreement** in [α/Fe] (bias 0.022 against 0.013) and logg (0.020 against 0.016): a lower
+  chi² is not the same as better agreement. Keep the default penalties until the cool-star pairs
+  say otherwise.
 
 Videos for these runs are in `models/<run>/videos/` (§9.5).
 
@@ -998,8 +1037,8 @@ k − j) on the vertical axis, for one catalog pair) are `--plane param1v1` and
 *both* catalogs measure that parameter (and say so if there are none); axis
 limits are 0.5–99.5 percentiles over all frames plus a margin, rather than the
 first frame's full range, so outliers do not set the scale; the Teff axis is
-labelled in 1000 K with a tick spacing chosen from the range (the notebook's
-fixed 5/10/20/30 ticks left cool-star panels unlabelled).
+labeled in 1000 K with a tick spacing chosen from the range (the notebook's
+fixed 5/10/20/30 ticks left cool-star panels unlabeled).
 Trajectories come from `load_bijector`, i.e. from the latest checkpoint.
 
 **Pitfall: `evaluate.py` hides small catalog pairs.** It only reports catalog
@@ -1059,7 +1098,7 @@ Found by looking at the `test30` videos: in the [Fe/H]–[α/Fe] plane one surve
 moves *away* from the others. It is **SDSS-V SLAM**: its [α/Fe] starts at
 about −0.04 and ends at about −0.12 (median shift −0.078), 0.08–0.2 dex from
 APOGEE/GALAH/ASPCAP in the harmonized space. The `turnover50` run has the same
-behaviour with smaller amplitude.
+behavior with smaller amplitude.
 
 Evidence (verified; all pairs, not only validation; "cool" = 5 ln(Teff/5000 K)
 < −1.4, i.e. Teff ≲ 3800 K; median [α/Fe] offset catalog_j − catalog_k, original
@@ -1097,6 +1136,29 @@ The owner asked to test whether this improves with (a) turnover 50 (done:
 reduced, not removed) and (b) longer training (the 8-epoch run, in progress).
 Later, the DESI/other-survey overlap at low temperature may improve with more
 data (§10).
+
+### 9.8 Gotchas for whoever continues
+
+- **Number of categories is per run, not global.** `load_bijector` reads the
+  catalog list from the run's `config.json` (`registry.run_keys`); `evaluate`,
+  `videos` and `train` use `max(c_control)+1` of the pairs file they are given.
+  The old 16-catalog runs therefore still work with
+  `data/pairs_and_ctrl_points.h5`; the 19-catalog run needs
+  `data/pairs_19cat.h5`.
+- **Progress figures hide parameters a catalog does not measure** (they used to
+  show placeholder zeros as a horizontal stripe at [α/Fe] = 0): the loader sets
+  `ctrl_dict["missing_control"]` before the `x_err` fix-up, and
+  `training_plots.catalog_sample_valid` turns it into a mask. Figures from before
+  2026-11-08 07:00 still show the stripe.
+- Catalog order is the category index and is baked into checkpoints (§5.2):
+  append only.
+- `config.json` is rewritten on resume with the (possibly updated) config and a
+  `resumed` list of timestamps.
+- Training tests: `tests/test_training.py` trains 40 real steps on synthetic data
+  (≈ 2.5 min); use `-k video` or `-k "pairs or dedupe or control or save"` for
+  the fast ones.
+- Do not run heavy analysis on the GPU while a long run is going: it slows the
+  run (1.0 → 1.7 s/step observed).
 
 ### 9.9 Applying the model and merging by star (`astrotune-apply`)
 
@@ -1187,28 +1249,121 @@ is not simply `sqrt(C_ii)`. Matmuls run in TF32 on the A100, so propagated
 covariances are accurate to ~1e-3 relative. Entries with a single catalog never
 go through a chi² test (chi² = 0).
 
-### 9.8 Gotchas for whoever continues
+### 9.10 Post-hoc learned uncertainties (`astrotune/delta/`) — new, beyond the notebook
 
-- **Number of categories is per run, not global.** `load_bijector` reads the
-  catalog list from the run's `config.json` (`registry.run_keys`); `evaluate`,
-  `videos` and `train` use `max(c_control)+1` of the pairs file they are given.
-  The old 16-catalog runs therefore still work with
-  `data/pairs_and_ctrl_points.h5`; the 19-catalog run needs
-  `data/pairs_19cat.h5`.
-- **Progress figures hide parameters a catalog does not measure** (they used to
-  show placeholder zeros as a horizontal stripe at [α/Fe] = 0): the loader sets
-  `ctrl_dict["missing_control"]` before the `x_err` fix-up, and
-  `training_plots.catalog_sample_valid` turns it into a mask. Figures from before
-  2026-11-08 07:00 still show the stripe.
-- Catalog order is the category index and is baked into checkpoints (§5.2):
-  append only.
-- `config.json` is rewritten on resume with the (possibly updated) config and a
-  `resumed` list of timestamps.
-- Training tests: `tests/test_training.py` trains 40 real steps on synthetic data
-  (≈ 2.5 min); use `-k video` or `-k "pairs or dedupe or control or save"` for
-  the fast ones.
-- Do not run heavy analysis on the GPU while a long run is going: it slows the
-  run (1.0 → 1.7 s/step observed).
+Idea (owner): after the bijector is trained, learn an extra variance per catalog
+entry, `ln_delta_cov(x, ln σ_x, catalog)` → 4 numbers, as a function of the
+entry's *own* catalog parameters (same transforms, e.g. `5 ln(Teff/5000 K)`),
+the log of its reported uncertainties, and the catalog (FiLM, reusing
+`VectorNetwork`). The output lives in the *harmonized* space. Objective: for each
+pair of entries of one star, the Gaussian likelihood of `d = y_a − y_b` with
+`S = C_a + C_b + diag(exp(ln_δ_a) + exp(ln_δ_b))`, **including `ln det S`** (without
+it the fit would inflate the errors to infinity). Parameters not measured by both
+catalogs are dropped from the quadratic form and the determinant. This is a
+less ambitious, post-hoc replacement for the learned error model the notebook
+trained *jointly* with the bijector (`ln_err_model`, not ported, §9.3). Decisions
+made with the owner: Gaussian likelihood and diagonal, additive-only for now
+("start simple"); the reported `ln σ_x` is an input; diagnostics before the model.
+
+```
+astrotune-apply --run-dir models/X                 # needs the transform cache (§9.9)
+astrotune-delta-diagnose --run-dir models/X        # calibration, no model; ~30 s
+astrotune-delta-train --run-dir models/X           # baselines + network; ~3 min
+```
+
+Everything goes to `<run>/delta/`: `pair_table.npz` (cache), `diagnostics/`,
+`delta_model.*` + `delta_model_config.json` (`model.load_delta_model`, and
+`model.numpy_delta_fn(model)(x, ln_sigma, catalog)`), `evaluation/`
+(`comparison.txt/json`, calibration figures with `_none` / `_network`,
+`learned_delta.png`). The bijector is frozen, so training uses precomputed `y`,
+`C` per pair (no ODE): it is cheap and has to be redone when the bijector changes.
+
+Design choices to know about: **one row per star per catalog** (the first in the
+table: no many-to-many pairs from repeated spectra, unlike the bijector
+training); the train/validation split is **by star** (id hash, 1/8); pairs are a
+composite likelihood (the three pairs of a triple are correlated; a per-star
+likelihood would be the principled upgrade); `ln_δ` has a smooth floor at
+σ = 0.003 and a weak Gaussian prior (center σ = 0.03, width 3 in ln-variance,
+weight 0.01 per sample). The pair difference constrains only `Σ_j + Σ_k`; the
+split between catalogs is identified through triangles of catalogs and the
+likelihood is very flat along it (needs ~1,000 steps at high lr to converge in
+the synthetic test), so poorly connected catalogs (VMP, PIGS, SLAM, MDC) are
+prior-dominated. Tests: `tests/test_delta.py` (likelihood vs scipy incl. masking,
+recovery of known extra variances, diagnostics on synthetic pairs).
+
+**Findings on `models/turnover50_8ep` (16 catalogs, 1.43 M pairs, rough)** —
+before any delta (`diagnostics/summary.txt`):
+- The quoted errors in the harmonized space are *both* too small and too large:
+  GALAH pairs and APOGEE×ASPCAP have scatter 0.3–0.9 of the quoted error
+  (APOGEE×ASPCAP share spectra and pipeline, so their errors are correlated);
+  LAMOST/DESI/BOSSNet pairs 1.1–1.8; DESI DR1×APOGEE/ASPCAP ~2–3. The robust
+  per-catalog excess is *negative* (errors too large) for GALAH, APOGEE, ASPCAP,
+  RAVE, and for [α/Fe] in nearly every catalog (the 0.05 error floor on [α/Fe]
+  exceeds the real scatter). An additive term cannot represent that.
+- Heavy tails: pooled `P(χ² survival < 1e-3) = 7%`, `|z| > 3` in 3–6 % of pairs
+  for Teff/[Fe/H]/logg.
+- The excess error is **correlated** (core residuals, observed vs predicted by
+  `S`): Teff–logg +0.38 vs −0.01, [Fe/H]–[α/Fe] −0.32 vs 0.00, Teff–[Fe/H] +0.18
+  vs −0.02. A diagonal delta cannot capture this.
+- The scale ratio depends on Teff (≈1.4 for hot stars, <0.6 for cool stars).
+
+After training (validation pairs, mean NLL per pair; lower is better):
+none −3.06, floor 0.03 (what the merge uses) −3.55, constant per catalog −4.20,
+**network −4.64** (train −4.66: no overfitting). The network learns strong
+Teff dependence (APOGEE/ASPCAP at the floor; LAMOST, DESI, BOSSNet at 0.05–0.1;
+larger for cool stars). **But calibration is not fixed**: median PIT 0.21 (0.5 if
+calibrated), the core is over-dispersed (scale ratio 0.66/0.85/0.69/0.35 for
+Teff/[Fe/H]/logg/[α/Fe]) because the Gaussian fit inflates to cover the tails, and
+`P(sf < 1e-3)` is still 0.76 % (nominal 0.1 %). [α/Fe] sits at the floor and is
+still too wide. Next steps, in the order the data suggest: a heavy-tailed
+likelihood (Student-t or outlier mixture); a multiplicative scale on the
+propagated covariance (lets the errors shrink); a full Cholesky factor
+(correlated excess); then replacing the 0.03 floor in `apply.py` with the model.
+Not yet integrated into `apply.py`/`merge.py`.
+
+Prerequisites and API: a run needs its transform cache (`astrotune-apply`), so the
+19-catalog runs have to be applied first (only `models/turnover50_8ep` has been). In
+code: `delta.pairs.get_pair_table`, `delta.diagnostics.diagnose` / `pair_stats`
+(accept an optional `delta_fn(x, ln_sigma, catalog) -> ln_delta`, so the same
+calibration measures can be computed with any covariance model),
+`delta.train.fit` / `run`, `delta.model.pair_nll`. To use a learned delta in the merge
+add `diag(exp(ln_delta))` to each entry's covariance in `apply.transform_catalog`
+(only for parameters the catalog measures) and drop the 0.03 floor in `merge.py`;
+the model's `ln σ_x` input is `log(sigma_x)`, set to 0 where a parameter is not measured.
+
+### 9.11 Catalog connectivity figure (`astrotune-catalog-graph`)
+
+For the paper (owner's idea): nodes = catalogs (radius ~ log10 rows), edges = pairs
+of catalogs that share stars (width/alpha ~ log10 shared stars), plus an
+adjacency matrix of every pair. Facts that shaped the design (19 catalogs): 138 of
+the 171 possible pairs share at least one star, 94 share ≥ 100, 70 share ≥ 1,000
+and 31 share ≥ 10,000 (max 283,068, APOGEE×ASPCAP); PIGS shares < 100 stars
+with anything and VMP only with DD-Payne. The graph is therefore close to complete:
+**no planar layout exists** and the crossing number is large, so the layout is a
+heuristic: weighted stress majorization (SMACOF; target distance short for many shared
+stars, long for none) with 300 restarts, keeping the one with the smallest
+*strength-weighted* crossing number (the circular layout, nodes ordered by annealing, is the alternative). Edges drawn: pairs with
+≥ `--min-shared` stars **plus every catalog's `--top-k` (3) strongest links**, so that
+the smallest catalogs (PIGS, VMP) are never left without an edge; the edge scale and
+legend then extend down to the weakest drawn edge (10 stars). With the default
+settings: 76 edges, 214 crossings (circle layout: 322). Edges are not straight: `route_edges` curves each edge (a chain of 40 points
+with fixed ends) around the nodes it is not attached to, with two forces: **tension**
+(each point is pulled toward the midpoint of its neighbors, so the curve wants to be
+straight) and **node repulsion** (every unrelated node pushes the points away from its
+center, strongly inside the circle and falling off as `exp(-d / 0.02)` outside its
+boundary). The closest approach of an edge to an unrelated node is logged (0.047 data
+units for the spring layout: nothing runs under a node); `--straight-edges` turns
+this off. The layout choice itself still scores straight-line crossings. Labels are placed by a small greedy placer
+(`place_labels`). Node radius is a power law of the row count (`rows**0.25`, i.e. 11x between 300 and 4 M rows) and edge width/opacity are steeper-than-linear functions of log10(shared stars) (0.7-9 pt); the legend shows the reference values; "rows" is the
+catalog's row count, shared stars are unique Gaia ids. The family (color) mapping
+is `catalog_graph.FAMILIES`; a new catalog must be added there (a test enforces it).
+The colors are generated with distinctipy for **deuteranomaly** (the most common
+color-vision deficiency): seed 34, pastel factor 0.2, min pairwise distance 0.52 in
+the simulated space (the earlier hand-picked palette: 0.11; a test checks both).
+Labels use the full "SDSS-V" name; the matrix marks the family with color chips,
+not colored text (some colors are too light to read).
+Not done: marking pairs whose errors are correlated (shared spectra or training
+labels, e.g. APOGEE–ASPCAP), which would be useful given §9.10.
 
 ### Notes from the original port order (all done; kept for context)
 
@@ -1219,7 +1374,7 @@ go through a chi² test (chi² = 0).
    verbatim, then verified against the legacy pairs file (§9.1).
 3. `train.py` — ported `grad_step` last, after the data matched.
 4. `apply.py` and `merge.py` are written (§9.9); `diagnostics.py` is next. The
-   legacy artefacts to compare against are `transformed_data.h5` and
+   legacy artifacts to compare against are `transformed_data.h5` and
    `merged_params_catalog_clean.h5` in the repo root.
 
 ## 10. What remains
@@ -1231,63 +1386,81 @@ In rough priority order:
    dispersed `x_err` (and SLAM 0.2 vs 0.4). Needs the GPU, so after the 8-epoch
    run. This is the test of whether the change helps; so far it is only
    verified to be consistent.
-1. **Finish the 8-epoch run** (`models/turnover50_8ep`, §9.4) and compare it with
-   `test30`/`turnover50`: the aggregate agreement table, and the cool-star pairs
-   of §9.7 (does the SLAM/MDC/DESI [α/Fe] regression shrink with more
-   training?). Make its videos with `astrotune-videos`, including
-   `--plane feh_alpha --highlight sdssv_slam --highlight sdssv_mdc`.
+1. **Check the cool-star pairs of §9.7 for the long runs** (`models/turnover50_8ep` and the
+   19-catalog runs of §9.4): does the SLAM/MDC/DESI [α/Fe] regression shrink with more training
+   or with the new catalogs (CLAM and Li+2025 reach the cool stars)? The aggregate agreement
+   is in §9.4. Make videos with `astrotune-videos`, including
+   `--plane feh_alpha --highlight sdssv_slam --highlight sdssv_mdc`, and the new
+   `param1v1_diff` pair videos (`--all-pairs-min 50`).
 2. **Per-catalog regression report in `evaluate.py`** (not done; proposed and
    not yet approved by the owner). Use *all* pairs with a low threshold (≈ 30),
    also stratify by Teff, flag every catalog pair that gets worse, and print
    per-catalog summaries. This is what exposed the SLAM problem (§9.7) and the
    present report cannot show it (§9.5). Related: label the background
    catalogs in the pair videos so a reader can tell which survey is which.
-3. **Modelling questions** raised by §9.7, for the owner to decide: whether the
+3. **Modeling questions** raised by §9.7, for the owner to decide: whether the
    small cool-star pairs need more weight (e.g. per-pair-type balancing), a
    bigger network, or more data; whether to revisit the uniform-uncertainty
    chi² the owner thought worked better; whether to turn on
    `--pair-path-in-loss` / `--freeze-after-frac`.
 4. **Optional:** zero noise on unknown axes in the loss so training matches
    evaluation (§9.6; small effect).
-5. **`apply.py`** (cells 461–488): **done** (§9.9), but run it on the full
-   catalogs with the final model (≈ 100 min for 12.9 M entries on a shared GPU).
+5. **`apply.py`** (cells 461–488): **done** (§9.9) and run on the 16-catalog
+   `models/turnover50_8ep` (9.25 M sources). Run it again with the final 19-catalog model
+   (≈ 100 min for 12.9 M entries on a shared GPU; the transform cache then lets the merge
+   settings change in minutes).
    **`diagnostics.py`** (cells 419–453, 456–460, 526–544; the paper's figures) is
    still to do. The notebook bugs listed below must be fixed, not copied. Legacy
-   artefacts to compare against: `transformed_data.h5`,
+   artifacts to compare against: `transformed_data.h5`,
    `merged_params_catalog_clean.h5` in the repo root.
 6. **New data** (from `TODO.md`; each is a new catalog module: follow the
-   two-stage procedure in §5.6, then append to the registry and retrain — see the
-   `load_bijector` gotcha, §9.8):
+   two-stage procedure in §5.6, then append to the registry and retrain; the
+   three bullets below marked *promoted* are already in the model, §5.5):
    - SDSS-V DR20 (new BOSS data, no new APOGEE data; the Astra 0.8.1 summary
      files are listed in `TODO.md`): **not done**.
-   - The new `The CLAM` catalog (BOSS-CLAM, arXiv 2607.22822): **prepared as a
-     candidate** (`sdssv_clam`, §5.5; 894,216 stars). Unlike Nagaraj it overlaps
+   - The new `The CLAM` catalog (BOSS-CLAM, arXiv 2607.22822): **promoted into the
+     model** (`sdssv_clam`, §5.5; 894,216 stars). Unlike Nagaraj it overlaps
      the cool-star catalogs heavily (SLAM 8,298, MDw Cannon 1,475, DESI DR1 6,609
      cool stars, all with [α/Fe] in both) and its first comparison supports DESI
-     DR1 being the outlier in [α/Fe] at low temperature (§5.5). Open decisions for
-     the owner before promoting it: the ×4 uncertainty scaling, whether to keep
+     DR1 being the outlier in [α/Fe] at low temperature (§5.5). Open decisions that
+     remain: the ×4 uncertainty scaling, whether to keep
      `LOW_MASS_TEFF_LOGG_CORR` stars (see §5.5), `WARN_IGNORES_FEH`, and the
      pinned logg of stars above 8000 K.
    - LAMOST DR12 for the LRS data: **not done**.
-   - The LAMOST M-star catalog of Li et al. (2025): **prepared as a candidate**
+   - The LAMOST M-star catalog of Li et al. (2025): **promoted into the model**
      (`lamost_mstar_li2025`, §5.5; 575,864 rows; DR10 spectra, so the TODO's
      `_dr12` key and URL were corrected; the URL there is the *official* DR12
      M-star catalog, not built). It overlaps DESI DR1 (28,006 stars), CLAM
      (7,500, independent spectra), MDw Cannon (4,493) and SLAM (2,762), all with
      [α/Fe] in both, and its comparison supports the CLAM-based picture of
-     §5.5 (DESI DR1 high in [α/Fe] at low temperature). Open decisions for the
-     owner before promoting it: the ×2 uncertainty scaling, the SNR threshold
+     §5.5 (DESI DR1 high in [α/Fe] at low temperature). Open decisions that
+     remain: the ×2 uncertainty scaling, the SNR threshold
      (30 in the quadrature sum), the APOGEE non-independence, and the many
      repeat spectra (24% of rows; no dedupe, per policy).
-   - The Nagaraj et al. (2026) DESI catalog (arXiv 2610.04294): **prepared as a
-     candidate** (`desi_nagaraj2026`, §5.5; partial release of ~170,000 stars, not
-     yet in the model). The owner hoped it would improve the overlap between
+   - The Nagaraj et al. (2026) DESI catalog (arXiv 2610.04294): **promoted into the
+     model** (`desi_nagaraj2026`, §5.5; partial release of ~170,000 stars). The owner hoped it would improve the overlap between
      DESI and the other surveys at low temperature, i.e. where §9.7 shows the
      problem; §5.5 shows it cannot reach the M-dwarf regime (no stars < 4050 K, no
-     overlap with SLAM/MDC), only add K-star anchors. Promote it by appending to
-     `registry.CATALOGS` and retraining; wait for the full release for much
-     larger overlaps.
-7. **Open decisions** (below).
+     overlap with SLAM/MDC), only add K-star anchors. Wait for the full
+     release for much larger overlaps.
+7. **Post-hoc error calibration** (§9.10), in the order the data suggest: a heavy-tailed
+   likelihood (Student-t or an outlier mixture; the Gaussian fit inflates the core), a
+   multiplicative scale on the propagated covariance (so errors can shrink: GALAH, APOGEE,
+   ASPCAP and [α/Fe] are over-estimated), a full Cholesky factor (the excess error is
+   correlated: Teff–logg +0.38), a per-star (not per-pair) likelihood, then use the model in
+   `apply.py` in place of the 0.03 floor and re-derive the chi² cut of the merge from
+   calibrated errors. Treat catalogs with shared spectra or labels (APOGEE/ASPCAP,
+   DD-Payne and Li+2025 trained on APOGEE, the two DESI catalogs) explicitly: the method
+   learns only the independent part of each error. Repeat spectra within a catalog are an
+   independent check of the learned variances. Also carry SNR through the prepared
+   tables as a model input.
+8. **Training budget** (§9.4): the 64-epoch / 16k-batch runs beat the 8-epoch / 1k-batch run
+   in chi² at about 40 % of the wall time; decide the final model's batch size, epochs and
+   learning rate (a 4,096 batch with 16 epochs would match the 1k run's learning-rate
+   budget), then run the cool-star check of item 1 and `astrotune-apply` on it.
+9. **Catalog graph** (§9.11), optional: mark pairs with correlated errors, score layouts by
+   node intrusions of edges, and tune the look for the paper.
+10. **Open decisions** (below).
 
 ### Bugs in the notebook that must be fixed while porting (do not copy)
 
@@ -1296,7 +1469,7 @@ rest are still open: they belong to the `apply.py`/`diagnostics.py` stage.
 
 - ~~Cells 391/393/394, 397, 412, 428~~ (fixed: `variables`/`metrics_history`/
   `n_steps` are defined before use; `ln_err_model` is not ported; `n_bij_vars`
-  used; `chi2_turnover` spelt correctly; `np.concatenate`).
+  used; `chi2_turnover` spelled correctly; `np.concatenate`).
 - Cell 456 (`get_transformed_pairs`): reads global `x_ctrl` / `c_ctrl` left over
   from the training loop. Pass them explicitly.
 - Cell 460: uses `d`, the loop variable left over from cell 387/412.
