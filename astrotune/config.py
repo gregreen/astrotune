@@ -53,8 +53,14 @@ N_PARAMS = len(PARAM_NAMES)
 
 # Default error floors, added in quadrature to the catalog uncertainties.
 # (Teff, [Fe/H], logg, [alpha/Fe]); catalogs with fewer parameters use a
-# prefix of this array.
-ERROR_FLOORS = np.array([0.01, 0.01, 0.04, 0.05], dtype="f8")
+# prefix of this array. The [alpha/Fe] floor was 0.05 (legacy notebook, the first
+# trained models) and was lowered to 0.02 on 2026-11-09: it was 77-100 % of the
+# [alpha/Fe] variance of most catalogs, and the pair differences of the harmonized
+# estimates are consistent with errors of about 0.02 (porting_project.md, section 9.10).
+ERROR_FLOORS = np.array([0.01, 0.01, 0.04, 0.02], dtype="f8")
+
+# The [alpha/Fe] floor of the legacy tables, to compare prepared tables with them.
+LEGACY_ALPHA_FLOOR = 0.05
 
 # Default regularization error used when a catalog does not override it.
 DEFAULT_X_ERR = 0.1

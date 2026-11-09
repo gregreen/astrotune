@@ -173,3 +173,21 @@ def test_transform_cache_round_trip_and_mismatch(tmp_path):
     assert np.array_equal(got.ids, e.ids) and np.allclose(got.y, e.y) and np.array_equal(got.measured, e.measured)
     assert ap.load_cached(tmp_path, 3, e.ids[::-1]) is None  # different row order: not reused
     assert ap.load_cached(tmp_path, 4, e.ids) is None
+
+
+def test_transform_cache_is_discarded_when_the_table_changes(tmp_path):
+    pytest.importorskip("tensorflow")
+    from astropy.table import Table
+
+    from astrotune import apply as ap
+
+    t = Table({"id": np.array([10, 11, 12]), "x": np.zeros((3, 4), "f4"), "sigma_x": np.full((3, 4), 0.1, "f4")})
+    e = _est(3, [10, 11, 12], np.arange(12).reshape(3, 4), 0.01)
+    ap.save_cached(tmp_path, e, t)
+    assert ap.load_cached(tmp_path, 3, e.ids, t) is not None
+    t2 = t.copy()
+    t2["sigma_x"][:, 3] = 0.05  # e.g. a different error floor, with the same ids
+    assert ap.load_cached(tmp_path, 3, e.ids, t2) is None
+    ap.save_cached(tmp_path, e)  # a cache made before the check existed
+    assert ap.load_cached(tmp_path, 3, e.ids, t) is None
+    assert ap.load_cached(tmp_path, 3, e.ids) is not None  # still readable without a table

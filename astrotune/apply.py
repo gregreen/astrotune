@@ -160,21 +160,44 @@ def _cache_path(cache_dir: Path, index: int) -> Path:
     return cache_dir / f"catalog_{index:02d}.npz"
 
 
-def save_cached(cache_dir: Path, est: Estimates) -> None:
+def table_checksum(table: Table) -> int:
+    """CRC32 of the parameters and uncertainties of a prepared table.
+
+    The cached covariances are propagated from ``sigma_x``, so a cache must be discarded when
+    ``x`` or ``sigma_x`` change (e.g. when an error floor is changed), even if the ids do not.
+    """
+    import zlib
+
+    crc = zlib.crc32(np.ascontiguousarray(np.asarray(table["x"], dtype="f4")).tobytes())
+    return zlib.crc32(np.ascontiguousarray(np.asarray(table["sigma_x"], dtype="f4")).tobytes(), crc)
+
+
+def save_cached(cache_dir: Path, est: Estimates, table: Optional[Table] = None) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     tmp = cache_dir / "tmp.npz"
-    np.savez(tmp, ids=est.ids, y=est.y.astype("f4"), cov=est.cov.astype("f4"), measured=est.measured)
+    extra = {} if table is None else {"table_crc": np.int64(table_checksum(table))}
+    np.savez(tmp, ids=est.ids, y=est.y.astype("f4"), cov=est.cov.astype("f4"), measured=est.measured, **extra)
     os.replace(tmp, _cache_path(cache_dir, est.index))
 
 
-def load_cached(cache_dir: Path, index: int, ids: np.ndarray) -> Optional[Estimates]:
-    """The cached estimates of catalog ``index`` if they belong to the same rows."""
+def load_cached(cache_dir: Path, index: int, ids: np.ndarray, table: Optional[Table] = None) -> Optional[Estimates]:
+    """The cached estimates of catalog ``index`` if they belong to the same rows.
+
+    With ``table`` (the prepared table the estimates are for) the cache is also required to
+    have been made from the same ``x`` and ``sigma_x``; caches written without that check
+    (before 2026-11-09) are treated as stale.
+    """
     path = _cache_path(cache_dir, index)
     if not path.exists():
         return None
     with np.load(path) as f:
         if len(f["ids"]) != len(ids) or not np.array_equal(f["ids"], ids):
             log.warning("Cache %s does not match the current table; recomputing", path)
+            return None
+        if table is not None and ("table_crc" not in f.files or int(f["table_crc"]) != table_checksum(table)):
+            log.warning(
+                "Cache %s was made from different x or sigma_x (or before they were checked); recomputing", path
+            )
             return None
         return Estimates(index, f["ids"], f["y"], f["cov"], f["measured"])
 
@@ -407,12 +430,12 @@ def apply_run(
 
     estimates = []
     for key, idx, t in zip(keys, indices, tables):
-        e = load_cached(cache_dir, idx, np.asarray(t["id"])) if reuse_transform else None
+        e = load_cached(cache_dir, idx, np.asarray(t["id"]), t) if reuse_transform else None
         if e is None:
             if transform is None:
                 transform = make_transform(load_bijector(run_dir))
             e = transform_catalog(transform, t, idx, batch_size, desc=key)
-            save_cached(cache_dir, e)
+            save_cached(cache_dir, e, t)
         else:
             log.info("%s: using the cached transformation", key)
         estimates.append(e)

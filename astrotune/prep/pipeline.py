@@ -200,7 +200,7 @@ def _report_parity(key: str, table: Table) -> None:
     except Exception as exc:  # pragma: no cover - unreadable legacy file
         log.warning("[%s] could not read legacy table %s: %s", key, legacy, exc)
         return
-    report = io.parity_report(table, reference)
+    report = io.parity_report(io.restore_legacy_alpha_floor(table), reference)
     for line in io.format_parity(report).splitlines():
         log.info("[%s] parity | %s", key, line)
 

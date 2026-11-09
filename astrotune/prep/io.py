@@ -150,6 +150,21 @@ def validate_table(
 
 
 # --- Parity against the legacy notebook output ------------------------------
+def restore_legacy_alpha_floor(table: Table) -> Table:
+    """A copy of ``table`` whose [alpha/Fe] floor is the legacy one (0.05, not the current one).
+
+    The floor was lowered on purpose (:data:`astrotune.config.ERROR_FLOORS`); undoing it
+    lets everything else in ``sigma_x`` still be compared with the legacy tables.
+    """
+    out = table.copy()
+    if out["sigma_x"].shape[1] == config.N_PARAMS:
+        s = np.asarray(out["sigma_x"][:, 3], dtype="f8")
+        ok = s < 1e6  # not a "not measured" placeholder
+        s[ok] = np.sqrt(np.maximum(s[ok] ** 2 - config.ERROR_FLOORS[3] ** 2 + config.LEGACY_ALPHA_FLOOR**2, 0.0))
+        out["sigma_x"][:, 3] = s
+    return out
+
+
 def parity_report(table: Table, reference: Table, *, n_percentiles=(1.0, 50.0, 99.0)) -> dict:
     """Compare a freshly built table with the legacy notebook output."""
     report: dict[str, Any] = {

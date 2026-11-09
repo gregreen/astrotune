@@ -390,6 +390,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         attrs=dict(
             seed=args.seed, dedupe=args.dedupe, dispersed_xerr=args.dispersed_xerr,
             catalogs=",".join(registry.keys()),
+            error_floors=",".join(f"{v:g}" for v in config.ERROR_FLOORS),
         ),
     )
     return 0

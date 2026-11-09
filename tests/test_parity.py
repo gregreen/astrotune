@@ -44,6 +44,9 @@ def test_parity_with_legacy(key):
 
     new = Table.read(config.catalog_path(key))
     reference = Table.read(legacy)
+    # The [alpha/Fe] floor was lowered on purpose; put the legacy floor back so that every other
+    # part of the uncertainty is still compared with the legacy table.
+    new = io.restore_legacy_alpha_floor(new)
     report = io.parity_report(new, reference)
 
     assert report["n_new"] == report["n_ref"]

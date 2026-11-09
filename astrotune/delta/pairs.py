@@ -99,9 +99,12 @@ def build_pair_table(run_dir, cache_dir: Optional[Path] = None) -> Tuple[PairTab
 
     cats = []
     for i, (key, t) in enumerate(zip(keys, tables)):
-        est = load_cached(cache_dir, i, np.asarray(t["id"]))
+        est = load_cached(cache_dir, i, np.asarray(t["id"]), t)
         if est is None:
-            raise FileNotFoundError(f"No usable cached transformation for {key} in {cache_dir}.")
+            raise FileNotFoundError(
+                f"No usable cached transformation for {key} in {cache_dir} (missing, or made from a "
+                f"different x or sigma_x): run `astrotune-apply --run-dir {run_dir}` (again)."
+            )
         cats.append(_catalog_arrays(est, t))
         log.info("%s: %d stars (first row per id)", key, len(cats[-1]["id"]))
     del tables
