@@ -42,6 +42,7 @@ astrotune-overlaps = "astrotune.prep.overlaps:main"
 astrotune-apply = "astrotune.apply:main"
 astrotune-delta-diagnose = "astrotune.delta.diagnostics:main"
 astrotune-delta-train = "astrotune.delta.train:main"
+astrotune-catalog-graph = "astrotune.catalog_graph:main"
 
 [tool.setuptools.packages.find]
 include = ["astrotune*"]
