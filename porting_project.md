@@ -244,6 +244,10 @@ checkpoints and pair files remain interpretable.
 `tests/test_parity.py` compares each built table against
 `training_data/<key>.h5`: identical row count, identical id set, identical row
 order, and `max|x_new - x_legacy| < 1e-5` (float32 round-off). All 16 pass.
+Since 2026-11-09 the [α/Fe] floor is 0.02, not the legacy 0.05: the test (and the
+prepare step's own parity report) first puts the legacy floor back into
+`sigma_x[:, 3]` (`prep.io.restore_legacy_alpha_floor`), so every other part of the
+uncertainty is still compared with the legacy tables.
 
 Two deliberate exceptions. Each declares `PARITY_EXEMPT` (the reason) and
 `PARITY_DIFFERS` (exactly which parameters of which columns differ); the test
@@ -392,8 +396,9 @@ Choices, all in the module docstring:
   APOGEE/GALAH/ASPCAP at SNR 10–30 is 5–8× the quoted error (3–5× once the
   systematic floor measured at SNR > 50 is subtracted), and the paper's own
   wide-binary test gives σ[Fe/H] ≈ 0.15 and σ[α/M] ≈ 0.06 at SNR = 10 against
-  0.04 and 0.019 quoted (3–4×). They are therefore **multiplied by 4** (`UNC_SCALES`, in the style of
-  `sdssv_slam`'s `unc_transf`) before the default floors are added; this keeps
+  0.04 and 0.019 quoted (3–4×). They were first **multiplied by 4**; since 2026-11-09 they are **multiplied by 3**
+  (`UNC_SCALES`, in the style of `sdssv_slam`'s `unc_transf`; the default error floors
+  apply; briefly they had their own, 0.05/0.05/0.1/0.02, see §5.7); this keeps
   the SNR dependence. A judgment call; the Nagaraj catalog is *not* scaled (no
   such external evidence). Raw scatter against other catalogs (~0.1 in
   5 ln Teff, 0.09 in [Fe/H], 0.2 in logg, 0.057 in [α/M] even at high SNR) is
@@ -534,10 +539,10 @@ unique stars; 117,499 duplicate-id rows kept**; 538,232 dwarfs, 37,632 giants).
 - **Uncertainties** are the spread of ten cross-validated CNNs (internal
   precision) and too small: the scatter in excess of the high-SNR plateau (an
   estimate of the random error) is 1.3–3.4× the quoted value (Teff 1.9, [M/H]
-  1.6–1.7, logg 1.3–1.6, [α/M] 2.3–3.4), so they are **multiplied by 2**
-  (`UNC_SCALES`; a judgment call, to be reviewed with the other catalogs; the
-  default [α/Fe] floor of 0.05 dominates the final [α/M] error anyway). Median
-  quoted errors: 23 K, 0.055 in logg and [M/H], 0.016 in [α/M].
+  1.6–1.7, logg 1.3–1.6, [α/M] 2.3–3.4), so they were first
+  **multiplied by 2**; briefly 1.3, and since 2026-11-09 they are **not scaled** (`UNC_SCALES = (1,)*4`; the
+  scaling is to be fixed post hoc, after the bijections are learned, §9.10; §5.7 has the evidence). Median quoted errors: 23 K, 0.055 in
+  logg and [M/H], 0.016 in [α/M].
 - Regularization errors `X_ERR = (0.2,)*4`: a first guess, untuned.
 
 **Overlaps** (`astrotune-overlaps lamost_mstar_li2025`; unique shared stars,
@@ -615,7 +620,8 @@ cannot overlap the cool stars it was hoped to constrain).
    - `ID_COL` must hold Gaia DR3 source ids; rows with `id <= 0` are dropped
      automatically. Duplicate ids are **kept** (§5.4); the validator only warns.
    - `sigma_x` (statistical errors, drives the pair χ²) gets the default error
-     floors `(0.01, 0.01, 0.04, 0.05)` in transformed units added in quadrature,
+     floors `(0.01, 0.01, 0.04, 0.02)` in transformed units added in quadrature
+     (the [α/Fe] floor was 0.05 until 2026-11-09, see §9.8),
      unless the module sets `ERROR_FLOORS`. `x_err` (from `param_errs`) is the
      *regularization* scale: how far the transformation may move each parameter
      for this catalog. Start from 0.1 and make it larger where the catalog is
@@ -702,6 +708,68 @@ Stage A is reused as is. The consequences, all verified in the code:
   overlap in some regime is only regularized there.
 
 ---
+
+### 5.7 Checking the uncertainty scalings (`astrotune-error-scale`)
+
+Several catalogs multiply their quoted uncertainties before the floors are added
+(`UNC_SCALES`: CLAM ×3, Li+2025 ×1 (unscaled), SLAM ×0.2 on Teff only). `astrotune-error-scale KEY`
+(`astrotune/prep/error_scale.py`, tests in `tests/test_error_scale.py`) shows the
+evidence from stars shared with other catalogs.
+
+**Which space.** The question is how much the *statistical* scatter is under-estimated, not how
+large the systematic differences between catalogs are (the bijector calibrates those away).
+In the catalogs' own coordinates the differences contain offsets that depend on the parameters,
+so the scatter, and especially the plateau, are inflated. The tool therefore works in the
+**harmonized space** when given `--run-dir RUN`: both estimates of a star go through the
+bijector, the quoted errors are propagated with the Jacobian (`C = J diag(σ²) Jᵀ`, parameters
+a catalog does not measure contribute nothing), and the scatter of `y_catalog − y_partner` is
+compared with them. Parameter p is skipped when either catalog lacks input p (e.g. MDC logg).
+Without `--run-dir` it compares in the input coordinates (kept for reference; **do not use it
+to choose floors**). Use `--run-dir models/turnover50_64ep_16kbatch_19cat` (a bijector trained
+with the earlier ×4 / ×2 / 0.05 settings is fine: only the residual scatter matters).
+
+For a partner and a parameter, the difference has variance `σ_c² + σ_p²` (independent errors).
+Binning the stars by the catalog's *quoted* (propagated) error `q` (recovered from the
+prepared table by undoing the scale and the floor), the robust (MAD) variance of the difference
+minus the partner's variance is attributed to the catalog and fitted as `s²q² + σ_sys²`: a
+scale `s` plus a plateau `σ_sys`. It writes `diagnostic_plots/<key>/error_scale[_harmonized].png`
+(observed vs quoted error; the black "final" curve is the per-bin median of the propagated
+final error), `…_fit.png` (s and σ_sys with 68 % bootstrap intervals), `…_z.png`
+(standardized differences vs a unit Gaussian), `…_zcore.png` (core width per partner; 1 =
+calibrated), plus `.json` and `.txt`. Caveats: the partner's own quoted error is trusted
+(partners that share labels or spectra with the catalog, e.g. APOGEE and ASPCAP for Li+2025,
+are marked and are not independent tests); the scatter is robust (MAD), so tails are ignored;
+the plateau is ambiguous in the harmonized space (unmodeled star-level systematics or
+unmodeled statistical error), and it differs between partners, so only the slope `s` is read
+as the statistical scale.
+
+Run on 2026-11-09 (with the [α/Fe] floor 0.02, CLAM ×3 with its own floors and Li ×1.3 as they were then, 19-catalog bijector):
+
+* **CLAM, harmonized space** (s, with the plateau in harmonized units), against APOGEE / ASPCAP / GALAH
+  (25,827 / 12,012 / 5,435 stars): Teff 3.05 / 3.15 / (GALAH, uncertain, 1.0), [Fe/H] 3.5 / 3.3 / 3.2,
+  logg 3.5 / 2.3 / (GALAH, uncertain, 0), [α/Fe] (APOGEE degenerate) / 4.1 / 4.7. So **×3 is
+  confirmed for Teff, [Fe/H] and logg; [α/Fe] wants about ×4–4.5** (this agrees with the
+  input-space fits, 4.6–5.3). A plateau of 0.06–0.07 remains in Teff, [Fe/H] and (APOGEE,
+  GALAH) logg against APOGEE and ASPCAP, but it is 0–0.03 against GALAH, which has few cool
+  stars: the three partners do not agree, so the floors (0.05, 0.05, 0.1) are a compromise.
+  With the settings in use the core width of the standardized differences is 1.1–1.25 against
+  APOGEE/ASPCAP and 0.75–0.95 against GALAH for Teff, [Fe/H], logg and 0.96 / 1.22 / 1.26 for
+  [α/Fe] (APOGEE / ASPCAP / GALAH), i.e. they bracket 1.
+* **The earlier input-space analysis** (CLAM ×4: scale 2.6–3.7 and plateau 0.07–0.14 in Teff, [Fe/H],
+  logg; Li ×2: 1.1–2.0) is superseded: its plateau mostly measured systematic offsets between
+  catalogs. The slopes were similar to the harmonized ones.
+* **Li+2025, harmonized space**, against CLAM / MDw Cannon / ASPCAP (not independent): Teff
+  0.7 / 1.4 / 1.2, [Fe/H] 1.2 / 1.6 / 1.2, logg (CLAM not measured) / 1.2, [α/Fe] 0.9 / 1.2 / 1.3;
+  plateaus ≈ 0 except [Fe/H] against CLAM (0.07, CLAM's own issue) and MDw (0.03). **×1.3 is
+  consistent with the data** (fits 1.2–1.6, the CLAM comparison lower); no floor beyond the default
+  is needed.
+* **Settings chosen by the project owner on 2026-11-09** (after the harmonized-space
+  analysis): CLAM ×3 on all parameters with the **default error floors** (the floors
+  0.05/0.05/0.1/0.02 tried earlier were dropped: the plateau is absent against GALAH);
+  Li+2025 **×1, unscaled** (the scaling is to be fixed post hoc after the bijections are
+  learned). Open: the CLAM [α/Fe] scale may be too low (4–4.5 preferred). Heavy tails remain for every parameter (up to
+  13 % of the stars beyond 3 σ for CLAM Teff): floors and scales cannot fix them (§9.10,
+  heavy-tailed likelihood). The tables were rebuilt, so the caveats of §9.8 apply again.
 
 ## 6. The method as implemented in the notebook
 
@@ -956,6 +1024,9 @@ text should be updated, or the code changed, so they agree.
 
 ### 9.4 Training runs so far
 
+**All runs below were trained with the old [α/Fe] error floor of 0.05** (now 0.02, §9.8), so
+they are not comparable with runs trained on the current tables.
+
 All with the defaults except as noted; `val-every 4`; 1 epoch = 1,518 steps.
 Agreement is on held-out pairs (200k sample), averaged over catalog pairs
 (47/47/44/27 pairs for Teff/[Fe/H]/logg/[α/Fe]). "|offset|" is the median of
@@ -1139,6 +1210,19 @@ data (§10).
 
 ### 9.8 Gotchas for whoever continues
 
+- **The [α/Fe] error floor was lowered from 0.05 to 0.02 on 2026-11-09**
+  (`config.ERROR_FLOORS`; the legacy value is `config.LEGACY_ALPHA_FLOOR`). With 0.05 the floor was
+  77–100 % of the [α/Fe] variance of most catalogs and the pair differences of the
+  harmonized estimates implied errors of ≈ 0.02 (§9.10). The 14 catalogs with [α/Fe] were
+  rebuilt (`astrotune-prepare KEY --no-plots`); only `sigma_x[:, 3]` changed (the parity tests put the legacy
+  floor back with `prep.io.restore_legacy_alpha_floor` and still pass). **Everything derived
+  from the old tables is stale:** every run in §9.4 was trained with the 0.05 floor (σ_x
+  sets the chi² weights and the injected noise) and should be retrained; the pairs files
+  (`data/pairs_*.h5`; new ones record `error_floors` in their attributes) must be rebuilt
+  with `astrotune-pairs`; the transform caches (`<run>/harmonized/transform_cache_*`) now
+  carry a checksum of `x` and `sigma_x` and are recomputed when it does not match (old ones
+  are treated as stale); the delta pair tables (`<run>/delta/pair_table.npz`) are not
+  checked: rebuild them with `--rebuild` after `astrotune-apply`.
 - **Number of categories is per run, not global.** `load_bijector` reads the
   catalog list from the run's `config.json` (`registry.run_keys`); `evaluate`,
   `videos` and `train` use `max(c_control)+1` of the pairs file they are given.
@@ -1321,6 +1405,10 @@ propagated covariance (lets the errors shrink); a full Cholesky factor
 (correlated excess); then replacing the 0.03 floor in `apply.py` with the model.
 Not yet integrated into `apply.py`/`merge.py`.
 
+**Consequence (2026-11-09):** these findings, in particular the over-estimated [α/Fe] errors,
+led to lowering the [α/Fe] floor from 0.05 to 0.02 (§9.8); the numbers above are for the
+0.05 floor, so rerun `astrotune-delta-diagnose` after the models are retrained.
+
 Prerequisites and API: a run needs its transform cache (`astrotune-apply`), so the
 19-catalog runs have to be applied first (only `models/turnover50_8ep` has been). In
 code: `delta.pairs.get_pair_table`, `delta.diagnostics.diagnose` / `pair_stats`
@@ -1423,7 +1511,7 @@ In rough priority order:
      the cool-star catalogs heavily (SLAM 8,298, MDw Cannon 1,475, DESI DR1 6,609
      cool stars, all with [α/Fe] in both) and its first comparison supports DESI
      DR1 being the outlier in [α/Fe] at low temperature (§5.5). Open decisions that
-     remain: the ×4 uncertainty scaling, whether to keep
+     remain: the uncertainty scaling (§5.7; ×3, default floors), whether to keep
      `LOW_MASS_TEFF_LOGG_CORR` stars (see §5.5), `WARN_IGNORES_FEH`, and the
      pinned logg of stars above 8000 K.
    - LAMOST DR12 for the LRS data: **not done**.
@@ -1434,7 +1522,7 @@ In rough priority order:
      (7,500, independent spectra), MDw Cannon (4,493) and SLAM (2,762), all with
      [α/Fe] in both, and its comparison supports the CLAM-based picture of
      §5.5 (DESI DR1 high in [α/Fe] at low temperature). Open decisions that
-     remain: the ×2 uncertainty scaling, the SNR threshold
+     remain: the uncertainty scaling (§5.7; unscaled, to be fixed post hoc), the SNR threshold
      (30 in the quadrature sum), the APOGEE non-independence, and the many
      repeat spectra (24% of rows; no dedupe, per policy).
    - The Nagaraj et al. (2026) DESI catalog (arXiv 2610.04294): **promoted into the
