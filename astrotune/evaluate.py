@@ -327,7 +327,10 @@ def evaluate_bijector(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     import tensorflow as tf
 
+    from .model.io import enable_memory_growth
     from .training_data import load_training_data
+
+    enable_memory_growth()
 
     parser = argparse.ArgumentParser(
         prog="astrotune-evaluate",

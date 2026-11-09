@@ -384,7 +384,10 @@ def apply_run(
 ) -> Dict[str, Path]:
     """Transform and merge all catalogs of a trained run; return the output paths."""
     from .model import load_bijector
+    from .model.io import enable_memory_growth
     from .training_data import load_tables
+
+    enable_memory_growth()
 
     run_dir = Path(run_dir)
     out_dir = Path(out_dir) if out_dir else run_dir / "harmonized"

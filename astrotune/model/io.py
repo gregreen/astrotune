@@ -11,6 +11,17 @@ from .. import registry
 from .ode_bijector import ODEBijector
 
 
+def enable_memory_growth() -> None:
+    """Make TensorFlow allocate GPU memory as needed instead of reserving
+    nearly all of it. Call before the first TensorFlow operation; the GPU is
+    shared (a process without this holds ~95% of it, whatever it really uses)."""
+    for device in tf.config.list_physical_devices("GPU"):
+        try:
+            tf.config.experimental.set_memory_growth(device, True)
+        except RuntimeError:  # already initialised
+            pass
+
+
 def load_bijector(run_dir) -> ODEBijector:
     """Restore the bijector from the latest checkpoint in ``run_dir``.
 

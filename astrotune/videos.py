@@ -444,7 +444,9 @@ def make_videos(
     common is added to ``pairs`` (as the notebook did, with 50).
     """
     from .model import load_bijector
+    from .model.io import enable_memory_growth
 
+    enable_memory_growth()
     run_dir = Path(run_dir)
     out_dir = Path(out_dir) if out_dir else run_dir / "videos"
     labels = registry.labels()[: len(registry.run_keys(run_dir))]
