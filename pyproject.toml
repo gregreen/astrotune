@@ -36,6 +36,7 @@ dev = ["pytest"]
 astrotune-prepare = "astrotune.cli:main"
 astrotune-observations = "astrotune.training_data:main"
 astrotune-train = "astrotune.train:main"
+astrotune-train-latent = "astrotune.train_latent:main"
 astrotune-evaluate = "astrotune.evaluate:main"
 astrotune-videos = "astrotune.videos:main"
 astrotune-overlaps = "astrotune.prep.overlaps:main"

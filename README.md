@@ -85,8 +85,8 @@ parameter altogether.
 ### Training
 
 ```
-astrotune-observations                # build data/observations_and_ctrl_points.h5
-astrotune-train --run-name my_run     # train; writes models/my_run/
+astrotune-observations                    # build data/observations_and_ctrl_points.h5
+astrotune-train-latent --run-name my_run  # train; writes models/my_run/
 ```
 
 `astrotune-observations` writes one row per catalog measurement of every star
@@ -98,9 +98,16 @@ points get a per-catalog `x_err` (the catalog's median, or its
 `X_ERR_DISPERSED`); `--dispersed-xerr uniform` gives the legacy uniform 0.2.
 Use `-o` to write a different file.
 
-> **The trainer is being ported to the latent-y loss.** `astrotune-train`,
-> `astrotune-evaluate` and `astrotune-videos` on this branch still read the pair
-> file (`data/pairs_and_ctrl_points.h5`) and will be updated next.
+`astrotune-train-latent` fits the bijector with one free harmonized parameter
+vector per star (the "latent-y" loss): every observation is mapped back through
+its own catalog and compared with the star's `y`, so no catalog is regressed
+onto another. The free parameters start at the precision-weighted mean of each
+star's observations and are saved with the run (`latent_y.npz`), but they are
+not part of the exported map.
+
+The legacy pair-loss trainer (`astrotune-train`) is unchanged and still reads
+`data/pairs_and_ctrl_points.h5`; so do `astrotune-evaluate` and
+`astrotune-videos`.
 
 During training a progress bar is shown and a figure (loss history plus the
 catalogs before/after the transformation) is saved every 5 minutes to

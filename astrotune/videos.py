@@ -58,6 +58,7 @@ if not os.environ.get("DISPLAY"):  # headless by default
 import matplotlib.pyplot as plt
 
 from . import registry
+from .training_data import load_pairs
 from .training_plots import PARAM_LABELS, catalog_colors
 
 log = logging.getLogger(__name__)
@@ -424,19 +425,6 @@ def make_plane_video(
 
 
 # --- Driver ---------------------------------------------------------------------
-def _load_pairs(pairs_path):
-    """Placeholder for the pair file, which the observation-based training data replaced.
-
-    The video functions themselves are independent of the training-data format;
-    only :func:`make_videos` reads the pairs (to find the stars shared by two
-    catalogs). Porting it is part of moving the trainer to the latent-y loss.
-    """
-    raise NotImplementedError(
-        "astrotune-videos has not been ported to the observation-based training "
-        "data yet (see astrotune.training_data.load_observations)"
-    )
-
-
 def make_videos(
     run_dir: Path,
     out_dir: Optional[Path] = None,
@@ -465,7 +453,7 @@ def make_videos(
     colors = catalog_colors(len(labels))
 
     bij = load_bijector(run_dir)
-    pair_dict, ctrl_dict = _load_pairs(pairs_path)
+    pair_dict, ctrl_dict = load_pairs(pairs_path, fix_unknown_errors=False)
     catalogs = catalog_trajectories(bij, ctrl_dict, n_video_frames, n_plot)
     pair_idx = {
         tuple(sorted((registry.category_index(ka), registry.category_index(kb))))

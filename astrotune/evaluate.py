@@ -16,6 +16,7 @@ Outputs go to ``<run-dir>/evaluation/``: ``agreement.json``,
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import logging
 from pathlib import Path
@@ -83,6 +84,53 @@ def orient_pairs(pairs, to_harmonized: Callable) -> Dict[str, np.ndarray]:
         yj=pick(y0, y1),
         yk=pick(y1, y0),
         valid=valid,
+    )
+
+
+def observation_pairs(
+    obs_dict, *, max_stars: int = 16384, seed: int = 0, stars=None
+) -> Dict[str, np.ndarray]:
+    """A synthetic pair table built from the observations of a sample of stars.
+
+    The latent-y training data have no pairs, but the agreement statistics are
+    defined per catalog pair. For every star that at least two catalogs observe
+    we take the *first* observation of each catalog and form all catalog pairs
+    (``j < k``), producing the :data:`PAIR_FIELDS` layout that
+    :func:`orient_pairs` and :func:`agreement_table` consume.
+
+    ``stars`` restricts the sample (e.g. to the validation stars); at most
+    ``max_stars`` of them are used, drawn with ``seed``.
+    """
+    star, cat = obs_dict["star"], obs_dict["c"]
+    n_stars = int(obs_dict["n_stars"])
+    pool = np.arange(n_stars) if stars is None else np.asarray(stars)
+    if len(pool) > max_stars:
+        pool = np.sort(
+            np.random.default_rng(seed).choice(pool, max_stars, replace=False)
+        )
+
+    # The first observation of every (star, catalog). The rows are sorted by id
+    # and then by catalog, so a catalog's repeats are adjacent.
+    first = np.ones(len(star), dtype=bool)
+    first[1:] = (star[1:] != star[:-1]) | (cat[1:] != cat[:-1])
+    rows = np.flatnonzero(first)
+    observed = star[rows]
+    lo = np.searchsorted(observed, pool, side="left")
+    hi = np.searchsorted(observed, pool, side="right")
+
+    i0, i1 = [], []
+    for a, b in zip(lo, hi):
+        if b - a < 2:
+            continue
+        for p, q in itertools.combinations(range(a, b), 2):
+            i0.append(rows[p])
+            i1.append(rows[q])
+    i0 = np.asarray(i0, dtype="i8")
+    i1 = np.asarray(i1, dtype="i8")
+    x, xs = obs_dict["x"], obs_dict["xs"]
+    return dict(
+        x0=x[i0], x1=x[i1], xs0=xs[i0], xs1=xs[i1],
+        c0=cat[i0].astype("i4"), c1=cat[i1].astype("i4"),
     )
 
 
@@ -328,7 +376,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     import tensorflow as tf
 
     from .model.io import enable_memory_growth
-    from .training_data import load_training_data
+    from .training_data import load_pairs
 
     enable_memory_growth()
 
@@ -347,7 +395,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if cfg_path.exists():
         val_frac = json.load(open(cfg_path))["config"].get("val_frac", val_frac)
 
-    pair_dict, ctrl_dict = load_training_data(args.pairs_path)
+    pair_dict, ctrl_dict = load_pairs(args.pairs_path)
     model = tf.saved_model.load(str(args.run_dir / "bijector"))
     evaluate_bijector(
         model.to_harmonized, pair_dict, ctrl_dict, args.run_dir / "evaluation",

@@ -132,11 +132,24 @@ def extract_observations(table, c: int, ids: np.ndarray) -> Dict[str, np.ndarray
     )
 
 
+def star_index(ids) -> Tuple[np.ndarray, int]:
+    """The dense index of the star of every row, and the number of stars.
+
+    The observations are grouped by Gaia id, so the index runs from 0 to
+    ``n_stars - 1`` in the order the ids first appear. It is derived, not
+    stored, so that in-memory and loaded observations agree.
+    """
+    stars, star = np.unique(np.asarray(ids), return_inverse=True)
+    return star.astype("i8", copy=False), int(len(stars))
+
+
 def build_observations(tables) -> Dict[str, np.ndarray]:
     """Every observation of a star that at least two catalogs observe.
 
     The rows are sorted by Gaia id and then by catalog, so the observations of
-    one star are contiguous and can be sliced or gathered as a block.
+    one star are contiguous and can be sliced or gathered as a block. The
+    ``star`` and ``n_stars`` entries index the free harmonized vector of the
+    star (see :func:`load_observations`).
     """
     if len(tables) < 2:
         raise ValueError("at least two catalogs are needed to match stars")
@@ -156,6 +169,7 @@ def build_observations(tables) -> Dict[str, np.ndarray]:
     log.info("%d observations of %d stars", len(out["id"]), len(ids))
     if len(out["id"]) == 0:
         log.warning("no star is observed by two catalogs; the training data are empty")
+    out["star"], out["n_stars"] = star_index(out["id"])
     return out
 
 
@@ -316,7 +330,7 @@ def save_observations(
     with h5py.File(path, "w") as f:
         for key, value in (attrs or {}).items():
             f.attrs[key] = value
-        for key in tqdm(obs_dict, desc="Saving observations"):
+        for key in tqdm(OBS_KEYS, desc="Saving observations"):
             f.create_dataset(f"obs_dict/{key}", data=obs_dict[key], **kw)
         for key in tqdm(ctrl_dict, desc="Saving control points"):
             f.create_dataset(f"ctrl_dict/{key}", data=ctrl_dict[key], **kw)
@@ -352,9 +366,7 @@ def load_observations(
         ctrl_dict = {k: f["ctrl_dict"][k][:] for k in f["ctrl_dict"].keys()}
 
     # The dense index of the free harmonized parameters of every observation.
-    stars, star = np.unique(obs_dict["id"], return_inverse=True)
-    obs_dict["star"] = star
-    obs_dict["n_stars"] = int(len(stars))
+    obs_dict["star"], obs_dict["n_stars"] = star_index(obs_dict["id"])
 
     # Remember which parameters are not measured; the fix-up below hides it.
     ctrl_dict["missing_control"] = ctrl_dict["xe_control"] > 1e6
@@ -362,6 +374,38 @@ def load_observations(
     if fix_unknown_errors:
         ctrl_dict["xe_control"][ctrl_dict["xe_control"] > 1e6] = UNKNOWN_XE
     return obs_dict, ctrl_dict
+
+
+def load_pairs(
+    path: Optional[Path] = None, *, fix_unknown_errors: bool = True
+) -> Tuple[dict, dict]:
+    """Load the legacy ``(pair_dict, ctrl_dict)`` from a ``pairs_and_ctrl_points.h5`` file.
+
+    Kept for the pair-loss trainer (:mod:`astrotune.train`), which runs
+    alongside the latent-y path. Nothing builds new pair files any more; the
+    observation builder above is the data preparation for the latent-y loss.
+    With ``fix_unknown_errors``, regularization errors ``> 1e6`` (placeholders
+    for missing parameters) are replaced by 0.05; ``ctrl_dict["missing_control"]``
+    always records which control-point parameters were placeholders.
+    """
+    path = Path(path or config.PAIRS_PATH)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} does not exist; the pair file is a legacy artefact (the latent-y "
+            "data are built with `python -m astrotune.training_data`)."
+        )
+    with h5py.File(path, "r") as f:
+        pair_dict = {k: f["pair_dict"][k][:] for k in f["pair_dict"].keys()}
+        ctrl_dict = {k: f["ctrl_dict"][k][:] for k in f["ctrl_dict"].keys()}
+
+    # Remember which parameters are not measured; the fix-up below hides it.
+    ctrl_dict["missing_control"] = ctrl_dict["xe_control"] > 1e6
+
+    if fix_unknown_errors:
+        for key in ("xe0", "xe1"):
+            pair_dict[key][pair_dict[key] > 1e6] = UNKNOWN_XE
+        ctrl_dict["xe_control"][ctrl_dict["xe_control"] > 1e6] = UNKNOWN_XE
+    return pair_dict, ctrl_dict
 
 
 def read_attrs(path: Optional[Path] = None) -> dict:

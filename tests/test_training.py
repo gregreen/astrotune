@@ -96,7 +96,6 @@ def test_save_load_observations_roundtrip(tmp_path):
     assert td.read_attrs(path)["seed"] == 1
 
 
-@pytest.mark.skip(reason="the trainer is being ported to the latent-y loss")
 @pytest.mark.filterwarnings("ignore")
 def test_training_step_runs_and_reduces_loss(tmp_path):
     pytest.importorskip("tensorflow")
@@ -285,3 +284,70 @@ def test_teff_axis_labels_a_narrow_range():
     labels = [ax.xaxis.get_major_formatter()(x) for x in ax.xaxis.get_major_locator()()]
     assert len(labels) >= 3 and "3.4" in labels
     plt.close(fig)
+
+
+def test_observation_pairs_build_every_catalog_pair():
+    from astrotune.evaluate import PAIR_FIELDS, observation_pairs
+
+    tables = [_table([1, 2], 4, i) for i in range(3)]
+    obs = td.build_observations(tables)
+    pairs = observation_pairs(obs, max_stars=10)
+    assert set(pairs) == set(PAIR_FIELDS)
+    assert len(pairs["c0"]) == 2 * 3  # two stars, three catalog pairs each
+    assert np.all(pairs["c0"] < pairs["c1"])
+    # A repeated observation of one catalog does not create extra pairs
+    repeated = [_table([1, 1, 2], 4, 0), _table([1, 2], 4, 1)]
+    pairs = observation_pairs(td.build_observations(repeated), max_stars=10)
+    assert len(pairs["c0"]) == 2
+
+
+def test_initial_y_is_the_precision_weighted_mean():
+    from astrotune.train_latent import initial_y
+
+    t0 = _table([1, 2], 4, 0)
+    t1 = _table([1, 2], 4, 1)
+    t1["sigma_x"][1] = 10.0  # star 2 is measured much less precisely here
+    y = initial_y(td.build_observations([t0, t1]))
+    x0, x1 = np.asarray(t0["x"]), np.asarray(t1["x"])
+    s0, s1 = np.asarray(t0["sigma_x"]), np.asarray(t1["sigma_x"])
+    for k in range(2):
+        w0, w1 = 1.0 / s0[k] ** 2, 1.0 / s1[k] ** 2
+        assert np.allclose(y[k], (w0 * x0[k] + w1 * x1[k]) / (w0 + w1), atol=1e-6)
+
+
+def test_initial_y_only_uses_the_catalogs_that_measure_an_axis():
+    from astrotune.train_latent import initial_y
+
+    t0 = _table([1], 4, 0)
+    y = initial_y(td.build_observations([t0, _table([1], 3, 1)]))
+    # Catalog 1 has no [alpha/Fe] (sigma = 1e9), so the axis is catalog 0's value
+    assert np.allclose(y[0, 3], np.asarray(t0["x"])[0, 3], atol=1e-4)
+    # Neither catalog measures it: the axis stays at 0
+    y = initial_y(td.build_observations([_table([1], 3, 0), _table([1], 3, 1)]))
+    assert y[0, 3] == 0.0
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_latent_training_moves_y_and_saves(tmp_path):
+    pytest.importorskip("tensorflow")
+    pytest.importorskip("sonnet")
+    from astrotune.train_latent import LatentTrainConfig, LatentTrainer
+
+    tables = [_table(np.arange(1200), 4, i) for i in range(2)]
+    tables[1]["x"] = tables[1]["x"] + np.array([0, 0.5, 0, 0], dtype="f4")
+    obs, ctrl = td.build_training_data(tables, seed=1)
+    cfg = LatentTrainConfig(
+        hidden_size=16, n_hidden=1, batch_size=256, n_epochs=2, max_steps=8,
+        plot_every_seconds=None, plot_every_steps=None,
+        checkpoint_every_seconds=None, agreement_n_stars=256,
+    )
+    tr = LatentTrainer(obs, ctrl, cfg)
+    y0 = tr.y.numpy().copy()
+    metrics = tr.train(tmp_path)
+    assert len(metrics["loss"]) == 8
+    assert np.all(np.isfinite(metrics["loss"]))
+    assert not np.allclose(tr.y.numpy(), y0)  # the free parameters moved
+    tr.save(tmp_path, metrics)
+    assert (tmp_path / "bijector" / "saved_model.pb").exists()
+    saved = np.load(tmp_path / "latent_y.npz")
+    assert saved["y"].shape == (1200, 4) and saved["id"].shape == (1200,)

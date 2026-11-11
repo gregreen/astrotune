@@ -1,0 +1,971 @@
+"""Train the bijector with a free harmonized parameter vector for every star.
+
+    astrotune-train-latent --run-name my_run
+
+The training data are single catalog observations (:mod:`astrotune.training_data`):
+one row per measurement, grouped by Gaia id. This model adds one free parameter
+vector ``y`` per star and fits
+
+    L_data = mean over observations of rho( sum_p (x_p - f_c^-1(y)_p)^2 / sigma_p^2 ),
+
+with ``rho`` the softened chi^2 of the pair loss. Every observation of a star is
+compared with the *same* ``y``, so no catalog is regressed onto another and the
+inverse-variance weighting cannot shrink a map. A parameter that a catalog does
+not measure carries ``sigma = 1e9``, so it drops out of the chi^2 without a
+mask.
+
+``y`` starts at the precision-weighted mean of the star's observations and is
+updated with a per-star step along the exact gradient of the loss: the gradient
+is taken from the same tape that updates the map, so it carries the Jacobian of
+``f_c^-1`` and points downhill even where the map is far from the identity. The
+step is divided by the star's total precision, the Gauss-Newton curvature of the
+chi^2 for a map close to the identity (which the control-point penalties keep),
+and that divisor is positive, so the step stays a descent direction whatever the
+map does. All observations of a star are in the same batch (the batches are
+blocks of a random permutation of the stars), so each ``y`` is updated once per
+epoch with all of its data. ``y`` is state of the run, not of the exported
+SavedModel: inference for a star observed by one catalog goes through
+``to_harmonized`` as before.
+
+The training loop runs in a graph: :meth:`LatentTrainer.train` calls a
+``tf.function`` that advances the dataset iterator and the optimizer for a chunk
+of steps inside one ``while_loop``, and does in Python only what needs the host
+(the progress figure, the catalog agreement, the checkpoints).
+
+The pair-loss path (:mod:`astrotune.train`, ``astrotune-train``) is untouched and
+still reads a legacy ``data/pairs_and_ctrl_points.h5``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import logging
+import os
+import signal
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional, Sequence, Tuple
+
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tqdm.auto import tqdm
+
+from . import config, registry
+from .evaluate import (
+    PARAM_SHORT,
+    evaluate_bijector,
+    format_summary,
+    observation_pairs,
+    quick_agreement,
+)
+from .model import ODEBijector
+from .model.io import enable_memory_growth
+from .train import arcsinh_of_exp
+from .training_data import load_observations, read_attrs
+from .training_plots import (
+    catalog_colors,
+    catalog_sample_valid,
+    catalog_samples,
+    save_progress_figure,
+)
+
+log = logging.getLogger(__name__)
+
+#: ``sigma_x`` above this marks a parameter that the catalog does not measure
+MISSING = 1e6
+
+#: Penalty metrics drawn by the progress figure
+LATENT_PENALTIES = (
+    ("penalty_obs", "penalty (obs)"),
+    ("penalty_ctrl", "penalty (control)"),
+    ("penalty_div", "penalty (div)"),
+    ("penalty_l2", "penalty (l2)"),
+)
+
+#: Per-step metrics recorded by the training loop
+METRIC_KEYS = (
+    "loss",
+    "chi2",
+    "penalty_obs",
+    "penalty_ctrl",
+    "penalty_div",
+    "penalty_l2",
+    "norm",
+)
+
+
+@dataclass
+class LatentTrainConfig:
+    # Network
+    hidden_size: int = 64
+    n_hidden: int = 3
+    ode_rtol: float = 1e-5
+    ode_atol: float = 1e-5
+
+    # Optimization
+    batch_size: int = 16384  # observations per batch
+    n_epochs: int = 16
+    val_frac: float = 1 / 8  # fraction of *stars* held out
+    learning_rate: float = 1e-3  # halved at each of 7 evenly spaced steps
+    clip_norm: float = 100.0
+    seed: int = 3
+    val_every: int = 1  # evaluate one validation batch every this many steps
+    max_steps: Optional[int] = None  # stop early (mainly for testing)
+
+    # The free harmonized parameters
+    #: Damping of the per-star gradient step (1 is the full step).
+    y_learning_rate: float = 1.0
+    #: Gradient steps used to fit y on a validation batch (the profile
+    #: likelihood; held-out stars have no trained y).
+    y_profile_steps: int = 3
+
+    # Observation loss
+    chi2_turnover: float = 50.0
+    #: Whether the path length of the observations' inverse map enters the loss
+    #: (the pair trainer's ``pair_path_in_loss``, off by default there too).
+    obs_path_in_loss: bool = False
+
+    # Path-length penalty (control points)
+    l1_path: float = 1e-1
+    l2_path: float = 1e-1
+
+    # Distance of control points from their images
+    l1_total: float = 1e-1
+    l2_total: float = 1e-1
+    sigma_ctrl: float = 0.3  # scatter added to control points
+
+    # Stretching / contraction of space
+    eps_div: float = 0.1
+    weight_div: float = 3.0
+
+    # Weight decay
+    l2_weights: float = 1e-4
+
+    # Freeze variables whose names contain these strings once this fraction of
+    # training is done (see the pair trainer).
+    freeze_after_frac: Optional[float] = None
+    freeze_vars: Tuple[str, ...] = ("embedding", "film")
+
+    # Progress figures
+    plot_every_seconds: Optional[float] = 5 * 60.0
+    plot_every_steps: Optional[int] = None
+    n_plot: int = 2048  # stars per catalog in the progress figure
+    #: Held-out stars used for the catalog agreement at each progress figure
+    agreement_n_stars: int = 16384
+
+    # Resumable state (model, optimizer, metrics) is written at each progress
+    # figure and at this interval
+    checkpoint_every_seconds: Optional[float] = 10 * 60.0
+
+
+#: Settings that may differ when resuming a run; everything else must match
+RESUME_MUTABLE = (
+    "plot_every_seconds",
+    "plot_every_steps",
+    "checkpoint_every_seconds",
+    "agreement_n_stars",
+    "n_plot",
+)
+
+
+# --- Data -----------------------------------------------------------------------
+def initial_y(obs_dict) -> np.ndarray:
+    """Precision-weighted mean of every star's observations, ``(n_stars, 4)``.
+
+    Dimensions that no observation of the star measures are left at 0: with
+    ``sigma = 1e9`` their weight is zero, and they have no gradient in the loss.
+    """
+    x, xs, star = obs_dict["x"], obs_dict["xs"], obs_dict["star"]
+    n_stars = int(obs_dict["n_stars"])
+    w = np.where(xs < MISSING, 1.0 / np.maximum(xs, 1e-12) ** 2, 0.0).astype("f8")
+    num, den = [], []
+    for p in range(x.shape[1]):
+        num.append(np.bincount(star, weights=w[:, p] * x[:, p], minlength=n_stars))
+        den.append(np.bincount(star, weights=w[:, p], minlength=n_stars))
+    return (np.stack(num, axis=1) / np.maximum(np.stack(den, axis=1), 1e-30)).astype("f4")
+
+
+def block_shuffled_rows(star: np.ndarray, rows: np.ndarray, rng) -> np.ndarray:
+    """``rows`` reordered by a random permutation of their star, stars kept whole.
+
+    ``rows`` must be sorted by star (true of the observation file) and a star's
+    rows stay contiguous, so at most one star straddles a batch boundary.
+    """
+    if len(rows) == 0:
+        return rows
+    stars = star[rows]
+    perm = rng.permutation(np.unique(stars))
+    rank = np.empty(int(stars.max()) + 1, dtype="i8")
+    rank[perm] = np.arange(len(perm))
+    return rows[np.argsort(rank[stars], kind="stable")]
+
+
+def _make_ctrl_dataset(arrays, batch_size: int, seed: int, n_repeat: Optional[int] = None):
+    ds = tf.data.Dataset.from_tensor_slices(tuple(arrays))
+    ds = ds.shuffle(buffer_size=batch_size * 64, seed=seed)
+    ds = ds.repeat(n_repeat)
+    return ds.batch(batch_size, drop_remainder=True)
+
+
+class LatentTrainer:
+    """Holds the bijector, the free harmonized parameters and the data pipelines."""
+
+    def __init__(self, obs_dict, ctrl_dict, cfg: LatentTrainConfig):
+        self.cfg = cfg
+        self.n_dim = obs_dict["x"].shape[1]
+        self.n_cat = int(ctrl_dict["c_control"].max()) + 1
+
+        tf.random.set_seed(cfg.seed)
+
+        self._make_data(obs_dict, ctrl_dict)
+        self.samples = catalog_samples(ctrl_dict, self.n_cat, cfg.n_plot)
+        self.sample_valid = catalog_sample_valid(ctrl_dict, self.n_cat, cfg.n_plot)
+
+        self.bij = ODEBijector(
+            self.n_dim,
+            self.n_cat,
+            cfg.hidden_size,
+            cfg.n_hidden,
+            rtol=cfg.ode_rtol,
+            atol=cfg.ode_atol,
+            vector_network_kwargs=dict(use_residual=True, use_film=True, use_layer_norm=True),
+        )
+        self.variables = list(self.bij.trainable_variables)
+        n_vars = sum(int(np.prod(v.shape)) for v in self.variables)
+        log.info("%d variables in bijector model.", n_vars)
+
+        self.y = tf.Variable(initial_y(obs_dict), name="latent_y", dtype=tf.float32)
+        log.info(
+            "%d free harmonized vectors (%.0f MB).",
+            int(self.y.shape[0]),
+            self.y.numpy().nbytes / 2**20,
+        )
+
+        # The learning-rate budget is set by the number of steps, so the data
+        # pipeline must be built first.
+        n = max(8, self.n_steps)
+        self.learning_rate = keras.optimizers.schedules.PiecewiseConstantDecay(
+            [i * n // 8 for i in range(1, 8)],
+            [cfg.learning_rate / 2**i for i in range(8)],
+        )
+        self.opt = keras.optimizers.Adam(learning_rate=self.learning_rate)
+        self.opt.build(self.variables)
+
+        # Graph-compiled steps: ``train`` creates the dataset iterators and
+        # these functions capture them, so a chunk of steps is one graph
+        # execution (see ``_run_steps_graph``).
+        self._it: Optional[tf.data.Iterator] = None
+        self._val_it: Optional[tf.data.Iterator] = None
+        self._run_steps = tf.function(self._run_steps_graph, reduce_retracing=True)
+        self._val_step = tf.function(self._val_step_graph)
+
+        self.to_harmonized = tf.function(
+            self.bij._forward,
+            input_signature=(
+                tf.TensorSpec([None, self.n_dim], tf.float32),
+                tf.TensorSpec([None], tf.int32),
+            ),
+        )
+
+    # -- data ---------------------------------------------------------------
+    def _make_data(self, obs_dict, ctrl_dict) -> None:
+        cfg = self.cfg
+        star = np.asarray(obs_dict["star"])
+        n_stars = int(obs_dict["n_stars"])
+        n_val_stars = int(n_stars * cfg.val_frac)
+        is_val = star < n_val_stars
+        rng = np.random.default_rng(cfg.seed)
+
+        train_rows = block_shuffled_rows(star, np.flatnonzero(~is_val), rng)
+        val_rows = np.flatnonzero(is_val)
+
+        n_batches = len(train_rows) // cfg.batch_size
+        if n_batches == 0:
+            raise ValueError(
+                f"batch_size {cfg.batch_size} is larger than the {len(train_rows)} "
+                "training observations"
+            )
+        self.n_steps = n_batches * cfg.n_epochs
+        if cfg.max_steps is not None:
+            self.n_steps = min(self.n_steps, cfg.max_steps)
+
+        ds = tf.data.Dataset.from_tensor_slices(train_rows.astype("i4"))
+        ds = ds.batch(cfg.batch_size, drop_remainder=True)
+        ds = ds.repeat(cfg.n_epochs).shuffle(max(1, min(n_batches, 256)), seed=cfg.seed)
+
+        val_epochs = int(np.ceil(cfg.n_epochs / cfg.val_frac))
+        ctrl_keys = ("x_control", "xe_control", "c_control")
+        n_val = int(len(ctrl_dict["x_control"]) * cfg.val_frac)
+        # The control points repeat for ever; zipping the two streams gives one
+        # iterator that yields a batch of observations and a batch of control
+        # points per step, which is what the graph loop consumes.
+        self.data = tf.data.Dataset.zip(
+            (
+                ds,
+                _make_ctrl_dataset(
+                    [ctrl_dict[k][n_val:] for k in ctrl_keys], cfg.batch_size, cfg.seed
+                ),
+            )
+        ).prefetch(2)
+
+        # Validation: a batch of held-out stars and one of held-out control
+        # points. Both are optional, so a tiny held-out part does not crash.
+        val_batch = min(cfg.batch_size, len(val_rows), n_val)
+        self.val_data = None
+        if val_batch > 0:
+            self.val_data = tf.data.Dataset.zip(
+                (
+                    tf.data.Dataset.from_tensor_slices(val_rows.astype("i4"))
+                    .batch(val_batch, drop_remainder=True)
+                    .repeat(val_epochs),
+                    _make_ctrl_dataset(
+                        [ctrl_dict[k][:n_val] for k in ctrl_keys],
+                        val_batch,
+                        cfg.seed,
+                        val_epochs,
+                    ),
+                )
+            ).prefetch(2)
+        else:
+            log.warning("too few held-out stars or control points; validation is off")
+
+        # GPU copies of the observation columns; a batch is gathered by row index
+        self.x_obs = tf.constant(np.asarray(obs_dict["x"]))
+        self.xs_obs = tf.constant(np.asarray(obs_dict["xs"]))
+        self.c_obs = tf.constant(np.asarray(obs_dict["c"], dtype="int32"))
+        self.star_obs = tf.constant(star)
+
+        # The rows of ``y`` follow the sorted unique ids (the observations are
+        # sorted by id, so the star index counts them in order).
+        self.ids = np.unique(np.asarray(obs_dict["id"]))
+        if len(self.ids) != n_stars:
+            raise ValueError(
+                f"the star index has {n_stars} entries but there are {len(self.ids)} ids"
+            )
+
+        # Held-out stars, for the agreement shown with each progress figure
+        self.eval_pairs = observation_pairs(
+            obs_dict,
+            max_stars=cfg.agreement_n_stars,
+            seed=cfg.seed,
+            stars=np.arange(n_val_stars),
+        )
+        log.info(
+            "%d steps expected (%d batches of %d observations per epoch); "
+            "%d held-out stars for the agreement.",
+            self.n_steps, n_batches, cfg.batch_size, n_val_stars,
+        )
+
+    # -- loss ---------------------------------------------------------------
+    def _profile_y(self, x, xs, c, star) -> tf.Tensor:
+        """Fit a batch's harmonized values by fixed-point iteration, without touching ``y``.
+
+        Held-out stars have no trained ``y``. Fitting it on the held-out batch is
+        the profile likelihood, which is what the training loss estimates: each
+        sweep sets every star's ``y`` to the value that matches its own
+        observations, which for a map close to the identity is the
+        precision-weighted mean.
+        """
+        w = 1.0 / xs**2
+        uniq, inv = tf.unique(star)
+        den = tf.math.unsorted_segment_sum(w, inv, tf.size(uniq))
+        y = tf.math.unsorted_segment_sum(w * x, inv, tf.size(uniq)) / (den + 1e-30)
+        for _ in range(self.cfg.y_profile_steps):
+            x_pred = self.bij._inverse(tf.gather(y, inv), c=c)
+            num = tf.math.unsorted_segment_sum(w * (x_pred - x), inv, tf.size(uniq))
+            step = tf.where(den > 1e-6, num / (den + 1e-30), tf.zeros_like(num))
+            y = y - step
+        return tf.gather(y, inv)
+
+    def _update_y(self, grad_y, xs, star) -> None:
+        """One step of ``y`` along the exact gradient of the loss.
+
+        ``grad_y`` is the gradient of the batch loss with respect to each
+        observation's harmonized vector. It comes out of the same tape as the
+        map's gradients, so it contains the Jacobian of the inverse map and is
+        the true direction of steepest descent in ``y`` even where ``f_c^-1``
+        is far from the identity.
+
+        The per-star step is divided by the star's total precision
+        ``sum_obs 1/sigma^2``: that is the Gauss-Newton curvature of the chi^2
+        for a map close to the identity, which the control-point penalties
+        enforce (they hold ``f_c`` near the identity in any region the catalog
+        does not measure). Any positive divisor keeps the step a descent
+        direction, so an inaccurate curvature only costs speed. A dimension
+        that none of the star's observations measures has ``sigma = 1e9``;
+        its weight is ~1e-18, which fails the ``den > 1e-6`` test and is left
+        alone instead of being divided by ~1e-18.
+        """
+        cfg = self.cfg
+        if not cfg.y_learning_rate:
+            return
+        w = 1.0 / xs**2
+        uniq, inv = tf.unique(star)
+        n = tf.size(uniq)
+        den = tf.math.unsorted_segment_sum(w, inv, n)
+        num = tf.math.unsorted_segment_sum(grad_y, inv, n)
+        delta = tf.where(den > 1e-6, num / (den + 1e-30), tf.zeros_like(num))
+        self.y.scatter_nd_sub(tf.expand_dims(uniq, 1), cfg.y_learning_rate * delta)
+
+    def _run_steps_graph(self, n_steps, freeze_list):
+        """``n_steps`` optimizer steps in one graph.
+
+        AutoGraph turns the loop into a ``tf.while_loop`` around the dataset
+        iterator and the optimizer, so each call advances the state by
+        ``n_steps`` without returning to Python. ``freeze_list`` is a Python
+        value: changing it retraces once, which is all a run ever needs.
+        """
+        out = tf.TensorArray(tf.float32, size=0, dynamic_size=True, clear_after_read=False)
+        for step in tf.range(n_steps):
+            obs_idx, (x_ctrl, xe_ctrl, c_ctrl) = self._it.get_next()
+            res = self._grad_step(
+                obs_idx,
+                x_ctrl,
+                xe_ctrl,
+                c_ctrl,
+                apply_grads=True,
+                freeze_list=freeze_list,
+            )
+            out = out.write(step, tf.stack([res[k] for k in METRIC_KEYS]))
+        return out.stack()
+
+    def _val_step_graph(self):
+        """One validation step: the loss on held-out stars, nothing updated."""
+        obs_idx, (x_ctrl, xe_ctrl, c_ctrl) = self._val_it.get_next()
+        return self._grad_step(
+            obs_idx, x_ctrl, xe_ctrl, c_ctrl, apply_grads=False, freeze_list=()
+        )
+
+    def _grad_step(
+        self,
+        obs_idx,
+        x_ctrl,
+        xe_ctrl,
+        c_ctrl,
+        apply_grads=True,
+        freeze_list=(),
+    ):
+        cfg = self.cfg
+        bij = self.bij
+
+        vars_filtered = [
+            v for v in self.variables if not any(s in v.name for s in freeze_list)
+        ]
+
+        # Scatter the control points, and create an offset copy of each, which is
+        # used to measure stretching/contraction of space
+        x_ctrl = x_ctrl + cfg.sigma_ctrl * tf.random.normal(tf.shape(x_ctrl))
+        x1_ctrl = x_ctrl + cfg.eps_div * tf.random.normal(tf.shape(x_ctrl))
+
+        x = tf.gather(self.x_obs, obs_idx)
+        xs = tf.gather(self.xs_obs, obs_idx)
+        c = tf.gather(self.c_obs, obs_idx)
+        star = tf.gather(self.star_obs, obs_idx)
+        if apply_grads:
+            y = tf.gather(self.y, star)
+        else:
+            y = self._profile_y(x, xs, c, star)
+
+        with tf.GradientTape(watch_accessed_variables=False) as g:
+            g.watch(vars_filtered)
+            if apply_grads:
+                # The gradient with respect to y comes from the same tape: one
+                # backward pass for the map and for the free parameters.
+                g.watch(y)
+
+            # Map every observation's harmonized value back into its catalog
+            x_pred, s = bij.inverse_with_s(y, c=c)
+
+            # chi^2 of each observation. An unmeasured parameter has sigma = 1e9
+            # and contributes ~1e-18, so no mask is needed.
+            chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
+            chi2 = cfg.chi2_turnover * arcsinh_of_exp(
+                tf.math.log(chi2_obs + 1e-30) - tf.math.log(cfg.chi2_turnover)
+            )
+            chi2 = tf.reduce_mean(chi2)
+
+            # Path-length penalty of the observation transformations
+            penalty_obs = cfg.l1_path * tf.reduce_mean(tf.abs(s)) + cfg.l2_path * tf.reduce_mean(
+                s**2
+            )
+
+            # Map control points (and their offset copies) to the common space
+            x_ctrl_pred, s_ctrl = bij.forward_with_s(x_ctrl, c=c_ctrl)
+            x1_ctrl_pred, _ = bij.forward_with_s(x1_ctrl, c=c_ctrl)
+
+            # Penalties on control-point transformations
+            length1_ctrl = tf.reduce_mean(tf.abs((x_ctrl_pred - x_ctrl) / xe_ctrl))
+            length2_ctrl = tf.reduce_mean(((x_ctrl_pred - x_ctrl) / xe_ctrl) ** 2)
+            penalty_ctrl = (
+                cfg.l1_total * length1_ctrl
+                + cfg.l2_total * length2_ctrl
+                + cfg.l1_path * tf.reduce_mean(tf.abs(s_ctrl))
+                + cfg.l2_path * tf.reduce_mean(s_ctrl**2)
+            )
+
+            # Penalty on stretching/contraction of space
+            length_div = tf.reduce_sum((x1_ctrl - x_ctrl) ** 2, axis=1)
+            length_div_p = tf.reduce_sum((x1_ctrl_pred - x_ctrl_pred) ** 2, axis=1)
+            eps = 1e-2 * cfg.eps_div
+            penalty_div = cfg.weight_div * tf.reduce_mean(
+                tf.math.log((length_div + eps) / (length_div_p + eps)) ** 2
+            )
+
+            # Weight decay on the dense-layer weights
+            penalty_l2 = cfg.l2_weights * tf.add_n(
+                [tf.nn.l2_loss(v) for v in vars_filtered if "w:" in v.name]
+            )
+
+            loss = chi2 + penalty_ctrl + penalty_div + penalty_l2
+            if cfg.obs_path_in_loss:
+                loss = loss + penalty_obs
+
+        res = {
+            "loss": loss,
+            "chi2": chi2,
+            "penalty_obs": penalty_obs,
+            "penalty_ctrl": penalty_ctrl,
+            "penalty_div": penalty_div,
+            "penalty_l2": penalty_l2,
+        }
+
+        if apply_grads:
+            *grads, grad_y = g.gradient(loss, vars_filtered + [y])
+            grads, norm = tf.clip_by_global_norm(grads, cfg.clip_norm)
+            self.opt.apply_gradients(zip(grads, vars_filtered))
+            if grad_y is not None:
+                self._update_y(grad_y, xs, star)
+            res["norm"] = norm
+
+        return res
+
+    # -- resumable state ----------------------------------------------------
+    def _manager(self, run_dir: Path) -> tf.train.CheckpointManager:
+        ckpt = tf.train.Checkpoint(bij=self.bij, latent_y=self.y)
+        return tf.train.CheckpointManager(ckpt, str(Path(run_dir) / "checkpoints"), max_to_keep=3)
+
+    def save_state(
+        self, run_dir: Path, step: int, metrics, n_figs: int, elapsed: float,
+        agreement, complete: bool = False,
+    ) -> None:
+        """Write everything needed to resume: model, y, optimizer, metrics, progress.
+
+        The model and the free harmonized parameters go into a
+        ``tf.train.Checkpoint`` numbered by step; the rest into
+        ``state-<step>.npz`` next to it, written first so that a checkpoint
+        never lacks its state.
+        """
+        ckpt_dir = Path(run_dir) / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        meta = dict(
+            step=step, n_figs=n_figs, elapsed=elapsed, complete=complete,
+            metrics=metrics, agreement=agreement,
+        )
+        arrays = {f"opt_{i}": np.asarray(v) for i, v in enumerate(self.opt.variables)}
+        tmp = ckpt_dir / "state.tmp"
+        with open(tmp, "wb") as f:
+            np.savez(f, meta=np.array(json.dumps(meta)), **arrays)
+        os.replace(tmp, ckpt_dir / f"state-{step}.npz")
+
+        manager = self._manager(run_dir)
+        if step != self._last_saved_step:
+            manager.save(checkpoint_number=step)
+            self._last_saved_step = step
+        keep = {int(p.rsplit("-", 1)[1]) for p in manager.checkpoints}
+        for f in ckpt_dir.glob("state-*.npz"):
+            if int(f.stem.split("-")[1]) not in keep:
+                f.unlink()
+
+    def load_state(self, run_dir: Path) -> Optional[dict]:
+        """Restore the latest complete checkpoint; return its metadata (or None)."""
+        manager = self._manager(run_dir)
+        for path in reversed(manager.checkpoints):
+            step = int(path.rsplit("-", 1)[1])
+            state_path = Path(run_dir) / "checkpoints" / f"state-{step}.npz"
+            if not state_path.exists():
+                continue
+            (tf.train.Checkpoint(bij=self.bij, latent_y=self.y)
+             .restore(path).assert_existing_objects_matched())
+            data = np.load(state_path)
+            meta = json.loads(str(data["meta"]))
+            opt_vars = self.opt.variables
+            n_saved = sum(k.startswith("opt_") for k in data.files)
+            if n_saved != len(opt_vars):
+                raise ValueError(
+                    f"Checkpoint has {n_saved} optimizer variables, expected {len(opt_vars)}."
+                )
+            for i, v in enumerate(opt_vars):
+                v.assign(data[f"opt_{i}"])
+            self._last_saved_step = step
+            log.info("Resumed from %s (step %d)", path, step)
+            return meta
+        return None
+
+    # -- training loop ------------------------------------------------------
+    def train(self, run_dir: Path, resume: bool = False) -> Dict[str, list]:
+        cfg = self.cfg
+        run_dir = Path(run_dir)
+        fig_dir = run_dir / "progress"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+
+        labels = registry.labels()[: self.n_cat]
+        colors = catalog_colors(self.n_cat)
+        self._last_saved_step = -1
+
+        metrics: Dict[str, list] = {"step_val": []}
+        agreement: list = []
+        self.agreement = agreement
+        n_figs = 0
+        elapsed_prev = 0.0
+        start = 0
+        if resume:
+            meta = self.load_state(run_dir)
+            if meta is None:
+                raise FileNotFoundError(f"No checkpoint to resume from in {run_dir}/checkpoints")
+            metrics, agreement = meta["metrics"], meta["agreement"]
+            self.agreement = agreement
+            n_figs, elapsed_prev, start = meta["n_figs"], meta["elapsed"], meta["step"]
+            tf.random.set_seed(cfg.seed + start)
+
+        t_start = time.monotonic() - elapsed_prev
+        t_last_plot = t_last_ckpt = time.monotonic()
+        step_last_plot = start
+
+        def checkpoint(step, complete=False):
+            nonlocal t_last_ckpt
+            self.save_state(
+                run_dir, step, metrics, n_figs, time.monotonic() - t_start, agreement, complete
+            )
+            t_last_ckpt = time.monotonic()
+
+        def make_figure(step):
+            nonlocal n_figs, t_last_plot, step_last_plot
+            elapsed = time.monotonic() - t_start
+            path = fig_dir / f"progress_{n_figs + 1:04d}.png"
+            summary = quick_agreement(self.to_harmonized, self.eval_pairs)
+            agreement.append({"step": step, "summary": summary})
+            log.info("Catalog agreement at step %d (held-out stars):\n%s",
+                     step, format_summary(summary))
+            ok = [s for s in summary if s["n_pairs"]]
+            title = (
+                f"step {step:,} / {self.n_steps:,}  ({elapsed/60:.1f} min)\n"
+                "mean over catalog pairs, catalog -> harmonized\n"
+                "|offset|: " + ", ".join(
+                    f"{PARAM_SHORT[s['param']]} {s['abs_bias_orig']:.3f}->{s['abs_bias_harm']:.3f}"
+                    for s in ok
+                )
+                + "\nscatter: " + ", ".join(
+                    f"{PARAM_SHORT[s['param']]} {s['sigma_orig']:.3f}->{s['sigma_harm']:.3f}"
+                    for s in ok
+                )
+            )
+            save_progress_figure(
+                path, metrics, self.bij, self.samples, labels, colors,
+                title=title, valid=self.sample_valid, penalties=LATENT_PENALTIES,
+            )
+            n_figs += 1
+            checkpoint(step)
+            t_last_plot = time.monotonic()
+            step_last_plot = step
+            return path
+
+        freeze_step = None
+        if cfg.freeze_after_frac is not None:
+            freeze_step = int(cfg.freeze_after_frac * self.n_steps)
+        freeze_list: Tuple[str, ...] = ()
+        if freeze_step is not None and start > freeze_step:
+            freeze_list = cfg.freeze_vars
+
+        # The iterators are resources captured by the graph functions; resumes
+        # skip the batches (and the validation steps) already done.
+        self._it = iter(self.data.skip(start))
+        self._val_it = None
+        if self.val_data is not None:
+            self._val_it = iter(self.val_data.skip(len(metrics["step_val"])))
+        step_last_val = metrics["step_val"][-1] if metrics["step_val"] else 0
+
+        def _on_sigterm(signum, frame):
+            raise KeyboardInterrupt
+
+        old_handler = None
+        if threading.current_thread() is threading.main_thread():
+            old_handler = signal.signal(signal.SIGTERM, _on_sigterm)
+
+        def report(step):
+            avg = {k: np.mean(v[-16:]) for k, v in metrics.items() if k != "step_val"}
+            pbar.set_postfix(
+                {
+                    "loss": avg["loss"],
+                    "chi2": avg["chi2"],
+                    "plty_o": avg["penalty_obs"],
+                    "plty_c": avg["penalty_ctrl"],
+                    "plty_d": avg["penalty_div"],
+                    "plty_l2": avg["penalty_l2"],
+                    "norm": avg["norm"],
+                    "lr": float(self.learning_rate(step)),
+                },
+                refresh=False,
+            )
+
+        # Steps per graph call. A chunk costs one host round trip and is not
+        # interruptible, so it is kept near a couple of seconds.
+        chunk = 4
+        done = start
+        pbar = tqdm(total=self.n_steps, initial=start, desc="training")
+        try:
+            while done < self.n_steps:
+                if freeze_step is not None and done >= freeze_step and not freeze_list:
+                    freeze_list = cfg.freeze_vars
+                    log.info("Step %d: freezing variables matching %s", done, freeze_list)
+
+                n = min(chunk, self.n_steps - done)
+                t0 = time.monotonic()
+                block = self._run_steps(tf.constant(n, tf.int32), freeze_list).numpy()
+                dt = time.monotonic() - t0
+
+                for key, column in zip(METRIC_KEYS, block.T):
+                    metrics.setdefault(key, []).extend(np.asarray(column, "f8").tolist())
+                done += n
+                pbar.update(n)
+
+                if self._val_it is not None and done - step_last_val >= cfg.val_every:
+                    res = self._val_step()
+                    for k, v in res.items():
+                        metrics.setdefault(k + "_val", []).append(float(v.numpy()))
+                    metrics["step_val"].append(done)
+                    step_last_val = done
+
+                report(done)
+                if dt > 0:
+                    chunk = int(np.clip(round(n * 2.0 / dt), 1, 1024))
+
+                due = False
+                if cfg.plot_every_seconds is not None:
+                    due |= time.monotonic() > t_last_plot + cfg.plot_every_seconds
+                if cfg.plot_every_steps is not None:
+                    due |= done - step_last_plot >= cfg.plot_every_steps
+                if due and len(metrics["loss"]) > 1:
+                    pbar.write(f"Wrote {make_figure(done)}")
+                elif (
+                    cfg.checkpoint_every_seconds is not None
+                    and time.monotonic() > t_last_ckpt + cfg.checkpoint_every_seconds
+                ):
+                    checkpoint(done)
+        except KeyboardInterrupt:
+            done = len(metrics["loss"])
+            pbar.close()
+            checkpoint(done)
+            log.warning(
+                "Interrupted at step %d; resume with --resume --run-dir %s", done, run_dir
+            )
+            raise
+        finally:
+            if old_handler is not None:
+                signal.signal(signal.SIGTERM, old_handler)
+
+        pbar.close()
+        done = len(metrics["loss"])
+        if done > 1 and step_last_plot != done:
+            log.info("Wrote %s", make_figure(done))
+        checkpoint(done, complete=True)
+        return metrics
+
+    def save(self, run_dir: Path, metrics) -> None:
+        """Write the SavedModel (``to_harmonized``/``from_harmonized``), ``y`` and the metrics."""
+        run_dir = Path(run_dir)
+        bij, n_dim = self.bij, self.n_dim
+
+        bij.to_harmonized = tf.function(
+            func=bij._forward,
+            input_signature=(
+                tf.TensorSpec([None, n_dim], tf.float32),  # x
+                tf.TensorSpec([None], tf.int32),  # c
+            ),
+        )
+        bij.from_harmonized = tf.function(
+            func=bij._inverse,
+            input_signature=(
+                tf.TensorSpec([None, n_dim], tf.float32),
+                tf.TensorSpec([None], tf.int32),
+            ),
+        )
+        tf.saved_model.save(bij, str(run_dir / "bijector"))
+
+        # The free harmonized parameters are training state, not part of the map;
+        # kept for the evaluation and for reference.
+        np.savez_compressed(
+            run_dir / "latent_y.npz",
+            id=self.ids,
+            y=self.y.numpy(),
+        )
+        with open(run_dir / "metrics_history.json", "w") as f:
+            json.dump(metrics, f)
+
+
+# --- Driver ---------------------------------------------------------------------
+def _config_from_json(d: dict) -> dict:
+    d = dict(d)
+    if "freeze_vars" in d:
+        d["freeze_vars"] = tuple(d["freeze_vars"])
+    return d
+
+
+def _check_resumable(saved: dict, cfg: LatentTrainConfig) -> None:
+    """Refuse to resume with settings that would change the run."""
+    old = dataclasses.asdict(LatentTrainConfig(**_config_from_json(saved["config"])))
+    new = dataclasses.asdict(cfg)
+    changed = [k for k in new if k not in RESUME_MUTABLE and new[k] != old[k]]
+    if changed:
+        raise ValueError(
+            "Cannot change these settings when resuming: "
+            + ", ".join(f"{k} ({old[k]!r} -> {new[k]!r})" for k in changed)
+        )
+
+
+def run_training(
+    cfg: LatentTrainConfig,
+    run_dir: Path,
+    observations_path: Optional[Path] = None,
+    resume: bool = False,
+) -> Dict[str, list]:
+    """Train a bijector with free per-star parameters; write everything to ``run_dir``."""
+    run_dir = Path(run_dir)
+    cfg_path = run_dir / "config.json"
+    if not resume and (run_dir / "checkpoints").exists():
+        raise FileExistsError(
+            f"{run_dir} already contains a run. Use --resume to continue it, "
+            "or choose a different --run-name."
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    enable_memory_growth()
+
+    obs_dict, ctrl_dict = load_observations(observations_path)
+    log.info(
+        "%d observations of %d stars, %d control points",
+        len(obs_dict["x"]), obs_dict["n_stars"], len(ctrl_dict["x_control"]),
+    )
+
+    sizes = dict(
+        n_observations=len(obs_dict["x"]),
+        n_stars=int(obs_dict["n_stars"]),
+        n_control=len(ctrl_dict["x_control"]),
+    )
+    if resume:
+        with open(cfg_path) as f:
+            snapshot = json.load(f)
+        for key, value in sizes.items():
+            if snapshot.get(key) != value:
+                raise ValueError(
+                    "The observation file differs from the one the run was started "
+                    f"with ({key}: {snapshot.get(key)} -> {value})."
+                )
+        _check_resumable(snapshot, cfg)
+        snapshot["config"] = dataclasses.asdict(cfg)
+        snapshot.setdefault("resumed", []).append(
+            datetime.now().isoformat(timespec="seconds")
+        )
+    else:
+        snapshot = {
+            "config": dataclasses.asdict(cfg),
+            "loss": "latent_y",
+            "observations_path": str(observations_path or config.OBSERVATIONS_PATH),
+            "observations_attrs": read_attrs(observations_path),
+            **sizes,
+            "catalogs": list(registry.keys()[: int(ctrl_dict["c_control"].max()) + 1]),
+            "tensorflow": tf.__version__,
+            "started": datetime.now().isoformat(timespec="seconds"),
+        }
+    with open(cfg_path, "w") as f:
+        json.dump(snapshot, f, indent=2)
+
+    trainer = LatentTrainer(obs_dict, ctrl_dict, cfg)
+    metrics = trainer.train(run_dir, resume=resume)
+    trainer.save(run_dir, metrics)
+    log.info("Saved model to %s", run_dir)
+
+    with open(run_dir / "agreement_history.json", "w") as f:
+        json.dump(trainer.agreement, f)
+    evaluate_bijector(
+        trainer.to_harmonized, trainer.eval_pairs, ctrl_dict, run_dir / "evaluation",
+        val_frac=1.0,
+    )
+    return metrics
+
+
+def _add_config_args(parser: argparse.ArgumentParser) -> None:
+    defaults = LatentTrainConfig()
+    for f in dataclasses.fields(LatentTrainConfig):
+        default = getattr(defaults, f.name)
+        flag = "--" + f.name.replace("_", "-")
+        if isinstance(default, bool):
+            parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=None)
+        elif isinstance(default, tuple):
+            parser.add_argument(flag, nargs="*", default=None)
+        elif f.name in ("max_steps", "plot_every_steps"):
+            parser.add_argument(flag, type=int, default=None)
+        elif f.name in ("freeze_after_frac", "plot_every_seconds", "checkpoint_every_seconds"):
+            parser.add_argument(flag, type=float, default=None)
+        else:
+            parser.add_argument(flag, type=type(default), default=None)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="astrotune-train-latent",
+        description="Train the Astrotune bijector with one free harmonized "
+        "parameter vector per star (the observation-based loss). Every "
+        "LatentTrainConfig field is available as an option.",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="output directory name under models/ (default: timestamp)",
+    )
+    parser.add_argument("--run-dir", type=Path, default=None, help="explicit output directory")
+    parser.add_argument(
+        "--observations-path", type=Path, default=None,
+        help="observations_and_ctrl_points.h5 (default: config.OBSERVATIONS_PATH)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue the run in --run-dir/--run-name from its latest checkpoint. The "
+        "saved configuration is reused; only plotting/checkpoint intervals may be changed.",
+    )
+    _add_config_args(parser)
+    args = parser.parse_args(argv)
+
+    overrides = {
+        f.name: getattr(args, f.name)
+        for f in dataclasses.fields(LatentTrainConfig)
+        if getattr(args, f.name) is not None
+    }
+    if "freeze_vars" in overrides:
+        overrides["freeze_vars"] = tuple(overrides["freeze_vars"])
+
+    if args.run_dir is None and args.run_name is None:
+        if args.resume:
+            parser.error("--resume needs --run-dir or --run-name")
+        args.run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_dir = args.run_dir or config.MODELS_DIR / args.run_name
+
+    if args.resume:
+        with open(run_dir / "config.json") as f:
+            saved = _config_from_json(json.load(f)["config"])
+        cfg = LatentTrainConfig(**{**saved, **overrides})
+    else:
+        cfg = LatentTrainConfig(**overrides)
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    run_training(cfg, run_dir, observations_path=args.observations_path, resume=args.resume)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

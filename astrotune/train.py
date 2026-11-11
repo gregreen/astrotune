@@ -56,7 +56,7 @@ from .evaluate import (
     validation_pairs,
 )
 from .model import ODEBijector
-from .training_data import load_training_data, read_attrs
+from .training_data import load_pairs, read_attrs
 from .training_plots import catalog_colors, catalog_sample_valid, catalog_samples, save_progress_figure
 
 log = logging.getLogger(__name__)
@@ -620,7 +620,7 @@ def run_training(
     run_dir.mkdir(parents=True, exist_ok=True)
     _set_memory_growth()
 
-    pair_dict, ctrl_dict = load_training_data(pairs_path)
+    pair_dict, ctrl_dict = load_pairs(pairs_path)
     log.info(
         "%d pairs, %d control points", len(pair_dict["x0"]), len(ctrl_dict["x_control"])
     )

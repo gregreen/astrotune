@@ -90,7 +90,7 @@ def _smooth(x, n_smooth: Optional[int] = None):
     return scipy.ndimage.convolve(x, w, mode="reflect")
 
 
-def plot_loss_history(metrics, fig) -> None:
+def plot_loss_history(metrics, fig, penalties=_PENALTIES) -> None:
     """Draw three loss panels on ``fig``: everything, loss, and penalties."""
     ax0, ax1, ax2 = fig.subplots(1, 3)
 
@@ -99,7 +99,7 @@ def plot_loss_history(metrics, fig) -> None:
     half = n // 2
     step_half = step[half:]
 
-    for key, label in (("loss", "loss"),) + _PENALTIES:
+    for key, label in (("loss", "loss"),) + tuple(penalties):
         alpha = 1.0 if key == "loss" else 0.7
         ax0.semilogy(step, np.maximum(metrics[key], 1e-12), label=label, alpha=alpha)
     leg = ax0.legend(fontsize=6)
@@ -118,7 +118,7 @@ def plot_loss_history(metrics, fig) -> None:
     ax1.legend(fontsize=6)
 
     ax2.plot([], [])  # advance the color cycle past the "loss" color
-    for key, label in _PENALTIES:
+    for key, label in penalties:
         ax2.plot(step_half, _smooth(metrics[key])[half:], label=label)
     ax2.legend(fontsize=6)
 
@@ -205,11 +205,12 @@ def save_progress_figure(
     title: str = "",
     dpi: int = 120,
     valid: Optional[Sequence[np.ndarray]] = None,
+    penalties=_PENALTIES,
 ) -> Path:
     """Write a figure summarizing training progress to ``path``."""
     fig = plt.figure(figsize=(8, 10), layout="constrained")
     top, bottom = fig.subfigures(2, 1, height_ratios=[1, 3.2])
-    plot_loss_history(metrics, top)
+    plot_loss_history(metrics, top, penalties)
     plot_transformed_params(bij, samples, labels, colors, bottom, valid)
     if title:
         fig.suptitle(title, fontsize=10)
