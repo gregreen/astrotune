@@ -119,3 +119,79 @@ def test_edges_curve_around_unrelated_nodes_and_stay_straight_otherwise():
     free = cg.route_edges(pos, radii, np.array([[0, 3]]))
     line = pos[0] + (pos[3] - pos[0]) * np.linspace(0, 1, free.shape[1])[:, None]
     assert np.allclose(free[0], line, atol=2e-3)
+
+
+def test_missing_parameters_are_counted_and_classified():
+    from astropy.table import Table
+
+    x = np.zeros((4, 3), "f4")
+    s = np.full((4, 3), 0.1, "f4")
+    s[:, 2] = 1e9  # no logg
+    x[1, 1] = np.nan  # a star without [Fe/H]
+    assert cg.measured_counts(Table({"x": x, "sigma_x": s})) == [4, 3, 0, 0]  # no [alpha/Fe] column
+    assert [cg.missing_kind(n, 4) for n in (4, 3, 0)] == ["none", "some", "all"]
+
+
+def test_node_strokes_mark_the_first_missing_parameter():
+    data = dict(
+        keys=list("abcd"), rows=[10, 10, 10, 10],
+        n_measured=[[10, 10, 10, 10], [10, 10, 10, 0], [10, 10, 0, 10], [10, 10, 10, 6]],
+    )
+    assert cg.node_strokes(data) == [(None, "none"), ("alpha", "all"), ("logg", "all"), ("alpha", "some")]
+    del data["n_measured"]  # counts from before the measured parameters were recorded
+    assert cg.node_strokes(data) == [(None, "none")] * 4
+
+
+def test_stroke_colors_extend_the_palette_without_changing_it():
+    import itertools
+
+    from distinctipy import colorblind, distinctipy
+
+    assert list(cg.STROKE_COLORS) == ["alpha", "logg"]
+    assert cg.palette(len(cg.FAMILIES)) == list(cg.FAMILY_COLORS.values())  # the family colors did not move
+    cols = list(cg.FAMILY_COLORS.values()) + list(cg.STROKE_COLORS.values())
+    rgb = [tuple(int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)) for h in cols]
+    sim = [colorblind.colorblind_filter(c, cg.COLORBLIND_TYPE) for c in rgb]
+    assert min(distinctipy.color_distance(a, b) for a, b in itertools.combinations(sim, 2)) > 0.3
+
+
+def test_labels_stay_inside_the_preferred_box_when_they_can():
+    import matplotlib.pyplot as plt
+
+    pos = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 0.8]])
+    radii = np.full(3, 0.08)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_aspect("equal")
+    ax.set_xlim(-1.0, 2.0)
+    ax.set_ylim(-1.0, 2.0)
+    texts = [ax.text(*p, "label %d" % i, fontsize=8) for i, p in enumerate(pos)]
+    box = (-0.1, -0.1, 1.1, 0.9)
+    boxes = cg.place_labels(fig, ax, texts, pos, radii, preferred=box, limit=(-1.0, -1.0, 2.0, 2.0))
+    assert len(boxes) == 3
+    assert all(b[0] >= box[0] and b[1] >= box[1] and b[2] <= box[2] and b[3] <= box[3] for b in boxes)
+    # A box too small for the labels: they still get placed (they stick out as little as they can)
+    tiny = (-0.05, -0.05, 1.05, 0.85)
+    boxes = cg.place_labels(fig, ax, texts, pos, radii, preferred=tiny, limit=(-1.0, -1.0, 2.0, 2.0))
+    assert len(boxes) == 3
+    plt.close(fig)
+
+
+def test_graph_has_labels_inside_nodes_and_strokes(tmp_path):
+    from astrotune import registry
+
+    keys = registry.keys()
+    n = len(keys)
+    rng = np.random.default_rng(0)
+    rows = rng.integers(300, 4_000_000, n)
+    shared = rng.integers(0, 200_000, (n, n))
+    shared = np.triu(shared, 1)
+    shared = shared + shared.T
+    measured = [[int(r)] * 4 for r in rows]
+    measured[0][3] = 0  # no [alpha/Fe]
+    measured[1][2] = 0  # no logg
+    measured[2][3] = int(rows[2]) // 2  # [alpha/Fe] for some stars
+    data = dict(keys=list(keys), labels=list(registry.labels()), rows=[int(r) for r in rows],
+                unique=[int(r) for r in rows], shared=shared.tolist(), n_measured=measured)
+    info = cg.plot_graph(data, tmp_path / "g", n_restarts=3)
+    assert (tmp_path / "g.png").stat().st_size > 0 and (tmp_path / "g.pdf").stat().st_size > 0
+    assert info["labels_outside"] <= 3  # almost every label is inside the bounding box of the nodes

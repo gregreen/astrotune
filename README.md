@@ -173,7 +173,8 @@ run; without `--run-dir` it uses the input coordinates, which include systematic
 astrotune-catalog-graph [--layout spring|circle] [--min-shared 1000] [--top-k 3] [--straight-edges]
 ```
 
-Draws the catalogs as circles (radius ~ log rows, color = family of spectra) joined
+Draws the catalogs as circles (radius ~ log rows, color = family of spectra, stroke = missing
+[alpha/Fe] or logg) joined
 by edges (width and opacity ~ log shared stars; pairs with at least `--min-shared`
 shared stars, plus every catalog's `--top-k` strongest links), plus a matrix of every pair, to
 `diagnostic_plots/catalog_graph/` (PNG and PDF; the counts are in

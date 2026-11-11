@@ -4,7 +4,12 @@
 
 *Nodes* are the catalogs in ``registry.CATALOGS``. The circle's radius grows with
 ``log10(number of rows)`` and its color marks the family of spectra the catalog
-is based on. *Edges* join catalogs that share stars (matched on Gaia DR3 id);
+is based on. The stroke around a node marks a missing parameter: white if the catalog
+measures all four, one color if it has no [alpha/Fe] and another if it has no logg
+(hatched, alternating with white, if only some of its stars lack the parameter; see
+:func:`node_strokes`). Labels are placed next to the nodes, preferably inside their bounding
+box so that they do not shrink the figure; the labels of the two largest nodes
+(``INSIDE_LABELS``) are written inside them. *Edges* join catalogs that share stars (matched on Gaia DR3 id);
 line width, opacity and color (``plasma``) grow with ``log10(number of shared stars)``. Edges below
 ``--min-shared`` are not drawn (the graph is nearly complete, so every pair
 would otherwise be an edge), except that each catalog always keeps its ``--top-k``
@@ -71,19 +76,33 @@ FAMILIES: Dict[str, Tuple[str, ...]] = {
 COLORBLIND_TYPE = "Deuteranomaly"
 PALETTE_PASTEL, PALETTE_SEED = 0.2, 34
 
+#: Strokes of the nodes mark catalogs that lack a parameter. The two stroke colors are the next two
+#: colors of the same distinctipy palette (the palette is generated one color at a time, so adding
+#: colors does not change the family colors).
+STROKE_PARAMS = ("alpha", "logg")
+STROKE_LABELS = {"alpha": "no [α/Fe]", "logg": "no log g"}
+#: Index of each parameter in the 4-parameter vector (Teff, [Fe/H], logg, [alpha/Fe])
+PARAM_INDEX = {"logg": 2, "alpha": 3}
 
-def family_colors(families: Sequence[str]) -> Dict[str, str]:
+
+def palette(n: int) -> List[str]:
     from distinctipy import distinctipy
 
     cols = distinctipy.get_colors(
-        len(families),
+        n,
         exclude_colors=[(1, 1, 1), (0, 0, 0), (0.5, 0.5, 0.5)],  # not the page, the text or the edges
         pastel_factor=PALETTE_PASTEL, colorblind_type=COLORBLIND_TYPE, rng=PALETTE_SEED,
     )
-    return {f: distinctipy.get_hex(c) for f, c in zip(families, cols)}
+    return [distinctipy.get_hex(c) for c in cols]
 
 
-FAMILY_COLORS = family_colors(list(FAMILIES))
+def family_colors(families: Sequence[str]) -> Dict[str, str]:
+    return dict(zip(families, palette(len(families))))
+
+
+_PALETTE = palette(len(FAMILIES) + len(STROKE_PARAMS))
+FAMILY_COLORS = dict(zip(FAMILIES, _PALETTE))
+STROKE_COLORS = dict(zip(STROKE_PARAMS, _PALETTE[len(FAMILIES):]))
 
 
 def family_of(key: str) -> str:
@@ -94,21 +113,41 @@ def family_of(key: str) -> str:
 
 
 # --- Counts ---------------------------------------------------------------------
+def measured_counts(table) -> List[int]:
+    """Number of rows of a prepared table that measure each of the 4 parameters (0 for a
+    parameter the catalog has no column for)."""
+    x, s = np.asarray(table["x"]), np.asarray(table["sigma_x"])
+    out = [0] * config.N_PARAMS
+    for j in range(min(x.shape[1], config.N_PARAMS)):
+        out[j] = int(((s[:, j] < 1e6) & np.isfinite(x[:, j])).sum())
+    return out
+
+
+def missing_kind(n_measured: int, n_rows: int) -> str:
+    """``"none"`` (all rows measure the parameter), ``"all"`` (no row does) or ``"some"``."""
+    if n_measured >= n_rows:
+        return "none"
+    return "all" if n_measured == 0 else "some"
+
+
 def compute_overlaps(keys: Optional[Sequence[str]] = None) -> dict:
-    """Rows, unique stars and the matrix of shared stars of the prepared catalogs."""
+    """Rows, unique stars, the matrix of shared stars and the parameters measured by the
+    prepared catalogs."""
     keys = list(registry.keys() if keys is None else keys)
-    rows, ids = [], []
+    rows, ids, measured = [], [], []
     for k in keys:
-        col = np.asarray(load_catalog(k)["id"])
+        table = load_catalog(k)
+        col = np.asarray(table["id"])
         rows.append(int(len(col)))
         ids.append(np.unique(col))
+        measured.append(measured_counts(table))
     n = len(keys)
     shared = np.zeros((n, n), dtype="i8")
     for i, j in itertools.combinations(range(n), 2):
         shared[i, j] = shared[j, i] = len(np.intersect1d(ids[i], ids[j], assume_unique=True))
     return dict(
         keys=keys, labels=[registry.get_spec(k).label for k in keys], rows=rows,
-        unique=[int(len(a)) for a in ids], shared=shared.tolist(),
+        unique=[int(len(a)) for a in ids], shared=shared.tolist(), n_measured=measured,
     )
 
 
@@ -283,51 +322,143 @@ def edge_color(s):
     return plt.get_cmap(EDGE_CMAP)(EDGE_CMAP_MAX * float(s))[:3]
 
 
-def place_labels(fig, ax, texts, pos: np.ndarray, radii: np.ndarray) -> None:
+#: Width (pt) of the stroke around every node, and the length (pt) of the dashes of a hatched one
+STROKE_PT, HATCH_PT = 2.0, 3.0
+
+#: Catalogs whose label is written inside the node (large enough), with the text to show
+#: (``None``: the catalog's label)
+INSIDE_LABELS: Dict[str, Optional[str]] = {"desi_dr1": None, "lamost_ddp_dr9": "LAMOST\nDD-Payne\n(DR9)"}
+
+#: Height (data units) that the legend needs, and its width from its left edge
+LEGEND_H, LEGEND_W = 2.8, 1.0
+
+
+def points_per_unit(ax) -> float:
+    """Points (1/72 inch) per data unit along x, with the axes as they are now."""
+    (x0, _), (x1, _) = ax.transData.transform([[0.0, 0.0], [1.0, 0.0]])
+    return float(abs(x1 - x0) * 72.0 / ax.figure.dpi)
+
+
+def text_color_on(color: str) -> str:
+    """Black or white, whichever reads better on ``color`` (a hex string)."""
+    r, g, b = (int(color[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return "black" if 0.299 * r + 0.587 * g + 0.114 * b > 0.6 else "white"
+
+
+def node_strokes(data: dict) -> List[Tuple[Optional[str], str]]:
+    """``(parameter, kind)`` for every catalog: the first of ``STROKE_PARAMS`` that it lacks
+    (``kind`` ``"all"``: no star measures it, ``"some"``: only some do), or ``(None, "none")``.
+    Without ``n_measured`` in the data (counts from before it was recorded) nothing is marked."""
+    n_rows, n_meas = data["rows"], data.get("n_measured")
+    out = []
+    for k in range(len(data["keys"])):
+        found = (None, "none")
+        for param in STROKE_PARAMS if n_meas is not None else ():
+            kind = missing_kind(n_meas[k][PARAM_INDEX[param]], n_rows[k])
+            if kind != "none":
+                found = (param, kind)
+                break
+        out.append(found)
+    return out
+
+
+def draw_stroke(ax, center, radius: float, width_pt: float, ppu: float, param: Optional[str], kind: str) -> None:
+    """A stroke of ``width_pt`` *outside* the circle (so that it does not eat into small nodes):
+    white, and on top of it the color of ``param``, solid for ``kind == "all"`` and as alternating
+    colored and white dashes (a whole number of them around the circle) for ``"some"``."""
+    r = radius + 0.5 * width_pt / ppu
+    ax.add_patch(Circle(center, r, fill=False, ec="white", lw=width_pt, zorder=3.1))
+    if param is None:
+        return
+    kw = dict(fill=False, ec=STROKE_COLORS[param], lw=width_pt, zorder=3.2)
+    if kind == "all":
+        ax.add_patch(Circle(center, r, **kw))
+        return
+    circumference = 2 * np.pi * r * ppu
+    n = max(4, int(round(circumference / (2 * HATCH_PT))))
+    seg = circumference / (2 * n) / width_pt  # matplotlib scales dash lengths by the line width
+    ax.add_patch(Circle(center, r, ls=(0, (seg, seg)), **kw))
+
+
+def place_labels(fig, ax, texts, pos: np.ndarray, radii: np.ndarray, skip: Sequence[int] = (),
+                 preferred: Optional[Tuple[float, float, float, float]] = None,
+                 limit: Optional[Tuple[float, float, float, float]] = None) -> List[Tuple[float, float, float, float]]:
     """Put every label next to its circle without covering any circle or other label.
 
     Larger circles first; for each label, candidate positions on rings around the
-    circle (starting radially outward) are tried until one is free.
+    circle (starting radially outward) are tried until one is free. The labels of the nodes in
+    ``skip`` are left where they are (they sit inside their circles).
+
+    ``preferred`` is a box ``(x0, y0, x1, y1)`` in data units, normally the bounding box of the
+    nodes: a free position inside it is always taken over one that sticks out, and of the free
+    positions that do stick out, the one that sticks out least is taken (so that labels do not
+    make the figure, which is scaled to fit them, any bigger than the nodes need). ``limit`` is a
+    hard box (default: the axis limits) that no label may leave.
+
+    Returns the boxes ``(x0, y0, x1, y1)`` of the placed labels.
     """
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
     inv = ax.transData.inverted()
-    x0, x1 = ax.get_xlim()
-    y0, y1 = ax.get_ylim()
+    if limit is None:
+        limit = (*ax.get_xlim(), *ax.get_ylim())
+        limit = (limit[0], limit[2], limit[1], limit[3])
+    if preferred is None:
+        preferred = limit
     boxes = [(p[0] - r, p[1] - r, p[0] + r, p[1] + r) for p, r in zip(pos, radii)]
     center = pos.mean(0)
+    skip = set(skip)
+    placed = []
 
     def overlaps(b, others):
         return any(b[0] < o[2] and b[2] > o[0] and b[1] < o[3] and b[3] > o[1] for o in others)
 
+    def protrusion(b):
+        return (max(0.0, preferred[0] - b[0]) + max(0.0, preferred[1] - b[1])
+                + max(0.0, b[2] - preferred[2]) + max(0.0, b[3] - preferred[3]))
+
     for k in np.argsort(-radii):
+        if k in skip:
+            continue
         t = texts[k]
         out = pos[k] - center
         base = np.arctan2(out[1], out[0])
-        chosen = None
+        others = [b for i, b in enumerate(boxes) if i != k]
+        best = None  # (protrusion, setting, box) of the best free candidate so far
+        first = None
         for ring in (0.015, 0.05, 0.1, 0.17, 0.26):
             for da in np.deg2rad([0, 25, -25, 50, -50, 80, -80, 110, -110, 150, -150, 180]):
                 u = np.array([np.cos(base + da), np.sin(base + da)])
                 ha = "left" if u[0] > 0.35 else ("right" if u[0] < -0.35 else "center")
                 va = "bottom" if u[1] > 0.35 else ("top" if u[1] < -0.35 else "center")
-                t.set_position(pos[k] + (radii[k] + ring) * u)
+                setting = (pos[k] + (radii[k] + ring) * u, ha, va)
+                t.set_position(setting[0])
                 t.set_ha(ha)
                 t.set_va(va)
                 bb = t.get_window_extent(renderer)
                 (bx0, by0), (bx1, by1) = inv.transform([[bb.x0, bb.y0], [bb.x1, bb.y1]])
                 box = (bx0, by0, bx1, by1)
-                inside = bx0 > x0 and bx1 < x1 and by0 > y0 and by1 < y1
-                own = boxes[k]
-                others = [b for i, b in enumerate(boxes) if i != k]
-                if inside and not overlaps(box, others) and not overlaps(box, [own]):
-                    chosen = box
-                    break
-            if chosen:
+                if first is None:
+                    first = (setting, box)
+                inside = bx0 > limit[0] and bx1 < limit[2] and by0 > limit[1] and by1 < limit[3]
+                if inside and not overlaps(box, others) and not overlaps(box, [boxes[k]]):
+                    pr = protrusion(box)
+                    if best is None or pr < best[0] - 1e-9:
+                        best = (pr, setting, box)
+                    if pr <= 0:
+                        break
+            if best is not None and best[0] <= 0:
                 break
-        if chosen is None:  # nothing free: fall back to radially outward
+        if best is None:  # nothing free: fall back to radially outward
             log.warning("no free label position for %s", t.get_text())
-            chosen = box
-        boxes.append(chosen)
+            best = (0.0, *first)
+        _, (xy, ha, va), box = best
+        t.set_position(xy)
+        t.set_ha(ha)
+        t.set_va(va)
+        boxes.append(box)
+        placed.append(box)
+    return placed
 
 
 def route_edges(pos: np.ndarray, radii: np.ndarray, edges: np.ndarray, n_points: int = 40, iters: int = 500,
@@ -409,28 +540,64 @@ def plot_graph(data: dict, out_base: Path, min_shared: int = 1000, layout: str =
     for e in np.argsort(strength):  # weak edges first, so the strong ones are on top
         ax.plot(*curves[e].T, color=edge_color(strength[e]), lw=lw(strength[e]), alpha=al(strength[e]),
                 solid_capstyle="round", zorder=1)
-    texts, patches = [], []
+    inside = {k for k, key in enumerate(keys) if key in INSIDE_LABELS}
+    texts = []
     for k, key in enumerate(keys):
-        patches.append(ax.add_patch(Circle(pos[k], radii[k], fc=FAMILY_COLORS.get(family_of(key), "k"), ec="white", lw=1.2, zorder=3)))
+        fill = FAMILY_COLORS.get(family_of(key), "k")
+        ax.add_patch(Circle(pos[k], radii[k], fc=fill, ec="none", zorder=3))
+        if k in inside:  # the label goes inside the circle, in a color that contrasts with it
+            texts.append(ax.text(*pos[k], INSIDE_LABELS[key] or labels[k], fontsize=8, ha="center", va="center",
+                                 color=text_color_on(fill), linespacing=0.95, zorder=5))
+            continue
         out = pos[k] - pos.mean(0)
         out = out / (np.linalg.norm(out) + 1e-9)
         texts.append(ax.text(*(pos[k] + (radii[k] + 0.03) * out), labels[k], fontsize=8, ha="center", va="center",
                              zorder=5, path_effects=[pe.withStroke(linewidth=2.5, foreground="white")]))
+    strokes = node_strokes(data)
     ax.set_aspect("equal")
-    xmax = pos[:, 0].max() + 0.25
-    ymin, ymax = pos[:, 1].min() - 0.35, pos[:, 1].max() + 0.35
-    ax.set_xlim(pos[:, 0].min() - 0.5, xmax + 1.0)
-    ax.set_ylim(ymin, ymax)
-    place_labels(fig, ax, texts, pos, radii)
+    ax.axis("off")
+
+    # The figure is scaled to fit the nodes, the legend and the labels. The labels are placed
+    # inside the bounding box of the nodes where possible, so they should not make the nodes
+    # smaller; if a few stick out, the limits grow to include them, and the labels are placed
+    # again (their size in data units depends on the scale).
+    node_lo, node_hi = pos.min(0), pos.max(0)
+    lo, hi = node_lo.copy(), node_hi.copy()
+    margin, w, ring = 0.04, 0.0, radii
+    for _ in range(5):
+        used_lo, used_hi = lo.copy(), hi.copy()
+        ax.set_xlim(used_lo[0] - margin, used_hi[0] + margin + 0.15 + LEGEND_W)
+        ax.set_ylim(min(used_lo[1] - margin, used_hi[1] + margin - LEGEND_H), used_hi[1] + margin)
+        fig.tight_layout()
+        w = STROKE_PT / points_per_unit(ax)
+        ring = radii + w  # the strokes go outside the circles
+        bbox_lo, bbox_hi = (pos - ring[:, None]).min(0), (pos + ring[:, None]).max(0)
+        preferred = (bbox_lo[0], bbox_lo[1], bbox_hi[0], bbox_hi[1])
+        limit = (bbox_lo[0] - 0.6, bbox_lo[1] - 0.6, bbox_hi[0] + 0.6, bbox_hi[1] + 0.6)
+        boxes = place_labels(fig, ax, texts, pos, ring, skip=inside, preferred=preferred, limit=limit)
+        lo = np.minimum(bbox_lo, np.min([b[:2] for b in boxes], axis=0)) if boxes else bbox_lo
+        hi = np.maximum(bbox_hi, np.max([b[2:] for b in boxes], axis=0)) if boxes else bbox_hi
+        if np.allclose(lo, used_lo, atol=1e-3) and np.allclose(hi, used_hi, atol=1e-3):
+            break
+    n_out = sum(b[0] < bbox_lo[0] or b[1] < bbox_lo[1] or b[2] > bbox_hi[0] or b[3] > bbox_hi[1] for b in boxes)
+    log.info("%d of %d labels stick out of the bounding box of the nodes", n_out, len(boxes))
+    ppu = points_per_unit(ax)
+    renderer = fig.canvas.get_renderer()
+    for k in inside:  # does the label fit in its circle?
+        bb = texts[k].get_window_extent(renderer)
+        if 0.5 * np.hypot(bb.width, bb.height) > radii[k] * ppu * fig.dpi / 72:
+            log.warning("the label of %s does not fit in its circle", keys[k])
+    for k in range(len(keys)):
+        draw_stroke(ax, pos[k], radii[k], STROKE_PT, ppu, *strokes[k])
 
     # Legends, drawn in data units to the right of the graph
-    x0, y = xmax + 0.15, ymax - 0.1
+    x0, y = hi[0] + margin + 0.15, hi[1] + margin - 0.1
     head = dict(fontsize=9, weight="bold", va="center")
     ax.text(x0, y, "rows in catalog", **head)
     for ref in (1e3, 1e5, 1e6):
         r = float(node_radii(ref))
         y -= max(r + 0.04, 0.1)
-        ax.add_patch(Circle((x0 + 0.2, y), r, fc="0.6", ec="white"))
+        ax.add_patch(Circle((x0 + 0.2, y), r, fc="0.6", ec="none", zorder=3))
         ax.text(x0 + 0.2 + r + 0.06, y, f"{ref:,.0f}", fontsize=8, va="center")
         y -= r
     y -= 0.12
@@ -444,15 +611,22 @@ def plot_graph(data: dict, out_base: Path, min_shared: int = 1000, layout: str =
     ax.text(x0, y, "spectra", **head)
     for fam in [f for f in FAMILY_COLORS if any(family_of(k) == f for k in keys)]:
         y -= 0.09
-        ax.add_patch(Circle((x0 + 0.05, y), 0.03, fc=FAMILY_COLORS[fam], ec="white"))
+        ax.add_patch(Circle((x0 + 0.05, y), 0.03, fc=FAMILY_COLORS[fam], ec="none", zorder=3))
         ax.text(x0 + 0.13, y, fam, fontsize=8, va="center")
+    y -= 0.14
+    ax.text(x0, y, "parameters in catalog", **head)
+    for param, text in ((None, "all parameters"), *((p, STROKE_LABELS[p]) for p in STROKE_PARAMS)):
+        y -= 0.09
+        ax.add_patch(Circle((x0 + 0.05, y), 0.03, fc="0.6", ec="none", zorder=3))
+        draw_stroke(ax, (x0 + 0.05, y), 0.03, STROKE_PT, ppu, param, "all")
+        ax.text(x0 + 0.13, y, text, fontsize=8, va="center")
     ax.text(x0, y - 0.12, f"edges: >= {min_shared:,} shared stars, or a catalog's top {top_k}", fontsize=7, color="0.3", va="center")
-    ax.axis("off")
     fig.tight_layout()
     for ext in ("png", "pdf"):
         fig.savefig(f"{out_base}.{ext}", dpi=170)
     plt.close(fig)
-    return dict(n_edges=len(edges), crossings=score[0], weighted_crossings=score[1], pos=pos.tolist())
+    return dict(n_edges=len(edges), crossings=score[0], weighted_crossings=score[1], pos=pos.tolist(),
+                labels_outside=int(n_out))
 
 
 def short(n: int) -> str:
@@ -517,7 +691,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     path = args.out_dir / "catalog_overlaps.json"
     if path.exists() and not args.recount:
         data = json.load(open(path))
-        if data["keys"] != list(registry.keys()):
+        if data["keys"] != list(registry.keys()) or "n_measured" not in data:
             data = None
     else:
         data = None
