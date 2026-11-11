@@ -30,8 +30,14 @@ TRAINING_DIR = DATA_DIR / "training"
 
 DIAGNOSTIC_DIR = _env_path("ASTROTUNE_DIAGNOSTIC_DIR", PROJECT_ROOT / "diagnostic_plots")
 
-# Training pairs + control points, built from the per-catalog tables
+# Legacy training pairs + control points, built from the per-catalog tables.
+# Still read by train.py, evaluate.py and videos.py until they are ported to the
+# latent-y loss; the observation builder writes OBSERVATIONS_PATH instead.
 PAIRS_PATH = DATA_DIR / "pairs_and_ctrl_points.h5"
+
+# Training observations (one row per catalog measurement of a star that at least
+# two catalogs observe) + control points, built from the per-catalog tables
+OBSERVATIONS_PATH = DATA_DIR / "observations_and_ctrl_points.h5"
 
 # Trained models: models/<run-name>/
 MODELS_DIR = PROJECT_ROOT / "models"

@@ -85,15 +85,22 @@ parameter altogether.
 ### Training
 
 ```
-astrotune-pairs                       # build data/pairs_and_ctrl_points.h5
+astrotune-observations                # build data/observations_and_ctrl_points.h5
 astrotune-train --run-name my_run     # train; writes models/my_run/
 ```
 
-`astrotune-pairs --dedupe first` keeps one row per Gaia id in every catalog;
-the default (`none`) reproduces the legacy many-to-many join. The dispersed
-control points get a per-catalog `x_err` (the catalog's median, or its
-`X_ERR_DISPERSED`); `--dispersed-xerr uniform` gives the legacy uniform 0.2. Use
-`-o` to write a different file and `astrotune-train --pairs-path` to train on it.
+`astrotune-observations` writes one row per catalog measurement of every star
+that at least two catalogs observe, keyed by Gaia id, plus the control points;
+the free per-star harmonized parameters are part of the model, not of the data.
+`--dedupe first` keeps one row per Gaia id in every catalog (the default,
+`none`, keeps duplicate ids as separate observations). The dispersed control
+points get a per-catalog `x_err` (the catalog's median, or its
+`X_ERR_DISPERSED`); `--dispersed-xerr uniform` gives the legacy uniform 0.2.
+Use `-o` to write a different file.
+
+> **The trainer is being ported to the latent-y loss.** `astrotune-train`,
+> `astrotune-evaluate` and `astrotune-videos` on this branch still read the pair
+> file (`data/pairs_and_ctrl_points.h5`) and will be updated next.
 
 During training a progress bar is shown and a figure (loss history plus the
 catalogs before/after the transformation) is saved every 5 minutes to
