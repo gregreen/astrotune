@@ -144,7 +144,11 @@ class LatentTrainConfig:
     lr_schedule_phases: int = 8
     clip_norm: float = 100.0
     seed: int = 3
-    val_every: int = 1  # evaluate one validation batch every this many steps
+    #: How often to validate, in training steps. ``None`` uses the data-size
+    #: ratio, ``round(n_train_obs / n_val_obs)``, which makes one epoch's worth of
+    #: validation calls sweep the entire held-out set exactly once (see
+    #: ``_make_data``, which also sizes the validation batch to make that exact).
+    val_every: Optional[int] = None
     max_steps: Optional[int] = None  # stop early (mainly for testing)
 
     # The free harmonized parameters
@@ -258,6 +262,36 @@ def held_out_stars(n_stars: int, val_frac: float, seed: int) -> np.ndarray:
     if n_val:
         is_val[np.random.default_rng(seed).permutation(n_stars)[:n_val]] = True
     return is_val
+
+
+def validation_schedule(
+    n_batches: int, n_train_obs: int, n_val_obs: int, val_every: Optional[int] = None
+) -> Tuple[int, int, int]:
+    """How often to validate, and with what batch size: ``(every, batch, batches)``.
+
+    Validating every step at the training batch size costs about as much time as
+    training; validating less often at a smaller batch instead makes ``chi2_val``
+    an average over fewer observations than ``chi2``, so the two stop being
+    comparable. So validate once every ``val_every`` steps -- by default the
+    data-size ratio, which makes one epoch's validation calls a single pass over
+    the held-out set -- and size the batch so that pass is exactly one pass:
+
+    .. code::
+
+        calls_per_epoch = batches_per_epoch // val_every
+        val_batch       = ceil(n_val_obs / calls_per_epoch)
+
+    Sizing the batch to the training value instead leaves a fixed tail that a
+    cycling stream never shows: 52 batches of 65,536 cover 94.7% of 484,492, and
+    the missing 5.3% is dropped every epoch.
+    """
+    if val_every is None:
+        val_every = max(1, round(n_train_obs / max(1, n_val_obs)))
+    val_every = max(1, int(val_every))
+    calls_per_epoch = max(1, n_batches // val_every)
+    val_batch = min(n_val_obs, -(-n_val_obs // calls_per_epoch))
+    n_val_batches = -(-n_val_obs // val_batch)
+    return val_every, val_batch, n_val_batches
 
 
 def block_shuffled_rows(star: np.ndarray, rows: np.ndarray, rng) -> np.ndarray:
@@ -409,37 +443,67 @@ class LatentTrainer:
             )
         ).prefetch(2)
 
-        # Validation: a batch of held-out stars and one of held-out control
-        # points. Both are optional, so a tiny held-out part does not crash.
-        val_batch = min(cfg.batch_size, len(val_rows), n_val)
+        # Validation: sweep the whole held-out set once per epoch, in batches as
+        # close to the training size as the arithmetic allows.
+        #
+        # Validating every step at the training batch size would spend about as
+        # much time on validation as on training; validating less often at a
+        # smaller batch instead would make ``chi2_val`` a noisier and less
+        # comparable number than ``chi2``. So validate once every ``val_every``
+        # steps, where the default is the data-size ratio, and size the batch so
+        # that the calls an epoch makes cover the held-out set exactly:
+        #
+        #     calls/epoch = batches/epoch // val_every
+        #     val_batch   = ceil(n_val_obs / calls/epoch)
+        #
+        # With 52 batches and a ratio of 7 that is 7 calls of 69,213 observations,
+        # which covers all 484,492 held-out observations once per epoch. Sizing it
+        # "round" instead (65,536) would leave a fixed 5% tail that a cycling
+        # stream never shows.
         self.val_data = None
-        if val_batch > 0:
-            # Enough repeats to cover *every* step of the run: with a large batch
-            # a held-out set only holds a batch or two, and sizing the stream by
-            # epochs (n_epochs / val_frac repeats) runs out mid-run. Both streams
-            # drop their own remainder, and ``zip`` stops at the shorter one, so
-            # the repeat count must be set by whichever yields fewer batches per
-            # repeat (the control points are trimmed to ``n_val`` and can give
-            # fewer than the observations).
-            per_repeat = min(
-                max(1, len(val_rows) // val_batch), max(1, n_val // val_batch)
+        if len(val_rows) > 0 and n_val > 0:
+            self.val_every, val_batch, n_val_batches = validation_schedule(
+                n_batches, len(train_rows), len(val_rows), cfg.val_every
             )
-            val_repeats = -(-self.n_steps // per_repeat) + 1  # one to spare
+            val_repeats = -(-self.n_steps // n_val_batches) + 1  # one to spare
+
+            # ``batch`` drops the short tail, so a cycle with a partial last batch
+            # would silently lose it and the coverage above would not hold. Wrap a
+            # few observations from the front of the set instead: at most
+            # ``val_batch - 1`` of them are then seen twice, which is nothing next
+            # to a mean over 484,492.
+            pad = (-len(val_rows)) % val_batch
+            val_row_batches = (
+                np.concatenate([val_rows, val_rows[:pad]]) if pad else val_rows
+            )
+
+            # The control points are a penalty term, not a per-star quantity, so
+            # their count per call is free. Their stream is unbounded, so that
+            # ``zip`` (which stops at the shorter stream) is ended by the
+            # observations and the held-out set is covered in full.
+            ctrl_batch = min(val_batch, n_val)
             self.val_data = tf.data.Dataset.zip(
                 (
-                    tf.data.Dataset.from_tensor_slices(val_rows.astype("i4"))
+                    tf.data.Dataset.from_tensor_slices(val_row_batches.astype("i4"))
                     .batch(val_batch, drop_remainder=True)
                     .repeat(val_repeats),
                     _make_ctrl_dataset(
                         [ctrl_dict[k][:n_val] for k in ctrl_keys],
-                        val_batch,
+                        ctrl_batch,
                         cfg.seed,
-                        val_repeats,
+                        None,  # for ever
                     ),
                 )
             ).prefetch(2)
+            log.info(
+                "validation every %d steps: %d calls of %d observations per epoch, "
+                "%d batches covering all %d held-out observations",
+                self.val_every, n_batches // max(1, self.val_every), val_batch,
+                n_val_batches, len(val_rows),
+            )
         else:
-            log.warning("too few held-out stars or control points; validation is off")
+            self.val_every = 0
+            log.warning("no held-out stars or control points; validation is off")
 
         # GPU copies of the observation columns; a batch is gathered by row index
         self.x_obs = tf.constant(np.asarray(obs_dict["x"]))
@@ -941,7 +1005,7 @@ class LatentTrainer:
                         done, cfg.y_solver,
                     )
 
-                if self._val_it is not None and done - step_last_val >= cfg.val_every:
+                if self._val_it is not None and done - step_last_val >= self.val_every:
                     try:
                         res = self._val_step(fit_y)
                     except tf.errors.OutOfRangeError:
@@ -1124,7 +1188,7 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
             parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=None)
         elif isinstance(default, tuple):
             parser.add_argument(flag, nargs="*", default=None)
-        elif f.name in ("max_steps", "plot_every_steps"):
+        elif f.name in ("max_steps", "plot_every_steps", "val_every"):
             parser.add_argument(flag, type=int, default=None)
         elif f.name in ("freeze_after_frac", "plot_every_seconds", "checkpoint_every_seconds"):
             parser.add_argument(flag, type=float, default=None)

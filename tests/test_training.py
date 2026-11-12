@@ -408,3 +408,41 @@ def test_shuffled_split_keeps_the_catalog_mix():
     # the shuffled one keeps both sides representative
     for cat in (8, 5):
         assert abs(share(new, cat) - share(~new, cat)) < 0.02
+
+
+def test_validation_schedule_covers_the_held_out_set_once_per_epoch():
+    """The default must sweep every held-out observation exactly once per epoch."""
+    from astrotune.train_latent import validation_schedule
+
+    n_batches, n_train, n_val = 52, 3_391_987, 484_492
+    every, batch, batches = validation_schedule(n_batches, n_train, n_val)
+
+    assert every == 7  # round(3.39e6 / 4.84e5)
+    calls_per_epoch = n_batches // every
+    assert batches == calls_per_epoch  # one pass per epoch, not more
+    assert batch * batches >= n_val  # and it is a full pass
+    assert batch * (batches - 1) < n_val  # with no wasted batch
+    # close to the training batch size, so chi2 and chi2_val are comparable
+    assert 0.8 < batch / 65_536 < 1.2
+
+
+def test_validation_schedule_is_overridable_and_always_covers():
+    from astrotune.train_latent import validation_schedule
+
+    cases = [
+        (52, 3_391_987, 484_492, 1),
+        (52, 3_391_987, 484_492, 13),
+        (52, 3_391_987, 4_000, None),
+        (52, 3_391_987, 4_000, 100),  # less often than once per epoch
+        (52, 3_391_987, 100, 1),  # fewer val observations than training batches
+        (3, 1000, 30, None),
+    ]
+    for n_batches, n_train, n_val, every in cases:
+        got_every, batch, batches = validation_schedule(n_batches, n_train, n_val, every)
+        assert got_every >= 1 and batch >= 1
+        assert batch <= n_val
+        assert batch * batches >= n_val, (n_batches, n_val, every)
+        # an epoch of validation calls must cover the held-out set
+        assert (n_batches // got_every) * batch >= n_val or batch == n_val, (
+            n_batches, n_val, every,
+        )
