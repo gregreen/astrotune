@@ -237,6 +237,29 @@ def initial_y(obs_dict) -> np.ndarray:
     return (np.stack(num, axis=1) / np.maximum(np.stack(den, axis=1), 1e-30)).astype("f4")
 
 
+def held_out_stars(n_stars: int, val_frac: float, seed: int) -> np.ndarray:
+    """Which stars are held out, as a boolean array over the star index.
+
+    A random choice per *star*, not a cut on the sorted ids. A Gaia id encodes a
+    HEALPix index, so the lowest ids are a patch of sky: taking the first
+    ``val_frac`` of them makes the held-out set a region, not a sample. On the
+    19-catalog file that region was LAMOST-heavy and DESI-poor by a factor of 7
+    (1.4% of its observations against 9.7% of the training ones), RAVE-poor by
+    100, and had no Pristine star at all, so the validation loss was measuring an
+    easier subset of the sky.
+
+    Args:
+      n_stars: number of stars.
+      val_frac: fraction of stars to hold out.
+      seed: reproducible choice.
+    """
+    n_val = int(n_stars * val_frac)
+    is_val = np.zeros(n_stars, dtype=bool)
+    if n_val:
+        is_val[np.random.default_rng(seed).permutation(n_stars)[:n_val]] = True
+    return is_val
+
+
 def block_shuffled_rows(star: np.ndarray, rows: np.ndarray, rng) -> np.ndarray:
     """``rows`` reordered by a random permutation of their star, stars kept whole.
 
@@ -336,8 +359,11 @@ class LatentTrainer:
         cfg = self.cfg
         star = np.asarray(obs_dict["star"])
         n_stars = int(obs_dict["n_stars"])
-        n_val_stars = int(n_stars * cfg.val_frac)
-        is_val = star < n_val_stars
+        # A random choice of stars (see ``held_out_stars``), applied per
+        # observation: every observation of a held-out star is held out.
+        is_val_star = held_out_stars(n_stars, cfg.val_frac, cfg.seed)
+        is_val = is_val_star[star]
+        n_val_stars = int(is_val_star.sum())
         rng = np.random.default_rng(cfg.seed)
 
         # ``block_shuffles`` independent permutations of the star blocks, one after
@@ -434,7 +460,7 @@ class LatentTrainer:
             obs_dict,
             max_stars=cfg.agreement_n_stars,
             seed=cfg.seed,
-            stars=np.arange(n_val_stars),
+            stars=np.flatnonzero(is_val_star),
         )
         log.info(
             "%d steps expected (%d batches of %d observations per epoch; each epoch "

@@ -351,3 +351,60 @@ def test_latent_training_moves_y_and_saves(tmp_path):
     assert (tmp_path / "bijector" / "saved_model.pb").exists()
     saved = np.load(tmp_path / "latent_y.npz")
     assert saved["y"].shape == (1200, 4) and saved["id"].shape == (1200,)
+
+
+def test_held_out_stars_is_a_random_sample_not_a_prefix():
+    """The held-out set must not be a block of the id order.
+
+    Gaia ids encode a HEALPix index, so the lowest ids are a patch of sky; cutting
+    on the sorted ids made the validation set a region (LAMOST-heavy, DESI-poor by
+    a factor of 7) rather than a sample.
+    """
+    from astrotune.train_latent import held_out_stars
+
+    n_stars = 20000
+    is_val = held_out_stars(n_stars, 0.125, seed=3)
+
+    assert is_val.dtype == bool and len(is_val) == n_stars
+    assert is_val.sum() == int(n_stars * 0.125)
+    # not the lowest ids
+    assert not np.array_equal(np.flatnonzero(is_val), np.arange(is_val.sum()))
+    # spread evenly over the index range instead
+    bins = np.array_split(np.arange(n_stars), 10)
+    for b in bins:
+        assert 0.10 < is_val[b].mean() < 0.15
+
+
+def test_held_out_stars_is_reproducible_and_seed_dependent():
+    from astrotune.train_latent import held_out_stars
+
+    a = held_out_stars(5000, 0.2, seed=1)
+    assert np.array_equal(a, held_out_stars(5000, 0.2, seed=1))
+    assert not np.array_equal(a, held_out_stars(5000, 0.2, seed=2))
+    assert a.sum() == 1000
+
+
+def test_shuffled_split_keeps_the_catalog_mix():
+    """A split on a sky-correlated id must not change which surveys are held out.
+
+    The observations are laid out like the real file: a low-id region dominated by
+    one catalog and a high-id region by another.
+    """
+    from astrotune.train_latent import held_out_stars
+
+    n_stars = 40000
+    star = np.repeat(np.arange(n_stars), 2)  # two observations per star
+    c = np.where(star < n_stars // 2, 8, 5)  # "DESI" low ids, "LAMOST" high ids
+
+    old = star < int(n_stars * 0.125)  # the previous, id-ordered split
+    new = held_out_stars(n_stars, 0.125, seed=3)[star]
+
+    def share(mask, cat):
+        return (c[mask] == cat).mean()
+
+    # the old split holds out the low-id region only, so its held-out set is a
+    # single catalog while training keeps both
+    assert share(old, 8) > 0.99 and share(old, 5) < 0.01
+    # the shuffled one keeps both sides representative
+    for cat in (8, 5):
+        assert abs(share(new, cat) - share(~new, cat)) < 0.02
