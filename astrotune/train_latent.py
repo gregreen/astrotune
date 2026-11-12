@@ -27,6 +27,12 @@ epoch with all of its data. ``y`` is state of the run, not of the exported
 SavedModel: inference for a star observed by one catalog goes through
 ``to_harmonized`` as before.
 
+The epoch is ``block_shuffles`` independent permutations of the star blocks
+concatenated, i.e. ``block_shuffles`` passes over the training set, so that a
+``drop_remainder`` cut only costs the stars in the tail of one permutation one
+of their ``block_shuffles`` updates. With ``drop_remainder=False`` (the default)
+nothing is skipped at all and the last batch of an epoch is short.
+
 The training loop runs in a graph: :meth:`LatentTrainer.train` calls a
 ``tf.function`` that advances the dataset iterator and the optimizer for a chunk
 of steps inside one ``while_loop``, and does in Python only what needs the host
@@ -111,8 +117,24 @@ class LatentTrainConfig:
     # Optimization
     batch_size: int = 16384  # observations per batch
     n_epochs: int = 16
+    #: Independent block permutations concatenated into one epoch. The data of an
+    #: epoch are ``block_shuffles`` passes over the training set, so with
+    #: ``drop_remainder`` the rows lost at the end of an epoch are those of one
+    #: permutation only, and the stars in them lose one update out of
+    #: ``block_shuffles`` instead of all of them.
+    block_shuffles: int = 1
+    #: Whether the short final batch of an epoch is discarded (constant batch
+    #: shape) or kept (no row is ever skipped).
+    drop_remainder: bool = False
     val_frac: float = 1 / 8  # fraction of *stars* held out
-    learning_rate: float = 1e-3  # halved at each of 7 evenly spaced steps
+    learning_rate: float = 1e-3
+    #: Number of piecewise-constant segments the rate is spread over; the rate
+    #: is halved from one segment to the next, so it covers a factor
+    #: ``2 ** (lr_schedule_phases - 1)``. The segments are equal fractions of
+    #: the run, which with ``n_epochs`` fixed is also equal fractions of its
+    #: data, so the schedule is comparable across batch sizes. Set it to 1 for
+    #: a constant rate, which is what an lr comparison wants.
+    lr_schedule_phases: int = 8
     clip_norm: float = 100.0
     seed: int = 3
     val_every: int = 1  # evaluate one validation batch every this many steps
@@ -208,7 +230,10 @@ def block_shuffled_rows(star: np.ndarray, rows: np.ndarray, rng) -> np.ndarray:
 
 def _make_ctrl_dataset(arrays, batch_size: int, seed: int, n_repeat: Optional[int] = None):
     ds = tf.data.Dataset.from_tensor_slices(tuple(arrays))
-    ds = ds.shuffle(buffer_size=batch_size * 64, seed=seed)
+    # A buffer far larger than the control catalogue is pure waste: at 256k
+    # observations per step the old batch_size * 64 asked for 16.7M slots to
+    # shuffle 2.9M points, and refilling it stalled for seconds every few steps.
+    ds = ds.shuffle(buffer_size=min(batch_size * 64, 1 << 20), seed=seed)
     ds = ds.repeat(n_repeat)
     return ds.batch(batch_size, drop_remainder=True)
 
@@ -250,9 +275,14 @@ class LatentTrainer:
         # The learning-rate budget is set by the number of steps, so the data
         # pipeline must be built first.
         n = max(8, self.n_steps)
+        k = max(1, min(int(cfg.lr_schedule_phases), n))
+        if k == 1:  # a constant rate; the decay needs one boundary to exist
+            boundaries, values = [n], [cfg.learning_rate, cfg.learning_rate]
+        else:
+            boundaries = [i * n // k for i in range(1, k)]
+            values = [cfg.learning_rate / 2**i for i in range(k)]
         self.learning_rate = keras.optimizers.schedules.PiecewiseConstantDecay(
-            [i * n // 8 for i in range(1, 8)],
-            [cfg.learning_rate / 2**i for i in range(8)],
+            boundaries, values
         )
         self.opt = keras.optimizers.Adam(learning_rate=self.learning_rate)
         self.opt.build(self.variables)
@@ -282,24 +312,35 @@ class LatentTrainer:
         is_val = star < n_val_stars
         rng = np.random.default_rng(cfg.seed)
 
-        train_rows = block_shuffled_rows(star, np.flatnonzero(~is_val), rng)
+        # ``block_shuffles`` independent permutations of the star blocks, one after
+        # another: shuffling once fixes both the order of the batches and the tail
+        # that a ``drop_remainder`` cut removes, so the same stars sit in that tail
+        # in every epoch. Concatenating N permutations spreads the cut over N sets.
+        base_rows = np.flatnonzero(~is_val)
+        train_rows = np.concatenate(
+            [
+                block_shuffled_rows(star, base_rows, rng)
+                for _ in range(max(1, cfg.block_shuffles))
+            ]
+        )
         val_rows = np.flatnonzero(is_val)
 
-        n_batches = len(train_rows) // cfg.batch_size
+        if cfg.drop_remainder:
+            n_batches = len(train_rows) // cfg.batch_size
+        else:
+            n_batches = -(-len(train_rows) // cfg.batch_size)  # keep the last partial batch
         if n_batches == 0:
             raise ValueError(
-                f"batch_size {cfg.batch_size} is larger than the {len(train_rows)} "
-                "training observations"
+                f"there are no training observations (batch_size {cfg.batch_size})"
             )
         self.n_steps = n_batches * cfg.n_epochs
         if cfg.max_steps is not None:
             self.n_steps = min(self.n_steps, cfg.max_steps)
 
         ds = tf.data.Dataset.from_tensor_slices(train_rows.astype("i4"))
-        ds = ds.batch(cfg.batch_size, drop_remainder=True)
+        ds = ds.batch(cfg.batch_size, drop_remainder=cfg.drop_remainder)
         ds = ds.repeat(cfg.n_epochs).shuffle(max(1, min(n_batches, 256)), seed=cfg.seed)
 
-        val_epochs = int(np.ceil(cfg.n_epochs / cfg.val_frac))
         ctrl_keys = ("x_control", "xe_control", "c_control")
         n_val = int(len(ctrl_dict["x_control"]) * cfg.val_frac)
         # The control points repeat for ever; zipping the two streams gives one
@@ -319,16 +360,27 @@ class LatentTrainer:
         val_batch = min(cfg.batch_size, len(val_rows), n_val)
         self.val_data = None
         if val_batch > 0:
+            # Enough repeats to cover *every* step of the run: with a large batch
+            # a held-out set only holds a batch or two, and sizing the stream by
+            # epochs (n_epochs / val_frac repeats) runs out mid-run. Both streams
+            # drop their own remainder, and ``zip`` stops at the shorter one, so
+            # the repeat count must be set by whichever yields fewer batches per
+            # repeat (the control points are trimmed to ``n_val`` and can give
+            # fewer than the observations).
+            per_repeat = min(
+                max(1, len(val_rows) // val_batch), max(1, n_val // val_batch)
+            )
+            val_repeats = -(-self.n_steps // per_repeat) + 1  # one to spare
             self.val_data = tf.data.Dataset.zip(
                 (
                     tf.data.Dataset.from_tensor_slices(val_rows.astype("i4"))
                     .batch(val_batch, drop_remainder=True)
-                    .repeat(val_epochs),
+                    .repeat(val_repeats),
                     _make_ctrl_dataset(
                         [ctrl_dict[k][:n_val] for k in ctrl_keys],
                         val_batch,
                         cfg.seed,
-                        val_epochs,
+                        val_repeats,
                     ),
                 )
             ).prefetch(2)
@@ -357,9 +409,11 @@ class LatentTrainer:
             stars=np.arange(n_val_stars),
         )
         log.info(
-            "%d steps expected (%d batches of %d observations per epoch); "
+            "%d steps expected (%d batches of %d observations per epoch; each epoch "
+            "is %d block permutations = %d passes over the data); "
             "%d held-out stars for the agreement.",
-            self.n_steps, n_batches, cfg.batch_size, n_val_stars,
+            self.n_steps, n_batches, cfg.batch_size,
+            max(1, cfg.block_shuffles), max(1, cfg.block_shuffles), n_val_stars,
         )
 
     # -- loss ---------------------------------------------------------------
@@ -735,10 +789,20 @@ class LatentTrainer:
                 pbar.update(n)
 
                 if self._val_it is not None and done - step_last_val >= cfg.val_every:
-                    res = self._val_step()
-                    for k, v in res.items():
-                        metrics.setdefault(k + "_val", []).append(float(v.numpy()))
-                    metrics["step_val"].append(done)
+                    try:
+                        res = self._val_step()
+                    except tf.errors.OutOfRangeError:
+                        # Never lose a long run to a diagnostic: drop validation
+                        # and carry on with the training stream.
+                        log.warning(
+                            "Validation stream exhausted at step %d; continuing "
+                            "without validation from here on.", done,
+                        )
+                        self._val_it, res = None, None
+                    if res is not None:
+                        for k, v in res.items():
+                            metrics.setdefault(k + "_val", []).append(float(v.numpy()))
+                        metrics["step_val"].append(done)
                     step_last_val = done
 
                 report(done)
