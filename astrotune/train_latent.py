@@ -27,6 +27,13 @@ on the optimum. ``y_solver="gradient"`` keeps the older variant, which updates
 run, not of the exported SavedModel: inference for a star observed by one catalog
 goes through ``to_harmonized`` as before.
 
+A run can start with the maps alone: ``pretrain_steps`` leaves ``y`` at its
+initial guess for the first that many steps, so the bijections are fitted
+against the precision-weighted means before ``y`` is allowed to move, and a
+value at least as large as the run is exactly "pre-train the bijections and
+stop". Held-out stars keep their own initial guess during that phase, so the
+validation loss measures the same objective as the training loss.
+
 The epoch is ``block_shuffles`` independent permutations of the star blocks
 concatenated, i.e. ``block_shuffles`` passes over the training set, so that a
 ``drop_remainder`` cut only costs the stars in the tail of one permutation one
@@ -157,6 +164,12 @@ class LatentTrainConfig:
     #: diagonal. Some stars constrain one direction very poorly, where the
     #: unregularised step can be hundreds of sigma.
     y_ridge: float = 1e-6
+    #: Steps at the start of the run during which ``y`` is left at its initial
+    #: guess, so the bijections are pre-trained against the precision-weighted
+    #: means before ``y`` is allowed to move; the maps then start out consistent
+    #: with a reasonable ``y``. Zero disables the phase, and setting it to at
+    #: least the whole run is exactly "pre-train the bijections and stop".
+    pretrain_steps: int = 0
 
     # Observation loss
     chi2_turnover: float = 50.0
@@ -546,13 +559,14 @@ class LatentTrainer:
         delta = tf.where(den > 1e-6, num / (den + 1e-30), tf.zeros_like(num))
         self.y.scatter_nd_sub(tf.expand_dims(uniq, 1), cfg.y_learning_rate * delta)
 
-    def _run_steps_graph(self, n_steps, freeze_list):
+    def _run_steps_graph(self, n_steps, freeze_list, fit_y):
         """``n_steps`` optimizer steps in one graph.
 
         AutoGraph turns the loop into a ``tf.while_loop`` around the dataset
         iterator and the optimizer, so each call advances the state by
-        ``n_steps`` without returning to Python. ``freeze_list`` is a Python
-        value: changing it retraces once, which is all a run ever needs.
+        ``n_steps`` without returning to Python. ``freeze_list`` and ``fit_y`` are
+        Python values: changing either retraces once, which is all a run ever
+        needs (``fit_y`` flips once, at the end of the pre-training phase).
         """
         out = tf.TensorArray(tf.float32, size=0, dynamic_size=True, clear_after_read=False)
         for step in tf.range(n_steps):
@@ -564,15 +578,17 @@ class LatentTrainer:
                 c_ctrl,
                 apply_grads=True,
                 freeze_list=freeze_list,
+                fit_y=fit_y,
             )
             out = out.write(step, tf.stack([res[k] for k in METRIC_KEYS]))
         return out.stack()
 
-    def _val_step_graph(self):
+    def _val_step_graph(self, fit_y):
         """One validation step: the loss on held-out stars, nothing updated."""
         obs_idx, (x_ctrl, xe_ctrl, c_ctrl) = self._val_it.get_next()
         return self._grad_step(
-            obs_idx, x_ctrl, xe_ctrl, c_ctrl, apply_grads=False, freeze_list=()
+            obs_idx, x_ctrl, xe_ctrl, c_ctrl,
+            apply_grads=False, freeze_list=(), fit_y=fit_y,
         )
 
     def _grad_step(
@@ -583,6 +599,7 @@ class LatentTrainer:
         c_ctrl,
         apply_grads=True,
         freeze_list=(),
+        fit_y=True,
     ):
         cfg = self.cfg
         bij = self.bij
@@ -603,8 +620,10 @@ class LatentTrainer:
 
         # The Gauss-Newton solver needs the Jacobian and no gradient with respect
         # to y; the gradient solver needs the opposite, so ``y`` is watched only
-        # for the latter.
-        gauss_newton = apply_grads and cfg.y_solver == "gauss_newton"
+        # for the latter. Either way, nothing touches ``y`` while it is being
+        # held at its initial guess.
+        gauss_newton = apply_grads and fit_y and cfg.y_solver == "gauss_newton"
+        y_gradient = apply_grads and fit_y and cfg.y_solver == "gradient"
 
         # ``y`` is fitted first, outside the tape: it is a separate block of the
         # optimisation, and its solve carries a Jacobian whose ops nothing needs
@@ -613,14 +632,16 @@ class LatentTrainer:
         # the fitted ``y`` rather than at the one about to be replaced.
         if gauss_newton:
             self._gauss_newton_y(x, xs, c, star)
-        if apply_grads:
+        if apply_grads or not fit_y:
+            # A pre-trained run holds every star at its initial guess, held-out or
+            # not, so the validation loss measures the objective being trained.
             y = tf.gather(self.y, star)
         else:
             y = self._profile_y(x, xs, c, star)
 
         with tf.GradientTape(watch_accessed_variables=False) as g:
             g.watch(vars_filtered)
-            if apply_grads and not gauss_newton:
+            if y_gradient:
                 # The gradient with respect to y comes from the same tape: one
                 # backward pass for the map and for the free parameters.
                 g.watch(y)
@@ -682,13 +703,13 @@ class LatentTrainer:
         }
 
         if apply_grads:
-            if gauss_newton:
-                grads = g.gradient(loss, vars_filtered)
-            else:
+            if y_gradient:
                 *grads, grad_y = g.gradient(loss, vars_filtered + [y])
+            else:
+                grads = g.gradient(loss, vars_filtered)
             grads, norm = tf.clip_by_global_norm(grads, cfg.clip_norm)
             self.opt.apply_gradients(zip(grads, vars_filtered))
-            if not gauss_newton and grad_y is not None:
+            if y_gradient and grad_y is not None:
                 self._update_y(grad_y, xs, star)
             res["norm"] = norm
 
@@ -874,18 +895,29 @@ class LatentTrainer:
                     log.info("Step %d: freezing variables matching %s", done, freeze_list)
 
                 n = min(chunk, self.n_steps - done)
+                # A chunk cannot straddle the end of the pre-training phase: the
+                # boundary is where ``fit_y`` flips, and a chunk is one graph
+                # execution with a single value of it.
+                if done < cfg.pretrain_steps:
+                    n = min(n, cfg.pretrain_steps - done)
+                fit_y = done >= cfg.pretrain_steps
                 t0 = time.monotonic()
-                block = self._run_steps(tf.constant(n, tf.int32), freeze_list).numpy()
+                block = self._run_steps(tf.constant(n, tf.int32), freeze_list, fit_y).numpy()
                 dt = time.monotonic() - t0
 
                 for key, column in zip(METRIC_KEYS, block.T):
                     metrics.setdefault(key, []).extend(np.asarray(column, "f8").tolist())
                 done += n
                 pbar.update(n)
+                if done == cfg.pretrain_steps:
+                    log.info(
+                        "Step %d: pre-training done, y starts being fitted (%s)",
+                        done, cfg.y_solver,
+                    )
 
                 if self._val_it is not None and done - step_last_val >= cfg.val_every:
                     try:
-                        res = self._val_step()
+                        res = self._val_step(fit_y)
                     except tf.errors.OutOfRangeError:
                         # Never lose a long run to a diagnostic: drop validation
                         # and carry on with the training stream.

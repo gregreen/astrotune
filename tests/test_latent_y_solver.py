@@ -148,3 +148,48 @@ def test_gauss_newton_is_the_default_and_trains(tmp_path):
 def test_y_solver_rejects_an_unknown_name():
     with pytest.raises(ValueError, match="y_solver"):
         _small_trainer(y_solver="newton")
+
+
+def _displace_y(tr, amount=0.15):
+    """Move every y off the precision-weighted mean, so a fit has work to do."""
+    shift = tf.constant(np.full(tr.y.shape, amount, dtype="f4"))
+    tr.y.assign_add(shift)
+    return tr.y.numpy().copy()
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_pretraining_leaves_y_at_its_initial_guess(tmp_path):
+    """The pre-training phase must not move y at all, only the maps.
+
+    ``initial_y`` is the precision-weighted mean, so holding it and fitting the
+    bijections alone is the pre-training the maps are meant to start from.
+    """
+    tr = _small_trainer(pretrain_steps=10**6)  # longer than the whole run
+    y0 = tr.y.numpy().copy()
+    w0 = [v.numpy().copy() for v in tr.variables]
+
+    metrics = tr.train(tmp_path)
+
+    assert np.array_equal(tr.y.numpy(), y0)  # bit for bit, not approximately
+    assert np.all(np.isfinite(metrics["loss"]))
+    # and the map did move, so this is not simply a no-op
+    assert any(not np.array_equal(v.numpy(), w) for v, w in zip(tr.variables, w0))
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_y_moves_only_after_pretraining_ends(tmp_path):
+    """With one pre-training step of two, the second step is the one that fits."""
+    tr = _small_trainer(pretrain_steps=2)  # the whole 2-step run
+    y_frozen = _displace_y(tr)
+    tr.train(tmp_path)
+    assert np.array_equal(tr.y.numpy(), y_frozen)
+
+    tr = _small_trainer(pretrain_steps=1)  # pre-train one step, then fit
+    y_mean = tr.y.numpy().copy()
+    y_displaced = _displace_y(tr)
+    tr.train(tmp_path)
+
+    # some stars moved, and on average y is closer to the initial guess than the
+    # displacement left it
+    assert np.abs(tr.y.numpy() - y_displaced).max() > 0.0
+    assert np.mean(np.abs(tr.y.numpy() - y_mean)) < np.mean(np.abs(y_displaced - y_mean))
