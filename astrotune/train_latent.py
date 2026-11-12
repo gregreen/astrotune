@@ -27,6 +27,12 @@ on the optimum. ``y_solver="gradient"`` keeps the older variant, which updates
 run, not of the exported SavedModel: inference for a star observed by one catalog
 goes through ``to_harmonized`` as before.
 
+The held-out stars have a second array, ``y_val``, fitted by the same rule on the
+validation batches and remembered between calls. Without it the validation loss
+would profile a cold ``y`` (one sweep from the precision-weighted mean) while the
+training loss uses a ``y`` already at its running fixed point, and the two would
+differ by about 0.3 in chi^2 for that reason alone.
+
 A run can start with the maps alone: ``pretrain_steps`` leaves ``y`` at its
 initial guess for the first that many steps, so the bijections are fitted
 against the precision-weighted means before ``y`` is allowed to move, and a
@@ -160,10 +166,6 @@ class LatentTrainConfig:
     y_solver: str = "gauss_newton"
     #: Damping of the ``y`` step (1 is the full step), for either solver.
     y_learning_rate: float = 1.0
-    #: Newton sweeps used to fit y on a validation batch (the profile
-    #: likelihood; held-out stars have no trained y). Each sweep is one solve
-    #: with the transported Jacobian, and a second sweep changes little.
-    y_profile_steps: int = 1
     #: Ridge of the per-star normal equations, relative to the mean of their
     #: diagonal. Some stars constrain one direction very poorly, where the
     #: unregularised step can be hundreds of sigma.
@@ -355,6 +357,11 @@ class LatentTrainer:
             "%d free harmonized vectors (%.0f MB).",
             int(self.y.shape[0]),
             self.y.numpy().nbytes / 2**20,
+        )
+        # The held-out stars' y, fitted the same way and remembered between
+        # validation calls; see ``_fit_y_val``.
+        self.y_val = tf.Variable(
+            initial_y(obs_dict), name="latent_y_val", dtype=tf.float32
         )
 
         # The learning-rate budget is set by the number of steps, so the data
@@ -579,25 +586,34 @@ class LatentTrainer:
         ridge = (self.cfg.y_ridge * scale + 1e-8) * tf.eye(n_dim, dtype=A.dtype)
         return tf.linalg.solve(A + ridge, b[:, :, None])[:, :, 0]
 
-    def _profile_y(self, x, xs, c, star) -> tf.Tensor:
-        """Fit a batch's harmonized values, without touching ``y``.
+    def _fit_y_val(self, x, xs, c, star) -> tf.Tensor:
+        """One Gauss-Newton sweep of the held-out stars' ``y``, kept between calls.
 
-        Held-out stars have no trained ``y``. Fitting it on the held-out batch is
-        the profile likelihood, which is what the training loss estimates, so this
-        solves the same normal equations the training step does. It starts from
-        the precision-weighted mean, which is the answer for a map close to the
-        identity.
+        The training ``y`` is re-solved once per epoch and so sits at its running
+        fixed point. A validation ``y`` refitted from scratch on every call would
+        instead be one sweep from the precision-weighted mean -- a cold start --
+        and would report a chi^2 about 0.3 higher than the training one for that
+        reason alone: on the finished ``latent_gn_dr1logg_1h`` the held-out stars
+        reach 4.32 after one sweep but 4.03 at the fixed point, against 3.90 for
+        the trained ``y``. So keep a second array and update it the same way: one
+        sweep, once per epoch per star, on the held-out batch. The two numbers are
+        then the same quantity.
+
+        Fitted only on held-out data, per star, in sample: no leakage into the map,
+        and no effect on it.
         """
-        w = 1.0 / xs**2
-        uniq, inv = tf.unique(star)
-        den = tf.math.unsorted_segment_sum(w, inv, tf.size(uniq))
-        y = tf.math.unsorted_segment_sum(w * x, inv, tf.size(uniq)) / (den + 1e-30)
-        for _ in range(self.cfg.y_profile_steps):
-            x_pred, _, jac = self.bij.inverse_with_s_and_jac(tf.gather(y, inv), c=c)
-            chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
-            A, b, _ = self._normal_equations(x, xs, x_pred, jac, chi2_obs, star)
-            y = y + self._solve_y(A, b)
-        return tf.gather(y, inv)
+        cfg = self.cfg
+        x_pred, _, jac = self.bij.inverse_with_s_and_jac(
+            tf.gather(self.y_val, star), c=c
+        )
+        chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
+        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, chi2_obs, star)
+        step = self._solve_y(A, b)
+        if cfg.y_learning_rate:
+            self.y_val.scatter_nd_add(
+                tf.expand_dims(uniq, 1), cfg.y_learning_rate * step
+            )
+        return tf.gather(self.y_val, star)
 
     def _gauss_newton_y(self, x, xs, c, star) -> None:
         """Move ``y`` to the Gauss-Newton optimum of the batch's chi^2.
@@ -727,7 +743,7 @@ class LatentTrainer:
             # not, so the validation loss measures the objective being trained.
             y = tf.gather(self.y, star)
         else:
-            y = self._profile_y(x, xs, c, star)
+            y = self._fit_y_val(x, xs, c, star)
 
         with tf.GradientTape(watch_accessed_variables=False) as g:
             g.watch(vars_filtered)
@@ -807,16 +823,18 @@ class LatentTrainer:
 
     # -- resumable state ----------------------------------------------------
     def _manager(self, run_dir: Path) -> tf.train.CheckpointManager:
-        ckpt = tf.train.Checkpoint(bij=self.bij, latent_y=self.y)
+        ckpt = tf.train.Checkpoint(
+            bij=self.bij, latent_y=self.y, latent_y_val=self.y_val
+        )
         return tf.train.CheckpointManager(ckpt, str(Path(run_dir) / "checkpoints"), max_to_keep=3)
 
     def save_state(
         self, run_dir: Path, step: int, metrics, n_figs: int, elapsed: float,
         agreement, complete: bool = False,
     ) -> None:
-        """Write everything needed to resume: model, y, optimizer, metrics, progress.
+        """Write everything needed to resume: model, y, y_val, optimizer, metrics, progress.
 
-        The model and the free harmonized parameters go into a
+        The model and the two free harmonized parameter arrays go into a
         ``tf.train.Checkpoint`` numbered by step; the rest into
         ``state-<step>.npz`` next to it, written first so that a checkpoint
         never lacks its state.
@@ -850,7 +868,7 @@ class LatentTrainer:
             state_path = Path(run_dir) / "checkpoints" / f"state-{step}.npz"
             if not state_path.exists():
                 continue
-            (tf.train.Checkpoint(bij=self.bij, latent_y=self.y)
+            (tf.train.Checkpoint(bij=self.bij, latent_y=self.y, latent_y_val=self.y_val)
              .restore(path).assert_existing_objects_matched())
             data = np.load(state_path)
             meta = json.loads(str(data["meta"]))
@@ -1084,6 +1102,7 @@ class LatentTrainer:
             run_dir / "latent_y.npz",
             id=self.ids,
             y=self.y.numpy(),
+            y_val=self.y_val.numpy(),
         )
         with open(run_dir / "metrics_history.json", "w") as f:
             json.dump(metrics, f)

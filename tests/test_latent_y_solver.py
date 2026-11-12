@@ -193,3 +193,45 @@ def test_y_moves_only_after_pretraining_ends(tmp_path):
     # displacement left it
     assert np.abs(tr.y.numpy() - y_displaced).max() > 0.0
     assert np.mean(np.abs(tr.y.numpy() - y_mean)) < np.mean(np.abs(y_displaced - y_mean))
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_y_val_is_warm_started_between_validation_calls():
+    """Each call must continue from the stored value, not from the initial guess.
+
+    A half step makes the difference visible: on data this close to linear, one
+    full sweep from either start lands in the same place, so a cold restart would
+    be indistinguishable from a warm one.
+    """
+    tr = _small_trainer(y_learning_rate=0.5)
+    x, xs, c, star = _first_stars(tr)
+    y_train = tr.y.numpy().copy()
+
+    # both arrays start at the same precision-weighted mean
+    assert np.array_equal(tr.y_val.numpy(), y_train)
+    uniq = np.unique(star.numpy())
+
+    hist = []
+    for _ in range(4):
+        y_obs = tr._fit_y_val(x, xs, c, star)
+        # the returned value is the state, and the state was written
+        assert np.array_equal(y_obs.numpy(), tf.gather(tr.y_val, star).numpy())
+        hist.append(tr.y_val.numpy()[uniq])
+
+    gaps = [float(np.abs(b - a).max()) for a, b in zip(hist, hist[1:])]
+    assert all(g > 0 for g in gaps), gaps  # every call moves it: not a cold restart
+    assert gaps[0] > gaps[-1]  # and it is converging
+
+    moved = np.flatnonzero(np.any(tr.y_val.numpy() != y_train, axis=1))
+    assert set(moved.tolist()) == set(uniq.tolist())  # only this batch's stars
+    assert np.array_equal(tr.y.numpy(), y_train)  # the training y is untouched
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_y_val_is_saved_with_the_run(tmp_path):
+    tr = _small_trainer()
+    tr._fit_y_val(*_first_stars(tr))
+    tr.save(tmp_path, {"loss": [1.0]})
+    saved = np.load(tmp_path / "latent_y.npz")
+    assert saved["y_val"].shape == saved["y"].shape
+    assert not np.array_equal(saved["y_val"], saved["y"])  # they have diverged
