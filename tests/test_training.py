@@ -446,3 +446,41 @@ def test_validation_schedule_is_overridable_and_always_covers():
         assert (n_batches // got_every) * batch >= n_val or batch == n_val, (
             n_batches, n_val, every,
         )
+
+
+def test_validation_curve_is_plotted_against_its_own_steps():
+    """There is no longer one validation point per step, so the x-axis must come
+    from ``step_val``: plotting the series against its index would compress it into
+    the first sliver of the panel, where with ``val_every=1`` it looked right."""
+    from matplotlib.figure import Figure
+
+    pytest.importorskip("matplotlib")
+    from astrotune.train_latent import LATENT_PENALTIES
+    from astrotune.training_plots import plot_loss_history
+
+    n, every = 1040, 7
+    step = np.arange(n)
+    metrics = {
+        "loss": 4.2 + 6.0 * np.exp(-step / 250.0),
+        "chi2": 4.1 + 6.0 * np.exp(-step / 250.0),
+        "penalty_obs": np.full(n, 2e-3),
+        "penalty_ctrl": np.full(n, 2.5e-2),
+        "penalty_div": np.full(n, 4e-2),
+        "penalty_l2": np.full(n, 2.5e-3),
+        "norm": np.full(n, 20.0),
+        "step_val": list(range(every, n + 1, every)),
+    }
+    metrics["loss_val"] = [3.2 + 6.0 * np.exp(-s / 250.0) for s in metrics["step_val"]]
+
+    fig = Figure(figsize=(12, 3))
+    plot_loss_history(metrics, fig, penalties=LATENT_PENALTIES)
+    ax = fig.axes[1]
+    val = [ln for ln in ax.get_lines() if ln.get_label() == "validation loss"][0]
+
+    x = np.asarray(val.get_xdata())
+    assert len(x) == len(metrics["step_val"]) // 2 or len(x) == len(metrics["step_val"]) // 2 + 1
+    # in step units, on the same axis as the training curve -- not an index
+    assert x.max() == pytest.approx(max(metrics["step_val"]) / 1000.0)
+    assert x.max() > 1.0
+    train_x = np.asarray(ax.get_lines()[0].get_xdata())
+    assert x.min() >= train_x.min()
