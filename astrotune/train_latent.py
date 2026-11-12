@@ -116,6 +116,7 @@ METRIC_KEYS = (
     "penalty_div",
     "penalty_l2",
     "norm",
+    "y_trust",
 )
 
 
@@ -148,6 +149,17 @@ class LatentTrainConfig:
     #: data, so the schedule is comparable across batch sizes. Set it to 1 for
     #: a constant rate, which is what an lr comparison wants.
     lr_schedule_phases: int = 8
+    #: Fraction of the run over which the rate ramps linearly from
+    #: ``learning_rate / warmup_steps`` up to ``learning_rate`` before the decay
+    #: takes over. Adam's step is ``~lr`` whatever the gradient norm is, so a run
+    #: that starts at the full rate can travel a long way before the first drop;
+    #: ``latent_gn_5h`` diverged at step ~930, still inside the first (full-rate)
+    #: segment. Zero disables the warmup.
+    lr_warmup_frac: float = 0.05
+    #: Ceiling on the global norm of the map's gradient. Note that Adam's step is
+    #: close to ``lr`` irrespective of this: clipping a gradient that is 1e9 only
+    #: keeps the *relative* weights of the coordinates sane, it does not bound the
+    #: step, which is why the warmup and the ``y`` trust region carry the load.
     clip_norm: float = 100.0
     seed: int = 3
     #: How often to validate, in training steps. ``None`` uses the data-size
@@ -167,9 +179,19 @@ class LatentTrainConfig:
     #: Damping of the ``y`` step (1 is the full step), for either solver.
     y_learning_rate: float = 1.0
     #: Ridge of the per-star normal equations, relative to the mean of their
-    #: diagonal. Some stars constrain one direction very poorly, where the
-    #: unregularised step can be hundreds of sigma.
-    y_ridge: float = 1e-6
+    #: diagonal: a direction of curvature ``c`` is followed by ``c / (c + ridge
+    #: * cbar)``. Some stars constrain one direction very poorly, where the
+    #: unregularised step can be hundreds of sigma, and those are exactly the
+    #: steps that fling a star and drag the maps with it. At 1e-3 a direction
+    #: with a tenth of the mean curvature loses 1% of its step, so balanced stars
+    #: are unaffected to within a part in 1e3.
+    y_ridge: float = 1e-3
+    #: Trust region on the ``y`` step, in absolute parameter value: the largest
+    #: single-parameter change a star may take in one sweep is capped at this.
+    #: ``None`` or 0 disables it. The step is scaled as a whole, never clipped
+    #: per dimension, so its direction is preserved. See
+    #: ``LatentTrainer._trust_region``.
+    y_trust_abs: Optional[float] = 0.5
     #: Steps at the start of the run during which ``y`` is left at its initial
     #: guess, so the bijections are pre-trained against the precision-weighted
     #: means before ``y`` is allowed to move; the maps then start out consistent
@@ -311,6 +333,45 @@ def block_shuffled_rows(star: np.ndarray, rows: np.ndarray, rng) -> np.ndarray:
     return rows[np.argsort(rank[stars], kind="stable")]
 
 
+class _WarmupAndDecay(keras.optimizers.schedules.LearningRateSchedule):
+    """``decay`` with a linear warmup from ``peak / warmup_steps`` in front of it.
+
+    Adam normalises by the running gradient RMS, so its step is roughly ``lr``
+    per coordinate no matter how large the gradient is: the shape of the early
+    trajectory is set by the rate alone. Starting at the full rate and holding it
+    for a whole segment is what let ``latent_gn_5h`` walk into a region where the
+    maps were distorted enough to punish themselves further. The ramp is
+    ``min``-ed against the decay so that it never raises the rate.
+
+    This has to be a ``LearningRateSchedule`` and not a plain function: Keras
+    calls a callable rate without arguments and only passes the step to objects
+    of that type.
+    """
+
+    def __init__(self, decay, peak: float, warmup_steps: int):
+        super().__init__()
+        self.decay = decay
+        self.peak = float(peak)
+        self.warmup_steps = int(warmup_steps)
+
+    def __call__(self, step):
+        rate = self.decay(step)
+        ramp = self.peak * (tf.cast(step, rate.dtype) + 1.0) / float(self.warmup_steps)
+        return tf.minimum(rate, ramp)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(decay=self.decay, peak=self.peak, warmup_steps=self.warmup_steps)
+        return config
+
+
+def _warmup_and_decay(decay, peak: float, warmup_steps: int):
+    """``decay`` unchanged when there is no warmup, wrapped in the ramp otherwise."""
+    if warmup_steps <= 0:
+        return decay
+    return _WarmupAndDecay(decay, peak, warmup_steps)
+
+
 def _make_ctrl_dataset(arrays, batch_size: int, seed: int, n_repeat: Optional[int] = None):
     ds = tf.data.Dataset.from_tensor_slices(tuple(arrays))
     # A buffer far larger than the control catalogue is pure waste: at 256k
@@ -373,9 +434,14 @@ class LatentTrainer:
         else:
             boundaries = [i * n // k for i in range(1, k)]
             values = [cfg.learning_rate / 2**i for i in range(k)]
-        self.learning_rate = keras.optimizers.schedules.PiecewiseConstantDecay(
-            boundaries, values
-        )
+        decay = keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
+        warmup_steps = int(cfg.lr_warmup_frac * n)
+        self.learning_rate = _warmup_and_decay(decay, cfg.learning_rate, warmup_steps)
+        if warmup_steps:
+            log.info(
+                "Learning rate ramps to %.3g over the first %d steps (%d%% of the run).",
+                cfg.learning_rate, warmup_steps, round(100 * cfg.lr_warmup_frac),
+            )
         self.opt = keras.optimizers.Adam(learning_rate=self.learning_rate)
         self.opt.build(self.variables)
 
@@ -581,7 +647,7 @@ class LatentTrainer:
             uniq,
         )
 
-    def _solve_y(self, A, b):
+    def _solve_y(self, A, b, return_scale=False):
         """Solve the per-star normal equations, with a ridge for flat directions.
 
         A parameter that none of a star's catalogs measures has ``sigma = 1e9``,
@@ -589,12 +655,44 @@ class LatentTrainer:
         ridge makes the step in that direction ~0 instead of undefined, which is
         the same outcome the ``den > 1e-6`` test gives the gradient solver. It is
         diagonal on purpose: an off-diagonal term would leak the other
-        components' steps into a direction they say nothing about.
+        components' steps into a direction they say nothing about. It also damps
+        the nearly-flat directions, where the full step is hundreds of sigma.
+
+        The result is then passed through the trust region, and the fraction of
+        the step that radii allowed is returned as well when ``return_scale``.
         """
         n_dim = tf.shape(b)[-1]
         scale = tf.reduce_mean(tf.linalg.diag_part(A), axis=1)[:, None, None]
         ridge = (self.cfg.y_ridge * scale + 1e-8) * tf.eye(n_dim, dtype=A.dtype)
-        return tf.linalg.solve(A + ridge, b[:, :, None])[:, :, 0]
+        step = tf.linalg.solve(A + ridge, b[:, :, None])[:, :, 0]
+        step, allowed = self._trust_region(step)
+        return (step, allowed) if return_scale else step
+
+    def _trust_region(self, step):
+        """Scale whole steps down to the trust radius; returns ``(step, allowed)``.
+
+        A Gauss-Newton step is a full Newton step, and where a star's normal
+        matrix is nearly singular it can be arbitrarily large. A star flung like
+        that is a star whose `y` is being fitted against a map that has just
+        changed under it; the next sweep of the map then trains on the flung
+        value, and the two can push each other away over a few steps.
+        ``latent_gn_5h`` went from chi^2 4.1 to 105 in fifteen steps, which is too
+        large for one star to cause (the loss is a mean over 65k observations and
+        the arcsinh softening caps a single star's contribution), but not too
+        large for a self-feeding ``y``-map loop.
+
+        So no star may move by more than ``y_trust_abs`` in any one parameter. The
+        step is *scaled*, never clipped component by component: every component
+        keeps its share, so the scaled step is still the exact minimiser of the
+        quadratic along that line, and the normal-equation solve is untouched in
+        the (overwhelmingly common) case where nothing binds.
+        """
+        cfg = self.cfg
+        if not cfg.y_trust_abs:
+            return step, tf.ones_like(step[:, 0])
+        biggest = tf.reduce_max(tf.abs(step), axis=1)
+        allowed = tf.minimum(1.0, cfg.y_trust_abs / tf.maximum(biggest, 1e-12))
+        return step * allowed[:, None], allowed
 
     def _fit_y_val(self, x, xs, c, star) -> tf.Tensor:
         """One Gauss-Newton sweep of the held-out stars' ``y``, kept between calls.
@@ -625,7 +723,7 @@ class LatentTrainer:
             )
         return tf.gather(self.y_val, star)
 
-    def _gauss_newton_y(self, x, xs, c, star) -> None:
+    def _gauss_newton_y(self, x, xs, c, star) -> tf.Tensor:
         """Move ``y`` to the Gauss-Newton optimum of the batch's chi^2.
 
         Called before the map's gradient step, so the map trains against the
@@ -635,15 +733,19 @@ class LatentTrainer:
         those stars rather than a partial one; the measurement on a finished run
         showed that a second step moves the mean softened chi^2 by only 2%,
         hence one step here.
+
+        Returns the mean fraction of the step the trust region allowed, so that
+        the progress figure shows whether the caps are binding.
         """
         cfg = self.cfg
         if not cfg.y_learning_rate:
-            return
+            return tf.constant(1.0)
         x_pred, _, jac = self.bij.inverse_with_s_and_jac(tf.gather(self.y, star), c=c)
         chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
         A, b, uniq = self._normal_equations(x, xs, x_pred, jac, chi2_obs, star)
-        step = self._solve_y(A, b)
+        step, allowed = self._solve_y(A, b, return_scale=True)
         self.y.scatter_nd_add(tf.expand_dims(uniq, 1), cfg.y_learning_rate * step)
+        return tf.reduce_mean(allowed)
 
     def _update_y(self, grad_y, xs, star) -> None:
         """One step of ``y`` along the exact gradient of the loss.
@@ -746,8 +848,9 @@ class LatentTrainer:
         # to differentiate, so keeping it out of the tape keeps it out of the
         # graph's gradient bookkeeping as well. The map then takes its step at
         # the fitted ``y`` rather than at the one about to be replaced.
+        trust = tf.constant(1.0)
         if gauss_newton:
-            self._gauss_newton_y(x, xs, c, star)
+            trust = self._gauss_newton_y(x, xs, c, star)
         if apply_grads or not fit_y:
             # A pre-trained run holds every star at its initial guess, held-out or
             # not, so the validation loss measures the objective being trained.
@@ -816,6 +919,7 @@ class LatentTrainer:
             "penalty_ctrl": penalty_ctrl,
             "penalty_div": penalty_div,
             "penalty_l2": penalty_l2,
+            "y_trust": trust,
         }
 
         if apply_grads:

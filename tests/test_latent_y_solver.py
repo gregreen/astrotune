@@ -117,8 +117,50 @@ def test_solve_y_ignores_a_direction_that_nothing_constrains():
 
     step = tr._solve_y(tf.constant(A), tf.constant(b)).numpy()[0]
     assert np.all(np.isfinite(step))
-    assert np.allclose(step[:3], 0.5, atol=1e-5)  # the constrained directions
+    # the constrained directions, damped by the ridge (y_ridge = 1e-3 times the
+    # mean diagonal, 1.5): 2 / (2 + 1.5e-3)
+    assert np.allclose(step[:3], 0.5, atol=1e-3)
     assert abs(step[3]) < 1e-6  # the flat one stays put
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_trust_region_caps_a_runaway_step_and_keeps_its_direction():
+    """A step that would move a star by a whole unit is scaled, not clipped.
+
+    The direction has to survive: each component is cut by the same factor, so
+    the scaled step is still the exact minimiser along that line. Clipping per
+    dimension would bend the step and could even raise the chi^2.
+    """
+    tr = _small_trainer()
+    # curvature 1e-4 in the last direction against 2 in the others: the solve
+    # puts a step of ~1e4 there, i.e. a star flung across the parameter space
+    A = np.diag([2.0, 2.0, 2.0, 1e-4])[None, :, :]
+    b = np.array([[1.0, 1.0, 1.0, 1.0]])
+
+    raw, allowed = tr._solve_y(tf.constant(A), tf.constant(b), return_scale=True)
+    raw, allowed = raw.numpy()[0], float(allowed.numpy()[0])
+    assert np.abs(raw).max() <= tr.cfg.y_trust_abs + 1e-6
+    assert allowed < 1e-3  # the cap is what did it
+
+    # the direction is the one the unconstrained solve gave: every component was
+    # cut by the same factor
+    free = _small_trainer(y_trust_abs=None)._solve_y(A, b)
+    ratio = raw / free.numpy()[0]
+    assert np.allclose(ratio, ratio[0], rtol=1e-4), ratio
+
+
+def test_trust_region_leaves_an_ordinary_step_alone():
+    tr = _small_trainer()
+    x, xs, c, star = _first_stars(tr)
+    x_pred, _, jac = tr.bij.inverse_with_s_and_jac(tf.gather(tr.y, star), c=c)
+    chi2 = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
+    A, b, _ = tr._normal_equations(x, xs, x_pred, jac, chi2, star)
+
+    blocked = _small_trainer(y_trust_abs=None)
+    step, allowed = tr._solve_y(A, b, return_scale=True)
+    free = blocked._solve_y(A, b)
+    assert float(np.min(allowed.numpy())) == 1.0
+    assert np.allclose(step.numpy(), free.numpy())
 
 
 @pytest.mark.filterwarnings("ignore")
@@ -248,3 +290,90 @@ def test_validation_batches_are_a_random_sample_not_an_id_block():
     idx = obs_idx.numpy()
     assert len(idx) > 10
     assert not np.all(np.diff(idx) > 0), "validation rows are still in id order"
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_lr_warms_up_before_it_decays():
+    """The rate must reach the peak only at the end of the warmup, and decay after.
+
+    Adam's step is ``~lr`` whatever the gradient norm is, so the first segment of
+    the schedule is the one that decides how far from its start the run can
+    travel: from the first step to the first drop, everything done at the full
+    rate. The ramp makes the early steps progressively less violent.
+    """
+    from astrotune.train_latent import _warmup_and_decay
+
+    peak, warmup = 1e-3, 50
+    decay = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
+        [500], [peak, peak / 2]
+    )
+    sched = _warmup_and_decay(decay, peak, warmup)
+    at = lambda s: float(sched(tf.constant(s, tf.int64)))  # noqa: E731
+
+    assert at(0) == pytest.approx(peak / warmup)  # the very first step
+    assert at(24) == pytest.approx(peak * 25 / warmup)
+    assert at(49) == pytest.approx(peak)  # the ladder reaches the peak
+    assert at(300) == pytest.approx(peak)  # and holds it
+    assert at(600) == pytest.approx(peak / 2)  # until the decay takes over
+
+    ramp = [at(s) for s in range(warmup)]
+    assert all(b >= a for a, b in zip(ramp, ramp[1:])), "the ramp must not wobble"
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_the_warmup_schedule_is_one_adam_accepts():
+    """Keras passes the step only to a ``LearningRateSchedule``.
+
+    A plain callable is called with no arguments (``base_optimizer.
+    _get_current_learning_rate``), which is a ``TypeError`` at the first
+    ``apply_gradients`` and not before -- the run has already loaded 1.4M star
+    vectors by then. So this is worth a step of actual Adam.
+    """
+    from keras.optimizers.schedules import LearningRateSchedule
+    from astrotune.train_latent import _warmup_and_decay
+
+    decay = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
+        [500], [1e-3, 5e-4]
+    )
+    sched = _warmup_and_decay(decay, 1e-3, 50)
+    assert isinstance(sched, LearningRateSchedule)
+
+    v = tf.Variable([1.0, 2.0])
+    opt = tf.keras.optimizers.Adam(learning_rate=sched)
+    opt.build([v])
+    for _ in range(3):
+        with tf.GradientTape() as tape:
+            loss = tf.reduce_sum(v**2)
+        opt.apply_gradients([(tape.gradient(loss, [v])[0], v)])
+    assert int(opt.iterations) == 3
+    assert np.all(np.abs(v.numpy()) < np.array([1.0, 2.0]))  # it did move
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_zero_warmup_is_the_plain_decay():
+    from astrotune.train_latent import _warmup_and_decay
+
+    decay = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
+        [500], [1e-3, 5e-4]
+    )
+    sched = _warmup_and_decay(decay, 1e-3, 0)
+    assert sched is decay
+    for step in (0, 499, 500):
+        assert float(sched(tf.constant(step, tf.int64))) == float(
+            decay(tf.constant(step, tf.int64))
+        )
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_the_trainer_reports_how_far_the_trust_region_bound(tmp_path):
+    """An unconstrained run reports 1.0; a run with absurdly tight caps reports
+    less on the steps where the caps bite, which is what the progress figure
+    shows during a rerun."""
+    tr = _small_trainer()
+    metrics = tr.train(tmp_path / "free")
+    assert np.allclose(metrics["y_trust"], 1.0)
+
+    tight = _small_trainer(y_trust_abs=1e-6)
+    tight.y.assign_add(tf.constant(np.full(tight.y.shape, 0.15, dtype="f4")))
+    metrics = tight.train(tmp_path / "tight")
+    assert float(np.min(metrics["y_trust"])) < 0.5
