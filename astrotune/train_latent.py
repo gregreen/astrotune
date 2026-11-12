@@ -418,7 +418,17 @@ class LatentTrainer:
                 for _ in range(max(1, cfg.block_shuffles))
             ]
         )
-        val_rows = np.flatnonzero(is_val)
+        # The validation rows are shuffled in star blocks too, with their own
+        # generator so that ``block_shuffles`` cannot change the validation
+        # order. In id order a validation batch is a contiguous block of sorted
+        # Gaia ids, i.e. a patch of sky: at fixed weights the seven batches of
+        # ``models/_check_yval`` ranged from 5.2 to 8.8 in chi^2, five times the
+        # offset the ``y_val`` change removed. Shuffled, each batch is a random
+        # sample of the sky, while a cycle still covers every held-out
+        # observation exactly once.
+        val_rows = block_shuffled_rows(
+            star, np.flatnonzero(is_val), np.random.default_rng([cfg.seed, 1])
+        )
 
         if cfg.drop_remainder:
             n_batches = len(train_rows) // cfg.batch_size

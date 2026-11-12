@@ -235,3 +235,16 @@ def test_y_val_is_saved_with_the_run(tmp_path):
     saved = np.load(tmp_path / "latent_y.npz")
     assert saved["y_val"].shape == saved["y"].shape
     assert not np.array_equal(saved["y_val"], saved["y"])  # they have diverged
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_validation_batches_are_a_random_sample_not_an_id_block():
+    """A validation batch must be a random sample of the sky, as the training
+    batches are. Row indices follow the sorted Gaia ids, so an unshuffled batch is
+    a contiguous id block -- a patch of sky -- and its chi^2 then varies several
+    times more from batch to batch than the training chi^2 does."""
+    tr = _small_trainer()
+    obs_idx, _ = next(iter(tr.val_data))
+    idx = obs_idx.numpy()
+    assert len(idx) > 10
+    assert not np.all(np.diff(idx) > 0), "validation rows are still in id order"
