@@ -14,18 +14,18 @@ inverse-variance weighting cannot shrink a map. A parameter that a catalog does
 not measure carries ``sigma = 1e9``, so it drops out of the chi^2 without a
 mask.
 
-``y`` starts at the precision-weighted mean of the star's observations and is
-updated with a per-star step along the exact gradient of the loss: the gradient
-is taken from the same tape that updates the map, so it carries the Jacobian of
-``f_c^-1`` and points downhill even where the map is far from the identity. The
-step is divided by the star's total precision, the Gauss-Newton curvature of the
-chi^2 for a map close to the identity (which the control-point penalties keep),
-and that divisor is positive, so the step stays a descent direction whatever the
-map does. All observations of a star are in the same batch (the batches are
-blocks of a random permutation of the stars), so each ``y`` is updated once per
-epoch with all of its data. ``y`` is state of the run, not of the exported
-SavedModel: inference for a star observed by one catalog goes through
-``to_harmonized`` as before.
+``y`` starts at the precision-weighted mean of the star's observations. Each step
+then fits it by solving the star's Gauss-Newton normal equations with the
+Jacobian of ``f_c^-1`` transported through the ODE, and only afterwards takes the
+map's gradient step at the new ``y``: the two blocks are optimised in turn, so
+the map never trains against harmonized values that are about to move, and the
+solve that produces the Jacobian stays outside the tape that differentiates the
+map. All observations of a star are in the same batch (the batches are blocks of
+a random permutation of the stars), so one solve sees all of its data and lands
+on the optimum. ``y_solver="gradient"`` keeps the older variant, which updates
+``y`` from the same tape as the map and needs no Jacobian. ``y`` is state of the
+run, not of the exported SavedModel: inference for a star observed by one catalog
+goes through ``to_harmonized`` as before.
 
 The epoch is ``block_shuffles`` independent permutations of the star blocks
 concatenated, i.e. ``block_shuffles`` passes over the training set, so that a
@@ -141,11 +141,22 @@ class LatentTrainConfig:
     max_steps: Optional[int] = None  # stop early (mainly for testing)
 
     # The free harmonized parameters
-    #: Damping of the per-star gradient step (1 is the full step).
+    #: How ``y`` is fitted. ``"gauss_newton"`` solves the per-star normal
+    #: equations with the Jacobian transported through the ODE (one exact step,
+    #: and nothing to tune); ``"gradient"`` takes the step along the loss's own
+    #: gradient divided by the star's total precision, the older behaviour that
+    #: needs no Jacobian and is several times cheaper per step.
+    y_solver: str = "gauss_newton"
+    #: Damping of the ``y`` step (1 is the full step), for either solver.
     y_learning_rate: float = 1.0
-    #: Gradient steps used to fit y on a validation batch (the profile
-    #: likelihood; held-out stars have no trained y).
-    y_profile_steps: int = 3
+    #: Newton sweeps used to fit y on a validation batch (the profile
+    #: likelihood; held-out stars have no trained y). Each sweep is one solve
+    #: with the transported Jacobian, and a second sweep changes little.
+    y_profile_steps: int = 1
+    #: Ridge of the per-star normal equations, relative to the mean of their
+    #: diagonal. Some stars constrain one direction very poorly, where the
+    #: unregularised step can be hundreds of sigma.
+    y_ridge: float = 1e-6
 
     # Observation loss
     chi2_turnover: float = 50.0
@@ -242,6 +253,10 @@ class LatentTrainer:
     """Holds the bijector, the free harmonized parameters and the data pipelines."""
 
     def __init__(self, obs_dict, ctrl_dict, cfg: LatentTrainConfig):
+        if cfg.y_solver not in ("gauss_newton", "gradient"):
+            raise ValueError(
+                f"y_solver must be 'gauss_newton' or 'gradient', not {cfg.y_solver!r}"
+            )
         self.cfg = cfg
         self.n_dim = obs_dict["x"].shape[1]
         self.n_cat = int(ctrl_dict["c_control"].max()) + 1
@@ -417,25 +432,89 @@ class LatentTrainer:
         )
 
     # -- loss ---------------------------------------------------------------
+    def _normal_equations(self, x, xs, x_pred, jac, chi2_obs, star):
+        """Per-star ``(A, b)`` of the Gauss-Newton step in ``y``.
+
+        With ``C = diag(sigma^2)`` diagonal, the normal equations of one
+        observation are ``J^T W J`` and ``J^T W (x - x_pred)``, ``W =
+        w / sigma^2`` elementwise. The weight ``w`` is the curvature of the
+        softened chi^2 the loss actually uses: the loss is
+        ``S * arcsinh(chi2 / S)``, whose derivative with respect to ``chi2`` is
+        ``1 / sqrt(1 + (chi2 / S)^2)``, so weighting by it makes the step the
+        exact minimiser of that loss and not merely of a quadratic stand-in.
+
+        Returns the summed matrices of shape ``(n_star, n_dim, n_dim)`` and
+        vectors of shape ``(n_star, n_dim)``, and the ``tf.unique`` of the star
+        index.
+        """
+        cfg = self.cfg
+        weight = (1.0 / tf.sqrt(1.0 + (chi2_obs / cfg.chi2_turnover) ** 2))[:, None]
+        weight = weight / xs**2
+        dx = x - x_pred
+        A = tf.einsum("npa,np,npb->nab", jac, weight, jac)
+        b = tf.einsum("npa,np,np->na", jac, weight, dx)
+        uniq, inv = tf.unique(star)
+        n = tf.size(uniq)
+        return (
+            tf.math.unsorted_segment_sum(A, inv, n),
+            tf.math.unsorted_segment_sum(b, inv, n),
+            uniq,
+        )
+
+    def _solve_y(self, A, b):
+        """Solve the per-star normal equations, with a ridge for flat directions.
+
+        A parameter that none of a star's catalogs measures has ``sigma = 1e9``,
+        so its row and column of ``A`` are ~1e-18 and the system is singular; the
+        ridge makes the step in that direction ~0 instead of undefined, which is
+        the same outcome the ``den > 1e-6`` test gives the gradient solver. It is
+        diagonal on purpose: an off-diagonal term would leak the other
+        components' steps into a direction they say nothing about.
+        """
+        n_dim = tf.shape(b)[-1]
+        scale = tf.reduce_mean(tf.linalg.diag_part(A), axis=1)[:, None, None]
+        ridge = (self.cfg.y_ridge * scale + 1e-8) * tf.eye(n_dim, dtype=A.dtype)
+        return tf.linalg.solve(A + ridge, b[:, :, None])[:, :, 0]
+
     def _profile_y(self, x, xs, c, star) -> tf.Tensor:
-        """Fit a batch's harmonized values by fixed-point iteration, without touching ``y``.
+        """Fit a batch's harmonized values, without touching ``y``.
 
         Held-out stars have no trained ``y``. Fitting it on the held-out batch is
-        the profile likelihood, which is what the training loss estimates: each
-        sweep sets every star's ``y`` to the value that matches its own
-        observations, which for a map close to the identity is the
-        precision-weighted mean.
+        the profile likelihood, which is what the training loss estimates, so this
+        solves the same normal equations the training step does. It starts from
+        the precision-weighted mean, which is the answer for a map close to the
+        identity.
         """
         w = 1.0 / xs**2
         uniq, inv = tf.unique(star)
         den = tf.math.unsorted_segment_sum(w, inv, tf.size(uniq))
         y = tf.math.unsorted_segment_sum(w * x, inv, tf.size(uniq)) / (den + 1e-30)
         for _ in range(self.cfg.y_profile_steps):
-            x_pred = self.bij._inverse(tf.gather(y, inv), c=c)
-            num = tf.math.unsorted_segment_sum(w * (x_pred - x), inv, tf.size(uniq))
-            step = tf.where(den > 1e-6, num / (den + 1e-30), tf.zeros_like(num))
-            y = y - step
+            x_pred, _, jac = self.bij.inverse_with_s_and_jac(tf.gather(y, inv), c=c)
+            chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
+            A, b, _ = self._normal_equations(x, xs, x_pred, jac, chi2_obs, star)
+            y = y + self._solve_y(A, b)
         return tf.gather(y, inv)
+
+    def _gauss_newton_y(self, x, xs, c, star) -> None:
+        """Move ``y`` to the Gauss-Newton optimum of the batch's chi^2.
+
+        Called before the map's gradient step, so the map trains against the
+        harmonized values it will actually be scored with. The batch holds the
+        complete observation set of nearly every star in it (the rows are
+        shuffled in star blocks), so one step is the full profile optimum for
+        those stars rather than a partial one; the measurement on a finished run
+        showed that a second step moves the mean softened chi^2 by only 2%,
+        hence one step here.
+        """
+        cfg = self.cfg
+        if not cfg.y_learning_rate:
+            return
+        x_pred, _, jac = self.bij.inverse_with_s_and_jac(tf.gather(self.y, star), c=c)
+        chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
+        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, chi2_obs, star)
+        step = self._solve_y(A, b)
+        self.y.scatter_nd_add(tf.expand_dims(uniq, 1), cfg.y_learning_rate * step)
 
     def _update_y(self, grad_y, xs, star) -> None:
         """One step of ``y`` along the exact gradient of the loss.
@@ -521,6 +600,19 @@ class LatentTrainer:
         xs = tf.gather(self.xs_obs, obs_idx)
         c = tf.gather(self.c_obs, obs_idx)
         star = tf.gather(self.star_obs, obs_idx)
+
+        # The Gauss-Newton solver needs the Jacobian and no gradient with respect
+        # to y; the gradient solver needs the opposite, so ``y`` is watched only
+        # for the latter.
+        gauss_newton = apply_grads and cfg.y_solver == "gauss_newton"
+
+        # ``y`` is fitted first, outside the tape: it is a separate block of the
+        # optimisation, and its solve carries a Jacobian whose ops nothing needs
+        # to differentiate, so keeping it out of the tape keeps it out of the
+        # graph's gradient bookkeeping as well. The map then takes its step at
+        # the fitted ``y`` rather than at the one about to be replaced.
+        if gauss_newton:
+            self._gauss_newton_y(x, xs, c, star)
         if apply_grads:
             y = tf.gather(self.y, star)
         else:
@@ -528,7 +620,7 @@ class LatentTrainer:
 
         with tf.GradientTape(watch_accessed_variables=False) as g:
             g.watch(vars_filtered)
-            if apply_grads:
+            if apply_grads and not gauss_newton:
                 # The gradient with respect to y comes from the same tape: one
                 # backward pass for the map and for the free parameters.
                 g.watch(y)
@@ -590,10 +682,13 @@ class LatentTrainer:
         }
 
         if apply_grads:
-            *grads, grad_y = g.gradient(loss, vars_filtered + [y])
+            if gauss_newton:
+                grads = g.gradient(loss, vars_filtered)
+            else:
+                *grads, grad_y = g.gradient(loss, vars_filtered + [y])
             grads, norm = tf.clip_by_global_norm(grads, cfg.clip_norm)
             self.opt.apply_gradients(zip(grads, vars_filtered))
-            if grad_y is not None:
+            if not gauss_newton and grad_y is not None:
                 self._update_y(grad_y, xs, star)
             res["norm"] = norm
 
