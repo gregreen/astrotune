@@ -18,7 +18,19 @@ class ODEBijector(tfb.Bijector):
     The inverse integrates the same ODE backwards from ``t = 1`` to ``t = 0``.
     Besides the plain maps (``_forward``/``_inverse``) there are variants that
     also return the integrated path length ``s`` (used as a training penalty),
-    and ``augmented_forward``, which adds ``ln det J``.
+    the same with the Jacobian ``d x(1)/d x(0)`` (``forward_with_s_and_jac`` and
+    ``inverse_with_s_and_jac``), and ``augmented_forward``, which adds
+    ``ln det J``.
+
+    The Jacobian is *transported* as part of the ODE state rather than obtained
+    by differentiating the solver: with ``M(t) = d x(t)/d x(0)``,
+
+    .. math:: \\dot M = \\frac{\\partial v}{\\partial x}\\, M,\\qquad M(0) = I,
+
+    so it comes out of the same integration for the price of one extra matrix
+    multiply per step. Nothing differentiated ``M`` afterwards: it is only used
+    to take a Gauss-Newton step in the harmonized parameters, so it is never
+    handed to a ``gradient`` call and needs no ``stop_gradient``.
     """
 
     def __init__(
@@ -35,6 +47,7 @@ class ODEBijector(tfb.Bijector):
     ):
         super().__init__(validate_args=validate_args, forward_min_event_ndims=0, name=name)
 
+        self.n_dim = n_dim
         self.v = VectorNetwork(
             n_cond, n_dim, n_hidden, hidden_size, **(vector_network_kwargs or {})
         )
@@ -74,6 +87,66 @@ class ODEBijector(tfb.Bijector):
         ds_dt = tf.math.sqrt(tf.reduce_sum(dx_dt**2, axis=1, keepdims=True))
         return tf.concat([dx_dt, ds_dt], 1)
 
+    def velocity_and_jacobian(self, t, x, c):
+        """The velocity and its Jacobian with respect to ``x``.
+
+        Returns:
+          v: ``(b, n)`` velocity at ``(t, x)``, as ``conditional_velocity``.
+          jac: ``(b, n, n)`` with ``jac[b, i, j] = d v_i / d x_j``.
+        """
+        # One forward pass and one backward pass per component. ``unstack`` has
+        # to happen inside the tape: a slice taken afterwards is not a recorded
+        # operation, so ``gradient`` would quietly return None for it.
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch(x)
+            v = self.conditional_velocity(t, x, c)
+            components = tf.unstack(v, axis=1)
+        rows = [tape.gradient(component, x) for component in components]
+        del tape  # every row is extracted; release what the tape holds
+        zeros = tf.zeros_like(x)
+        return v, tf.stack([zeros if row is None else row for row in rows], axis=1)
+
+    def ode_with_s_and_jac(self, t, state, c, sign):
+        """Right-hand side of the state ``[x, s, M]``, ``M = d x(t)/d x(0)``.
+
+        ``sign`` is ``+1`` for the forward map (which integrates
+        ``v(t, x)``) and ``-1`` for the inverse (which integrates
+        ``-v(1 - t, x)``).
+        """
+        n = self.n_dim
+        x = state[:, :n]
+        v, jac = self.velocity_and_jacobian(t if sign > 0 else 1 - t, x, c)
+
+        ds_dt = tf.math.sqrt(tf.reduce_sum(v**2, axis=1, keepdims=True))
+        M = tf.reshape(state[:, n + 1 :], [-1, n, n])
+        dM_dt = tf.linalg.matmul(jac, M)
+
+        return tf.concat(
+            [sign * v, sign * ds_dt, sign * tf.reshape(dM_dt, [-1, n * n])], 1
+        )
+
+    def integrate_with_jac(self, x0, c, sign):
+        """Integrate ``[x, s, M]`` from ``x(0) = x0`` to ``t = 1``."""
+        n = self.n_dim
+        b = tf.shape(x0)[0]
+        identity = tf.reshape(tf.eye(n, dtype=x0.dtype), [1, n * n])
+        state0 = tf.concat(
+            [
+                x0,
+                tf.zeros([b, 1], dtype=x0.dtype),
+                tf.broadcast_to(identity, tf.stack([b, n * n])),
+            ],
+            1,
+        )
+        dxsM_dt = lambda t, state: self.ode_with_s_and_jac(t, state, c, sign)
+        res = self.ode_solver.solve(dxsM_dt, 0.0, state0, [1.0])
+        state = tf.squeeze(res.states, 0)
+        return (
+            state[:, :n],
+            state[:, n : n + 1],
+            tf.reshape(state[:, n + 1 :], [-1, n, n]),
+        )
+
     def _forward(self, x, c=None):
         dx_dt = lambda tt, xx: self.conditional_velocity(tt, xx, c)
         res = self.ode_solver.solve(dx_dt, 0.0, x, [1.0])
@@ -101,6 +174,27 @@ class ODEBijector(tfb.Bijector):
         xs = tf.squeeze(res.states, 0)
         x, s = tf.split(xs, [-1, 1], axis=1)
         return x, -s
+
+    def forward_with_s_and_jac(self, x, c=None):
+        """Forward map; also the path length and ``d y / d x``.
+
+        Returns:
+          y: ``(b, n)`` harmonized parameters.
+          s: ``(b, 1)`` path length.
+          jac: ``(b, n, n)`` with ``jac[b, i, j] = d y_i / d x_j``.
+        """
+        return self.integrate_with_jac(x, c, 1.0)
+
+    def inverse_with_s_and_jac(self, y, c=None):
+        """Inverse map; also the path length and ``d x / d y``.
+
+        Returns:
+          x: ``(b, n)`` catalog-space parameters.
+          s: ``(b, 1)`` path length.
+          jac: ``(b, n, n)`` with ``jac[b, i, j] = d x_i / d y_j``.
+        """
+        x, s, jac = self.integrate_with_jac(y, c, -1.0)
+        return x, -s, jac
 
     def augmented_forward(self, x, c=None):
         """Forward map that also returns the path length and ``ln det J``."""
