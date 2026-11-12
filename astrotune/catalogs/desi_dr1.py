@@ -120,7 +120,7 @@ def param_errs(t: Table, ctx) -> np.ndarray:
         [
             teff_err,
             np.full(n, 0.1),
-            edge_penalty + 0.1,
+            2*edge_penalty + 0.2,
             np.full(n, 0.4),
         ],
         axis=1,
