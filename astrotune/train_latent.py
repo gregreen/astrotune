@@ -124,6 +124,18 @@ METRIC_KEYS = (
 )
 
 
+def layer_of(variable) -> str:
+    """The parameter group a variable belongs to: ``film_0``, ``hidden_2``, ``output``...
+
+    Taking the module path
+    ``vector_network/film_0/w:0`` -> ``film_0`` puts a layer's weight matrix and
+    its bias into one group, which is the unit one thinks in when asking which
+    part of the network is moving.
+    """
+    parts = variable.name.split("/")
+    return parts[1] if len(parts) > 2 else parts[0].split(":")[0]
+
+
 @dataclass
 class LatentTrainConfig:
     # Network
@@ -487,6 +499,16 @@ class LatentTrainer:
         self.variables = list(self.bij.trainable_variables)
         n_vars = sum(int(np.prod(v.shape)) for v in self.variables)
         log.info("%d variables in bijector model.", n_vars)
+
+        # One gradient norm per parameter group, per step. Memory and the
+        # checkpoint history are unchanged for one run, the pair of run-to-run
+        # comparisons that matter: which layer moves, and when, is not visible in
+        # the global norm at all -- in ``latent_gn_5h_v3`` the blow-up showed up as
+        # a 5x jump in ``film_output``'s relative change and 2.4x in ``output``,
+        # against 1.0x in ``hidden_0``, which no aggregate could have told apart.
+        self.grad_groups = sorted({layer_of(v) for v in self.variables})
+        self.metric_keys = METRIC_KEYS + tuple(f"grad/{g}" for g in self.grad_groups)
+        log.info("Per-layer gradient norms for: %s", ", ".join(self.grad_groups))
 
         y_init = initial_y(obs_dict)
         self.y = tf.Variable(y_init, name="latent_y", dtype=tf.float32)
@@ -997,7 +1019,7 @@ class LatentTrainer:
                 freeze_list=freeze_list,
                 fit_y=fit_y,
             )
-            out = out.write(step, tf.stack([res[k] for k in METRIC_KEYS]))
+            out = out.write(step, tf.stack([res[k] for k in self.metric_keys]))
         return out.stack()
 
     def _val_step_graph(self, fit_y):
@@ -1135,6 +1157,19 @@ class LatentTrainer:
                 *grads, grad_y = g.gradient(loss, vars_filtered + [y])
             else:
                 grads = g.gradient(loss, vars_filtered)
+
+            # Per-layer norms, before the global clip: once clipped, most of a
+            # run has every layer's contribution scaled by the same factor and the
+            # information about *which* layer is moving is lost.
+            by_group = {}
+            for var, gv in zip(vars_filtered, grads):
+                by_group.setdefault(layer_of(var), []).append(gv)
+            for name in self.grad_groups:
+                parts = by_group.get(name, [])
+                res[f"grad/{name}"] = tf.sqrt(
+                    tf.add_n([tf.reduce_sum(tf.square(x)) for x in parts])
+                )
+
             grads, norm = tf.clip_by_global_norm(grads, cfg.clip_norm)
             res["norm"] = norm
 
@@ -1302,6 +1337,13 @@ class LatentTrainer:
                 raise FileNotFoundError(f"No checkpoint to resume from in {run_dir}/checkpoints")
             metrics, agreement = meta["metrics"], meta["agreement"]
             self.agreement = agreement
+            # A metric introduced after the run started (the per-layer gradient
+            # norms, say) has no history in the checkpoint it resumes from. Pad it
+            # with NaN so that every series is indexed by the same step number,
+            # which is what any analysis of the history assumes.
+            n_have = len(metrics.get("loss", []))
+            for key in self.metric_keys:
+                metrics.setdefault(key, [float("nan")] * n_have)
             n_figs, elapsed_prev, start = meta["n_figs"], meta["elapsed"], meta["step"]
             tf.random.set_seed(cfg.seed + start)
 
@@ -1354,12 +1396,21 @@ class LatentTrainer:
         if freeze_step is not None and start > freeze_step:
             freeze_list = cfg.freeze_vars
 
-        # The iterators are resources captured by the graph functions; resumes
-        # skip the batches (and the validation steps) already done.
-        self._it = iter(self.data.skip(start))
+        # The iterators are resources captured by the graph functions, and both
+        # streams *restart* on a resume rather than skipping ahead. ``skip`` pulls
+        # every discarded batch through the pipeline before the first step, and at
+        # these sizes that is not free: 2,149 training batches of 65,536 rows sat
+        # for minutes with the GPU idle when ``latent_gn_5h_v3`` was resumed, and
+        # ~300 validation batches (with the control-point stream refilling its
+        # 1M-entry shuffle buffer for each) hung the first validation call for
+        # longer than that. What the loop counts is the number of steps left, not
+        # which batches they were: the shuffle is reseeded from ``cfg.seed`` on
+        # every start, and ``tf.random`` is reseeded from ``cfg.seed + start``, so
+        # the order after a resume is different either way.
+        self._it = iter(self.data)
         self._val_it = None
         if self.val_data is not None:
-            self._val_it = iter(self.val_data.skip(len(metrics["step_val"])))
+            self._val_it = iter(self.val_data)
         step_last_val = metrics["step_val"][-1] if metrics["step_val"] else 0
 
         def _on_sigterm(signum, frame):
@@ -1407,7 +1458,7 @@ class LatentTrainer:
                 block = self._run_steps(tf.constant(n, tf.int32), freeze_list, fit_y).numpy()
                 dt = time.monotonic() - t0
 
-                for key, column in zip(METRIC_KEYS, block.T):
+                for key, column in zip(self.metric_keys, block.T):
                     metrics.setdefault(key, []).extend(np.asarray(column, "f8").tolist())
                 done += n
                 pbar.update(n)
