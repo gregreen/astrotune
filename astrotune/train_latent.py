@@ -762,6 +762,14 @@ class LatentTrainer:
         )
 
     # -- loss ---------------------------------------------------------------
+    # Autograph converts everything reachable from the traced step, including
+    # these helpers, and regenerates their code on every retrace. On the
+    # pre-training boundary the SGD run died with a generated module naming the
+    # wrong function (``tf___make_data`` called with ``_normal_equations``'s seven
+    # arguments), which is autograph mixing up its own generated code rather than
+    # an error in the maths here. None of these helpers has data-dependent Python
+    # control flow, so autograph has nothing to do for them in the first place.
+    @tf.autograph.experimental.do_not_convert
     def _normal_equations(self, x, xs, x_pred, jac, chi2_obs, star):
         """Per-star ``(A, b)`` of the Gauss-Newton step in ``y``.
 
@@ -791,6 +799,7 @@ class LatentTrainer:
             uniq,
         )
 
+    @tf.autograph.experimental.do_not_convert
     def _solve_y(self, A, b, return_scale=False):
         """Solve the per-star normal equations, with a ridge for flat directions.
 
@@ -812,6 +821,7 @@ class LatentTrainer:
         step, allowed = self._trust_region(step)
         return (step, allowed) if return_scale else step
 
+    @tf.autograph.experimental.do_not_convert
     def _trust_region(self, step):
         """Scale whole steps down to the trust radius; returns ``(step, allowed)``.
 
@@ -925,6 +935,7 @@ class LatentTrainer:
         self._norm_n.assign_add(1)
 
     @staticmethod
+    @tf.autograph.experimental.do_not_convert
     def _robust_stats(a):
         """Per-column median, MAD-sigma, min, max and count beyond 8 sigma."""
         n = tf.shape(a)[0]
