@@ -481,3 +481,22 @@ def test_checkpoint_round_trip_and_retention(tmp_path):
     assert meta["step"] == 10
     assert np.allclose(tr.y.numpy(), y_before)
     assert int(tr.opt.iterations) == 0  # the counter is restored as saved
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_sgd_is_available_and_trains(tmp_path):
+    """The optimiser can be swapped; SGD takes real steps at a usable rate."""
+    from astrotune.train_latent import LatentTrainConfig
+
+    assert LatentTrainConfig().optimizer == "adam"
+    tr = _small_trainer(optimizer="sgd", sgd_momentum=0.9)
+    y0 = tr.y.numpy().copy()
+    metrics = tr.train(tmp_path)
+    assert "SGD" in tr.opt.__class__.__name__
+    assert np.all(np.isfinite(metrics["loss"]))
+    assert not np.allclose(tr.y.numpy(), y0)
+
+
+def test_unknown_optimizer_is_rejected():
+    with pytest.raises(ValueError, match="optimizer"):
+        _small_trainer(optimizer="lamb")

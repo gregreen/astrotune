@@ -177,6 +177,21 @@ class LatentTrainConfig:
     #: keeps the *relative* weights of the coordinates sane, it does not bound the
     #: step, which is why the warmup and the ``y`` trust region carry the load.
     clip_norm: float = 100.0
+    #: Optimiser. Adam is the default, everywhere in this project. ``"sgd"``
+    #: exists to test one hypothesis about the divergences: that Adam's
+    #: per-coordinate normalisation is itself the problem. Under Adam the step is
+    #: ``~lr`` in every coordinate whatever the gradient does, so a batch whose
+    #: gradient is twice as large over its whole width produces an almost
+    #: identical update -- and rejection rules have to be bolted on to stop it.
+    #: Plain momentum has no such invariance: its step is proportional to the
+    #: gradient, so a batch that is unusually loud simply moves the weights
+    #: further, which is either the cure or the disease, depending on the answer.
+    optimizer: str = "adam"
+    #: Momentum for ``optimizer="sgd"``. It multiplies the steady-state step by
+    #: roughly ``1 / (1 - momentum)``, which is what sets a comparable rate: with
+    #: momentum 0.9 and a per-weight gradient near 0.4, ``lr = 2e-4`` moves each
+    #: weight about as far per step as Adam does at ``lr = 1e-3``.
+    sgd_momentum: float = 0.9
     #: Adam's second-moment decay: 0.999 (the Keras default) averages over ~1000
     #: steps, so one anomalous step keeps the step size suppressed -- or keeps
     #: pushing in the direction of a bad step -- for a long time afterwards.
@@ -293,6 +308,8 @@ RESUME_MUTABLE = (
     # the optimizer behaves, not what is being optimised.
     "adam_beta_2",
     "adam_amsgrad",
+    "optimizer",
+    "sgd_momentum",
     "skip_norm_factor",
     "clip_norm",
     "y_trust_abs",
@@ -555,11 +572,21 @@ class LatentTrainer:
                 "Learning rate ramps to %.3g over the first %d steps (%d%% of the run).",
                 cfg.learning_rate, warmup_steps, round(100 * cfg.lr_warmup_frac),
             )
-        self.opt = keras.optimizers.Adam(
-            learning_rate=self.learning_rate,
-            beta_2=cfg.adam_beta_2,
-            amsgrad=cfg.adam_amsgrad,
-        )
+        if cfg.optimizer == "adam":
+            self.opt = keras.optimizers.Adam(
+                learning_rate=self.learning_rate,
+                beta_2=cfg.adam_beta_2,
+                amsgrad=cfg.adam_amsgrad,
+            )
+        elif cfg.optimizer == "sgd":
+            self.opt = keras.optimizers.SGD(
+                learning_rate=self.learning_rate, momentum=cfg.sgd_momentum
+            )
+        else:
+            raise ValueError(
+                f"optimizer must be 'adam' or 'sgd', not {cfg.optimizer!r}"
+            )
+        log.info("Optimiser: %s", self.opt.__class__.__name__)
         self.opt.build(self.variables)
 
         # Graph-compiled steps: ``train`` creates the dataset iterators and
