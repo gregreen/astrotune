@@ -117,6 +117,10 @@ METRIC_KEYS = (
     "penalty_l2",
     "norm",
     "y_trust",
+    "y_capped",
+    "dy_max",
+    "y_disp_max",
+    "grad_skip",
 )
 
 
@@ -161,6 +165,21 @@ class LatentTrainConfig:
     #: keeps the *relative* weights of the coordinates sane, it does not bound the
     #: step, which is why the warmup and the ``y`` trust region carry the load.
     clip_norm: float = 100.0
+    #: Adam's second-moment decay: 0.999 (the Keras default) averages over ~1000
+    #: steps, so one anomalous step keeps the step size suppressed -- or keeps
+    #: pushing in the direction of a bad step -- for a long time afterwards.
+    adam_beta_2: float = 0.99
+    #: AMSGrad: keep the running maximum of the second moment, so the effective
+    #: step size can never grow again in a direction that once saw a large
+    #: gradient. Used with ``adam_beta_2`` this makes a spike a one-step event.
+    adam_amsgrad: bool = True
+    #: A step whose gradient norm exceeds this multiple of the running median is
+    #: skipped entirely: neither the parameters nor Adam's moments move, so an
+    #: anomalous gradient cannot act, and cannot poison the moments either. The
+    #: skipped step prints the batch statistics that would explain it (see
+    #: ``LatentTrainer._report_bad_batch``). 0 disables the test; the test also
+    #: waits for ten norms before it is armed.
+    skip_norm_factor: float = 10.0
     seed: int = 3
     #: How often to validate, in training steps. ``None`` uses the data-size
     #: ratio, ``round(n_train_obs / n_val_obs)``, which makes one epoch's worth of
@@ -233,18 +252,39 @@ class LatentTrainConfig:
     #: Held-out stars used for the catalog agreement at each progress figure
     agreement_n_stars: int = 16384
 
-    # Resumable state (model, optimizer, metrics) is written at each progress
-    # figure and at this interval
-    checkpoint_every_seconds: Optional[float] = 10 * 60.0
+    # Resumable state (model, optimizer, metrics) is written every this many
+    # steps. Steps and not seconds: a time-based rule writes a checkpoint exactly
+    # when the ODE solver slows down, i.e. when the map is going wrong and the
+    # state on disk is the least likely to be worth keeping.
+    checkpoint_every_steps: Optional[int] = 256
+    #: Retention, rule one: every checkpoint within ``keep_recent *
+    #: checkpoint_every_steps`` steps of the newest one is kept, so a mistake can
+    #: be undone from the last few hours.
+    keep_recent: int = 8
+    #: Retention, rule two: one checkpoint per ``1 / keep_milestones`` of the run,
+    #: so a long run keeps a coarse record of its whole history instead of losing
+    #: everything outside the recent band. The two rules together keep at most 40
+    #: checkpoints (~1.8 GB).
+    keep_milestones: int = 32
 
 
 #: Settings that may differ when resuming a run; everything else must match
 RESUME_MUTABLE = (
     "plot_every_seconds",
     "plot_every_steps",
-    "checkpoint_every_seconds",
+    "checkpoint_every_steps",
+    "keep_recent",
+    "keep_milestones",
     "agreement_n_stars",
     "n_plot",
+    # The guards below are the point of resuming a diverged run: they change how
+    # the optimizer behaves, not what is being optimised.
+    "adam_beta_2",
+    "adam_amsgrad",
+    "skip_norm_factor",
+    "clip_norm",
+    "y_trust_abs",
+    "y_ridge",
 )
 
 
@@ -372,6 +412,41 @@ def _warmup_and_decay(decay, peak: float, warmup_steps: int):
     return _WarmupAndDecay(decay, peak, warmup_steps)
 
 
+def checkpoints_to_keep(steps, n_steps, every, recent=8, milestones=32):
+    """Which of the saved checkpoints to keep: a recent band plus milestones.
+
+    Two rules, both cheap to state and to compute:
+
+    * everything within ``recent * every`` steps of the newest checkpoint, which
+      is the band a mistake gets undone from;
+    * the first checkpoint of each ``1 / milestones`` slice of the run, so that a
+      long run keeps a coarse record of its whole history rather than losing
+      everything that falls out of the recent band (which is how two runs lost the
+      last state before their blow-up).
+
+    ``steps`` are the step numbers of the checkpoints on disk, in any order.
+    Returns the subset to keep; the caller deletes the rest.
+    """
+    steps = sorted(int(s) for s in steps)
+    if not steps:
+        return set()
+    every = max(1, int(every or 1))
+    recent = max(1, int(recent))
+    milestones = max(1, int(milestones))
+
+    newest = steps[-1]
+    keep = {s for s in steps if newest - s <= recent * every}
+
+    width = max(1.0, n_steps / milestones)
+    filled = set()
+    for s in steps:  # ascending, so the first checkpoint of a slice wins
+        i = min(int(s // width), milestones - 1)
+        if i not in filled:
+            filled.add(i)
+            keep.add(s)
+    return keep
+
+
 def _make_ctrl_dataset(arrays, batch_size: int, seed: int, n_repeat: Optional[int] = None):
     ds = tf.data.Dataset.from_tensor_slices(tuple(arrays))
     # A buffer far larger than the control catalogue is pure waste: at 256k
@@ -413,7 +488,8 @@ class LatentTrainer:
         n_vars = sum(int(np.prod(v.shape)) for v in self.variables)
         log.info("%d variables in bijector model.", n_vars)
 
-        self.y = tf.Variable(initial_y(obs_dict), name="latent_y", dtype=tf.float32)
+        y_init = initial_y(obs_dict)
+        self.y = tf.Variable(y_init, name="latent_y", dtype=tf.float32)
         log.info(
             "%d free harmonized vectors (%.0f MB).",
             int(self.y.shape[0]),
@@ -421,9 +497,24 @@ class LatentTrainer:
         )
         # The held-out stars' y, fitted the same way and remembered between
         # validation calls; see ``_fit_y_val``.
-        self.y_val = tf.Variable(
-            initial_y(obs_dict), name="latent_y_val", dtype=tf.float32
+        self.y_val = tf.Variable(y_init, name="latent_y_val", dtype=tf.float32)
+        # The initial guess, kept for the displacement diagnostics: how far ``y``
+        # has travelled from the precision-weighted mean is the statistic that
+        # showed a whole population (the M dwarfs) walking away in
+        # ``latent_gn_5h_v2``. Not checkpointed -- it is recomputed from the data.
+        self.y_init = tf.constant(y_init)
+
+        # The last few gradient norms, for the anomaly test in ``_grad_step``. A
+        # short ring buffer is enough: the median of ~100 norms is insensitive to
+        # a handful of spikes, and insensitive is what this test needs.
+        self.norm_window = 101
+        self._norm_hist = tf.Variable(
+            tf.zeros([self.norm_window]), trainable=False, name="grad_norm_history"
         )
+        self._norm_n = tf.Variable(0, trainable=False, dtype=tf.int32, name="grad_norm_count")
+        # The step whose model state is already on disk, so that a checkpoint
+        # written by the progress figure is not written again by the loop.
+        self._last_saved_step = -1
 
         # The learning-rate budget is set by the number of steps, so the data
         # pipeline must be built first.
@@ -442,7 +533,11 @@ class LatentTrainer:
                 "Learning rate ramps to %.3g over the first %d steps (%d%% of the run).",
                 cfg.learning_rate, warmup_steps, round(100 * cfg.lr_warmup_frac),
             )
-        self.opt = keras.optimizers.Adam(learning_rate=self.learning_rate)
+        self.opt = keras.optimizers.Adam(
+            learning_rate=self.learning_rate,
+            beta_2=cfg.adam_beta_2,
+            amsgrad=cfg.adam_amsgrad,
+        )
         self.opt.build(self.variables)
 
         # Graph-compiled steps: ``train`` creates the dataset iterators and
@@ -723,7 +818,7 @@ class LatentTrainer:
             )
         return tf.gather(self.y_val, star)
 
-    def _gauss_newton_y(self, x, xs, c, star) -> tf.Tensor:
+    def _gauss_newton_y(self, x, xs, c, star):
         """Move ``y`` to the Gauss-Newton optimum of the batch's chi^2.
 
         Called before the map's gradient step, so the map trains against the
@@ -734,18 +829,122 @@ class LatentTrainer:
         showed that a second step moves the mean softened chi^2 by only 2%,
         hence one step here.
 
-        Returns the mean fraction of the step the trust region allowed, so that
-        the progress figure shows whether the caps are binding.
+        Returns the statistics of the step, which are recorded as metrics: the
+        mean fraction the trust region allowed, the fraction of stars it capped,
+        and the largest single-parameter move. Together with the ``y``
+        displacement these are the numbers that show a population of stars
+        walking away long before the loss notices.
         """
         cfg = self.cfg
         if not cfg.y_learning_rate:
-            return tf.constant(1.0)
+            return 1.0, 0.0, 0.0
         x_pred, _, jac = self.bij.inverse_with_s_and_jac(tf.gather(self.y, star), c=c)
         chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
         A, b, uniq = self._normal_equations(x, xs, x_pred, jac, chi2_obs, star)
         step, allowed = self._solve_y(A, b, return_scale=True)
         self.y.scatter_nd_add(tf.expand_dims(uniq, 1), cfg.y_learning_rate * step)
-        return tf.reduce_mean(allowed)
+        return (
+            tf.reduce_mean(allowed),
+            tf.reduce_mean(tf.cast(allowed < 0.999, tf.float32)),
+            tf.reduce_max(tf.abs(step)),
+        )
+
+    # -- anomaly report ------------------------------------------------------
+    def _skip_threshold(self):
+        """The gradient norm above which a step is anomalous, or ``+inf``.
+
+        The reference is the median of the last ``norm_window`` norms, so a
+        handful of spikes cannot move it. Until the window is full the test is
+        disarmed: the run starts far from where it settles (the first norm of
+        ``latent_gn_5h`` was 629 against a steady ~40) and there is no honest
+        reference to compare against yet.
+        """
+        cfg = self.cfg
+        if not cfg.skip_norm_factor:
+            return tf.constant(np.inf, tf.float32)
+        median = tf.sort(self._norm_hist)[self.norm_window // 2]
+        return tf.where(
+            self._norm_n >= self.norm_window,
+            cfg.skip_norm_factor * median,
+            tf.constant(np.inf, tf.float32),
+        )
+
+    def _record_norm(self, norm):
+        """Push one norm into the ring buffer the anomaly test reads."""
+        i = tf.reshape(self._norm_n % self.norm_window, [1, 1])
+        self._norm_hist.scatter_nd_update(i, [norm])
+        self._norm_n.assign_add(1)
+
+    @staticmethod
+    def _robust_stats(a):
+        """Per-column median, MAD-sigma, min, max and count beyond 8 sigma."""
+        n = tf.shape(a)[0]
+        srt = tf.sort(a, axis=0)
+        med = srt[n // 2]
+        sig = 1.4826 * tf.sort(tf.abs(a - med), axis=0)[n // 2]
+        out = tf.reduce_sum(
+            tf.cast(tf.abs(a - med) > 8.0 * tf.maximum(sig, 1e-12), tf.int32), axis=0
+        )
+        return tf.cast(
+            tf.stack([med, sig, srt[0], srt[-1], tf.cast(out, med.dtype)], axis=1),
+            tf.float64,
+        )
+
+    def _report_bad_batch(self, norm, threshold, x, xs, c, star, y, chi2_obs, disp):
+        """Print what is anomalous about a batch whose gradient norm is huge.
+
+        Only ever called on the skipped branch, so it costs nothing on an
+        ordinary step. The quantities are the ones that answered the question by
+        hand on ``latent_gn_5h_v2``, where the loss took 2,500 steps to react and
+        the ``y`` displacement showed immediately that a whole population (the
+        M-dwarf catalogs, 76-85% of their stars) had walked ~14 units away: the
+        per-parameter distribution of ``x`` and ``y``, the upper tail of chi^2,
+        the worst individual observations with their catalog, and how far ``y``
+        has drifted from the precision-weighted mean per catalog.
+        """
+        n_obs = tf.shape(x)[0]
+        n_star = tf.size(tf.unique(star).y)
+        tf.print("")
+        tf.print(
+            "  !! gradient norm", norm, ">", threshold, "-- step skipped  (",
+            n_obs, "observations,", n_star, "stars)",
+        )
+        tf.print("     x  [median, mad_sigma, min, max, n>8sig] per parameter:")
+        tf.print(self._robust_stats(x))
+        tf.print("     y  [median, mad_sigma, min, max, n>8sig] per parameter:")
+        tf.print(self._robust_stats(y))
+
+        # The tail of chi^2: one catastrophic catalog row, or everything slightly bad?
+        n = tf.shape(chi2_obs)[0]
+        srt = tf.sort(chi2_obs)
+        p999 = srt[tf.minimum(tf.cast(0.999 * tf.cast(n, tf.float32), tf.int32), n - 1)]
+        tf.print(
+            "     chi2: mean", tf.reduce_mean(chi2_obs), "median", srt[n // 2],
+            "p99.9", p999, "max", srt[n - 1],
+            "n>100", tf.reduce_sum(tf.cast(chi2_obs > 100, tf.int32)),
+            "n>1000", tf.reduce_sum(tf.cast(chi2_obs > 1000, tf.int32)),
+        )
+        top = tf.argsort(chi2_obs, direction="DESCENDING")[:5]
+        tf.print("     worst 5 obs:  chi2", tf.gather(chi2_obs, top))
+        tf.print("                     cat ", tf.gather(c, top))
+        tf.print("                     x   ", tf.gather(x, top))
+        tf.print("                     sig ", tf.gather(xs, top))
+        tf.print("                     y   ", tf.gather(y, top))
+
+        # Drift of y away from the initial guess, which is what the loss lags.
+        moved = tf.cast(disp > 3.0, tf.float32)
+        tf.print(
+            "     |y-y0|: median", tf.sort(disp)[n_star // 2],
+            "max", tf.reduce_max(disp),
+            "frac>3", tf.reduce_mean(moved),
+        )
+        tf.print(
+            "     frac(|y-y0|>3) per catalog:",
+            tf.math.unsorted_segment_sum(moved, c, self.n_cat)
+            / tf.maximum(
+                tf.math.unsorted_segment_sum(tf.ones_like(moved), c, self.n_cat), 1.0
+            ),
+        )
 
     def _update_y(self, grad_y, xs, star) -> None:
         """One step of ``y`` along the exact gradient of the loss.
@@ -848,9 +1047,9 @@ class LatentTrainer:
         # to differentiate, so keeping it out of the tape keeps it out of the
         # graph's gradient bookkeeping as well. The map then takes its step at
         # the fitted ``y`` rather than at the one about to be replaced.
-        trust = tf.constant(1.0)
+        trust, capped, dy_max = tf.constant(1.0), tf.constant(0.0), tf.constant(0.0)
         if gauss_newton:
-            trust = self._gauss_newton_y(x, xs, c, star)
+            trust, capped, dy_max = self._gauss_newton_y(x, xs, c, star)
         if apply_grads or not fit_y:
             # A pre-trained run holds every star at its initial guess, held-out or
             # not, so the validation loss measures the objective being trained.
@@ -920,7 +1119,16 @@ class LatentTrainer:
             "penalty_div": penalty_div,
             "penalty_l2": penalty_l2,
             "y_trust": trust,
+            "y_capped": capped,
+            "dy_max": dy_max,
         }
+
+        # How far y has drifted from the precision-weighted mean, for this batch.
+        # One number here replaced a per-star demonstration: in
+        # ``latent_gn_5h_v2`` the maximum of this rose to 45 while the loss was
+        # still falling, and 18% of the stars were beyond 3.
+        disp = tf.norm(tf.gather(self.y, star) - tf.gather(self.y_init, star), axis=1)
+        res["y_disp_max"] = tf.reduce_max(disp)
 
         if apply_grads:
             if y_gradient:
@@ -928,19 +1136,47 @@ class LatentTrainer:
             else:
                 grads = g.gradient(loss, vars_filtered)
             grads, norm = tf.clip_by_global_norm(grads, cfg.clip_norm)
-            self.opt.apply_gradients(zip(grads, vars_filtered))
-            if y_gradient and grad_y is not None:
-                self._update_y(grad_y, xs, star)
             res["norm"] = norm
+
+            # An anomalous norm means this batch is not like the last hundred. The
+            # step is dropped whole -- including the update of Adam's moments, so
+            # the anomaly cannot suppress or redirect learning afterwards either --
+            # and the batch is printed so that whatever made it anomalous can be
+            # looked at. The reference median is updated afterwards, always, so a
+            # run that stays anomalous resumes stepping instead of freezing.
+            threshold = self._skip_threshold()
+
+            def skip_this_step():
+                self._report_bad_batch(norm, threshold, x, xs, c, star, y, chi2_obs, disp)
+                return tf.constant(1.0)
+
+            def take_this_step():
+                self.opt.apply_gradients(zip(grads, vars_filtered))
+                if y_gradient and grad_y is not None:
+                    self._update_y(grad_y, xs, star)
+                return tf.constant(0.0)
+
+            res["grad_skip"] = tf.cond(norm > threshold, skip_this_step, take_this_step)
+            self._record_norm(norm)
 
         return res
 
     # -- resumable state ----------------------------------------------------
-    def _manager(self, run_dir: Path) -> tf.train.CheckpointManager:
-        ckpt = tf.train.Checkpoint(
-            bij=self.bij, latent_y=self.y, latent_y_val=self.y_val
+    @staticmethod
+    def _checkpoint_paths(run_dir: Path) -> list:
+        """The checkpoint prefixes on disk, oldest first.
+
+        The directory is scanned rather than read through a
+        ``tf.train.CheckpointManager``: the retention rule wants old milestones
+        next to recent checkpoints, which the manager's count-based ``max_to_keep``
+        cannot express, and a scan also skips over a checkpoint whose write was
+        interrupted, since that one has no ``.index``.
+        """
+        d = Path(run_dir) / "checkpoints"
+        return sorted(
+            (str(p.with_suffix("")) for p in d.glob("ckpt-*.index")),
+            key=lambda p: int(p.rsplit("-", 1)[1]),
         )
-        return tf.train.CheckpointManager(ckpt, str(Path(run_dir) / "checkpoints"), max_to_keep=3)
 
     def save_state(
         self, run_dir: Path, step: int, metrics, n_figs: int, elapsed: float,
@@ -951,8 +1187,10 @@ class LatentTrainer:
         The model and the two free harmonized parameter arrays go into a
         ``tf.train.Checkpoint`` numbered by step; the rest into
         ``state-<step>.npz`` next to it, written first so that a checkpoint
-        never lacks its state.
+        never lacks its state. Afterwards the retention rule
+        (``checkpoints_to_keep``) decides what stays.
         """
+        cfg = self.cfg
         ckpt_dir = Path(run_dir) / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         meta = dict(
@@ -960,40 +1198,82 @@ class LatentTrainer:
             metrics=metrics, agreement=agreement,
         )
         arrays = {f"opt_{i}": np.asarray(v) for i, v in enumerate(self.opt.variables)}
+        # Saved by name as well as by position: adding AMSGrad adds a slot per
+        # weight, and positional restore would then write momentum into the wrong
+        # one. An old checkpoint has no names and is handled in ``load_state``.
+        arrays["opt_names"] = np.array([v.name for v in self.opt.variables])
         tmp = ckpt_dir / "state.tmp"
         with open(tmp, "wb") as f:
             np.savez(f, meta=np.array(json.dumps(meta)), **arrays)
         os.replace(tmp, ckpt_dir / f"state-{step}.npz")
 
-        manager = self._manager(run_dir)
         if step != self._last_saved_step:
-            manager.save(checkpoint_number=step)
+            tf.train.Checkpoint(
+                bij=self.bij, latent_y=self.y, latent_y_val=self.y_val
+            ).write(str(ckpt_dir / f"ckpt-{step}"))
             self._last_saved_step = step
-        keep = {int(p.rsplit("-", 1)[1]) for p in manager.checkpoints}
-        for f in ckpt_dir.glob("state-*.npz"):
-            if int(f.stem.split("-")[1]) not in keep:
+
+        steps = [int(p.rsplit("-", 1)[1]) for p in self._checkpoint_paths(run_dir)]
+        keep = checkpoints_to_keep(
+            steps, self.n_steps, cfg.checkpoint_every_steps,
+            cfg.keep_recent, cfg.keep_milestones,
+        )
+        for s in set(steps) - keep:
+            for f in ckpt_dir.glob(f"ckpt-{s}.*"):
                 f.unlink()
+            (ckpt_dir / f"state-{s}.npz").unlink(missing_ok=True)
 
     def load_state(self, run_dir: Path) -> Optional[dict]:
-        """Restore the latest complete checkpoint; return its metadata (or None)."""
-        manager = self._manager(run_dir)
-        for path in reversed(manager.checkpoints):
+        """Restore the newest usable checkpoint; return its metadata (or None)."""
+        for path in reversed(self._checkpoint_paths(run_dir)):
             step = int(path.rsplit("-", 1)[1])
             state_path = Path(run_dir) / "checkpoints" / f"state-{step}.npz"
             if not state_path.exists():
                 continue
-            (tf.train.Checkpoint(bij=self.bij, latent_y=self.y, latent_y_val=self.y_val)
-             .restore(path).assert_existing_objects_matched())
+            try:
+                tf.train.Checkpoint(
+                    bij=self.bij, latent_y=self.y, latent_y_val=self.y_val
+                ).restore(path).expect_partial()
+            except (tf.errors.OpError, ValueError) as exc:
+                log.warning(
+                    "Checkpoint %s is unusable (%s); trying the one before", path, exc
+                )
+                continue
             data = np.load(state_path)
             meta = json.loads(str(data["meta"]))
             opt_vars = self.opt.variables
-            n_saved = sum(k.startswith("opt_") for k in data.files)
-            if n_saved != len(opt_vars):
-                raise ValueError(
-                    f"Checkpoint has {n_saved} optimizer variables, expected {len(opt_vars)}."
-                )
-            for i, v in enumerate(opt_vars):
-                v.assign(data[f"opt_{i}"])
+            if "opt_names" in data.files:
+                saved = {
+                    name: data[f"opt_{i}"]
+                    for i, name in enumerate(data["opt_names"].tolist())
+                }
+                lost = [v.name for v in opt_vars if v.name not in saved]
+                if lost:
+                    log.warning(
+                        "%d optimizer variables (of %d) are new in this run and "
+                        "start fresh, e.g. %s", len(lost), len(opt_vars), lost[0]
+                    )
+                for v in opt_vars:
+                    if v.name in saved:
+                        v.assign(saved[v.name])
+            else:
+                n_saved = sum(k.startswith("opt_") for k in data.files)
+                if n_saved == len(opt_vars):
+                    for i, v in enumerate(opt_vars):
+                        v.assign(data[f"opt_{i}"])
+                else:
+                    # A checkpoint from before the optimizer changed shape (e.g.
+                    # AMSGrad adds one slot per weight). The moments mean
+                    # something different now, so keep only the step counter,
+                    # which is what the learning-rate schedule reads, and let the
+                    # moments build up again.
+                    log.warning(
+                        "Optimizer state has %d variables and this run's has %d; "
+                        "keeping the step counter and starting the moments afresh.",
+                        n_saved, len(opt_vars),
+                    )
+                    for i, v in enumerate(opt_vars[:2]):
+                        v.assign(data[f"opt_{i}"])
             self._last_saved_step = step
             log.info("Resumed from %s (step %d)", path, step)
             return meta
@@ -1026,15 +1306,15 @@ class LatentTrainer:
             tf.random.set_seed(cfg.seed + start)
 
         t_start = time.monotonic() - elapsed_prev
-        t_last_plot = t_last_ckpt = time.monotonic()
-        step_last_plot = start
+        t_last_plot = time.monotonic()
+        step_last_plot = step_last_ckpt = start
 
         def checkpoint(step, complete=False):
-            nonlocal t_last_ckpt
+            nonlocal step_last_ckpt
             self.save_state(
                 run_dir, step, metrics, n_figs, time.monotonic() - t_start, agreement, complete
             )
-            t_last_ckpt = time.monotonic()
+            step_last_ckpt = step
 
         def make_figure(step):
             nonlocal n_figs, t_last_plot, step_last_plot
@@ -1166,8 +1446,8 @@ class LatentTrainer:
                 if due and len(metrics["loss"]) > 1:
                     pbar.write(f"Wrote {make_figure(done)}")
                 elif (
-                    cfg.checkpoint_every_seconds is not None
-                    and time.monotonic() > t_last_ckpt + cfg.checkpoint_every_seconds
+                    cfg.checkpoint_every_steps is not None
+                    and done - step_last_ckpt >= cfg.checkpoint_every_steps
                 ):
                     checkpoint(done)
         except KeyboardInterrupt:
@@ -1321,7 +1601,7 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
             parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=None)
         elif isinstance(default, tuple):
             parser.add_argument(flag, nargs="*", default=None)
-        elif f.name in ("max_steps", "plot_every_steps", "val_every"):
+        elif f.name in ("max_steps", "plot_every_steps", "val_every", "checkpoint_every_steps"):
             parser.add_argument(flag, type=int, default=None)
         elif f.name in ("freeze_after_frac", "plot_every_seconds", "checkpoint_every_seconds"):
             parser.add_argument(flag, type=float, default=None)

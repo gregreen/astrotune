@@ -44,12 +44,13 @@ def _small_trainer(**overrides):
     tables = [_table(np.arange(1200), 4, 0) for _ in range(2)]
     tables[1]["x"] = tables[0]["x"] + np.array([0.05, 0.1, 0.05, 0.05], dtype="f4")
     obs, ctrl = td.build_training_data(tables, seed=1)
-    cfg = LatentTrainConfig(
+    settings = dict(
         hidden_size=16, n_hidden=1, batch_size=256, n_epochs=1, max_steps=2,
         plot_every_seconds=None, plot_every_steps=None,
-        checkpoint_every_seconds=None, agreement_n_stars=256, **overrides,
+        checkpoint_every_steps=None, agreement_n_stars=256,
     )
-    return LatentTrainer(obs, ctrl, cfg)
+    settings.update(overrides)
+    return LatentTrainer(obs, ctrl, LatentTrainConfig(**settings))
 
 
 def _first_stars(tr, n=200):
@@ -377,3 +378,106 @@ def test_the_trainer_reports_how_far_the_trust_region_bound(tmp_path):
     tight.y.assign_add(tf.constant(np.full(tight.y.shape, 0.15, dtype="f4")))
     metrics = tight.train(tmp_path / "tight")
     assert float(np.min(metrics["y_trust"])) < 0.5
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_an_anomalous_gradient_skips_the_step(tmp_path):
+    """A norm far above the recent median must leave every weight untouched.
+
+    The moments must not move either: if they did, one bad batch would keep
+    suppressing (or redirecting) the step for the next hundred updates, which is
+    the failure mode beta_2 = 0.99 and AMSGrad are there to shorten.
+    """
+    tr = _small_trainer()
+    # arm the test with a reference far below any real batch's norm
+    tr._norm_hist.assign(tf.ones_like(tr._norm_hist))
+    tr._norm_n.assign(tr.norm_window)
+    w0 = [v.numpy().copy() for v in tr.variables]
+    momentum0 = [v.numpy().copy() for v in tr.opt.variables]
+
+    metrics = tr.train(tmp_path)
+
+    assert np.all(np.asarray(metrics["grad_skip"]) == 1.0)
+    assert all(np.array_equal(v.numpy(), w) for v, w in zip(tr.variables, w0))
+    assert all(np.array_equal(v.numpy(), w) for v, w in zip(tr.opt.variables, momentum0))
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_an_ordinary_gradient_takes_the_step(tmp_path):
+    tr = _small_trainer()
+    tr._norm_hist.assign(tf.fill(tr._norm_hist.shape, 1e6))
+    tr._norm_n.assign(tr.norm_window)
+    w0 = [v.numpy().copy() for v in tr.variables]
+
+    metrics = tr.train(tmp_path)
+
+    assert np.all(np.asarray(metrics["grad_skip"]) == 0.0)
+    assert any(not np.array_equal(v.numpy(), w) for v, w in zip(tr.variables, w0))
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_the_anomaly_test_waits_for_its_reference():
+    """Until the window is full there is no honest median, so nothing is skipped.
+
+    The first norm of a run is far above where it settles (629 against ~40 in
+    ``latent_gn_5h``), so an armed test would drop the opening steps.
+    """
+    tr = _small_trainer()
+    assert float(tr._skip_threshold()) == np.inf
+    tr._norm_n.assign(tr.norm_window)
+    tr._norm_hist.assign(tf.fill(tr._norm_hist.shape, 7.0))
+    assert float(tr._skip_threshold()) == pytest.approx(10 * 7.0)
+
+    off = _small_trainer(skip_norm_factor=0.0)
+    off._norm_n.assign(off.norm_window)
+    assert float(off._skip_threshold()) == np.inf
+
+
+def test_checkpoints_keep_a_recent_band_and_even_milestones():
+    """The two rules, on a run of 10,000 steps checkpointed every 256."""
+    from astrotune.train_latent import checkpoints_to_keep
+
+    every, n_steps = 256, 10_000
+    steps = list(range(every, n_steps + 1, every))  # 39 checkpoints
+    keep = checkpoints_to_keep(steps, n_steps, every, recent=8, milestones=32)
+
+    newest = steps[-1]
+    assert {s for s in steps if newest - s <= 8 * every} <= keep  # the recent band
+    assert len(keep) <= 8 + 32
+    # a milestone from each eighth of the run, so the early history survives
+    for i in range(8):
+        lo, hi = i * n_steps / 32, (i + 1) * n_steps / 32
+        assert any(lo <= s < hi for s in keep), f"nothing kept in slice {i}"
+    # and the newest is never dropped
+    assert newest in keep
+
+
+def test_checkpoints_keep_everything_when_the_run_is_short():
+    from astrotune.train_latent import checkpoints_to_keep
+
+    steps = [256, 512, 768]  # fewer checkpoints than milestones
+    assert checkpoints_to_keep(steps, 800, 256, recent=8, milestones=32) == set(steps)
+
+
+def test_checkpoint_round_trip_and_retention(tmp_path):
+    """A saved state must reload, and the rules must actually delete files."""
+    from astrotune.train_latent import LatentTrainConfig, LatentTrainer
+
+    tr = _small_trainer(checkpoint_every_steps=1, keep_recent=2, keep_milestones=1)
+    metrics = {"loss": [1.0, 0.9], "step_val": []}
+    for step in (2, 4, 6, 8, 10):
+        tr.save_state(tmp_path, step, metrics, 0, 1.0, [])
+
+    files = sorted(p.name for p in (tmp_path / "checkpoints").glob("ckpt-*.index"))
+    # recent band = the last two saves (8, 10); milestones = the first save (2)
+    assert files == ["ckpt-10.index", "ckpt-2.index", "ckpt-8.index"], files
+    assert sorted(
+        int(p.stem.split("-")[1]) for p in (tmp_path / "checkpoints").glob("state-*.npz")
+    ) == [2, 8, 10]
+
+    y_before = tr.y.numpy().copy()
+    tr.y.assign(tr.y + 1.0)
+    meta = tr.load_state(tmp_path)
+    assert meta["step"] == 10
+    assert np.allclose(tr.y.numpy(), y_before)
+    assert int(tr.opt.iterations) == 0  # the counter is restored as saved

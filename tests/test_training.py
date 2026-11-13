@@ -339,7 +339,7 @@ def test_latent_training_moves_y_and_saves(tmp_path):
     cfg = LatentTrainConfig(
         hidden_size=16, n_hidden=1, batch_size=256, n_epochs=2, max_steps=8,
         plot_every_seconds=None, plot_every_steps=None,
-        checkpoint_every_seconds=None, agreement_n_stars=256,
+        checkpoint_every_steps=None, agreement_n_stars=256,
     )
     tr = LatentTrainer(obs, ctrl, cfg)
     y0 = tr.y.numpy().copy()
