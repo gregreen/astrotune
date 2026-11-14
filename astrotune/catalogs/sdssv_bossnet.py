@@ -1,8 +1,12 @@
-"""SDSS-V Milky Way Mapper (DR19): BOSSNet parameters from BOSS spectra.
+"""SDSS-V Milky Way Mapper (DR20): BOSSNet parameters from BOSS spectra.
 
 References
 ----------
-Sizemore et al. (2024), AJ 167, 173
+Sizemore et al. (2024), AJ 167, 173 (DOI: 10.3847/1538-3881/ad291d)
+SDSS Collaboration (2026), arXiv:2607.26149 (DOI: 10.48550/arXiv.2607.26149)
+https://dr20.sdss.org/sas/dr20/spectro/astra/0.8.1/summary/
+
+BOSSNet is also described here:
 https://sdss.org/dr19/mwm/astra/pipelines-in-astra/bossnet/
 
 Notes
@@ -12,6 +16,16 @@ The ``astra`` summary files keep the stellar parameters in HDU 1.
 BOSSNet provides no [alpha/Fe], so this catalog has three parameters. Since
 the parameters come from a neural-network fit to lower-resolution optical
 spectra, the regularization error is set to 0.3 on every axis.
+
+DR20 (astra 0.8.1) is the first release with southern-hemisphere BOSS spectra,
+so the catalogue grows by roughly the southern sky; see
+``porting_project.md`` for what that did to the cuts.
+
+Caveat: SDSS warns that BOSSNet gives poor parameters for halo stars and that
+MINESweeper or BOSS-CLAM should be used instead (DR20 paper, arXiv:2607.26149,
+Sec. VI.1.2). The halo and open-fiber cartons dominate the DR20 growth, and the
+astra summary files carry no carton column, so such stars cannot be removed
+here.
 """
 
 from __future__ import annotations
@@ -21,7 +35,7 @@ from astropy.io import fits
 from astropy.table import Table
 
 from ..prep import plots
-from ..prep.download import download_sdss
+from ..prep.download import download as fetch
 from ..prep.transforms import unmask
 
 KEY = "sdssv_bossnet"
@@ -29,10 +43,10 @@ LABEL = "SDSS-V (BOSSNet)"
 N_PARAMS = 3
 REFERENCE = "Sizemore et al. 2024, AJ 167, 173"
 SOURCES = (
-    "https://data.sdss5.org/sas/dr19/spectro/astra/0.6.0/summary/"
-    "astraAllStarBossNet-0.6.0.fits.gz",
+    "https://dr20.sdss.org/sas/dr20/spectro/astra/0.8.1/summary/"
+    "astraAllStarBossNet-0.8.1.fits.gz",
 )
-FILENAME = "astraAllStarBossNet-0.6.0.fits.gz"
+FILENAME = "astraAllStarBossNet-0.8.1.fits.gz"
 HDU = 1
 
 ID_COL = "gaia_dr3_source_id"
@@ -45,7 +59,8 @@ X_ERR = (0.3, 0.3, 0.3)
 
 
 def download(ctx) -> None:
-    download_sdss(SOURCES[0], ctx.raw_dir / FILENAME)
+    # dr20.sdss.org is public: no SDSS-V credentials, so nothing prompts.
+    fetch(SOURCES[0], ctx.raw_dir / FILENAME)
 
 
 def load(ctx) -> Table:
