@@ -42,8 +42,18 @@ def load_bijector(run_dir) -> ODEBijector:
         atol=cfg["ode_atol"],
         vector_network_kwargs=dict(use_residual=True, use_film=True, use_layer_norm=True),
     )
-    path = tf.train.latest_checkpoint(str(run_dir / "checkpoints"))
-    if path is None:
+    # The checkpoint directory is scanned rather than read through
+    # ``tf.train.latest_checkpoint``: the trainer writes ``Checkpoint`` objects
+    # directly so that it can keep old milestones alongside recent checkpoints
+    # (see ``train_latent.checkpoints_to_keep``), and no longer maintains the
+    # ``checkpoint`` proto that ``latest_checkpoint`` needs. Scanning also picks
+    # the numerically newest step, which the proto's order would not guarantee
+    # once checkpoints are deleted out of order.
+    index_files = list((run_dir / "checkpoints").glob("ckpt-*.index"))
+    if not index_files:
         raise FileNotFoundError(f"No checkpoint in {run_dir}/checkpoints")
+    path = str(
+        max(index_files, key=lambda p: int(p.name.split("-")[1].split(".")[0]))
+    )[: -len(".index")]
     tf.train.Checkpoint(bij=bij).restore(path).assert_existing_objects_matched()
     return bij
