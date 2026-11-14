@@ -46,6 +46,7 @@ CATALOGS: Tuple[CatalogSpec, ...] = (
     CatalogSpec("desi_nagaraj2026", "DESI (Nagaraj)", "astrotune.catalogs.desi_nagaraj2026", 4, ""),
     CatalogSpec("sdssv_clam", "SDSS-V (CLAM)", "astrotune.catalogs.sdssv_clam", 4, ""),
     CatalogSpec("lamost_mstar_li2025", "LAMOST M-Stars (Li)", "astrotune.catalogs.lamost_mstar_li2025", 4, ""),
+    CatalogSpec("sdssv_apogeenet", "SDSS-V (APOGEENet)", "astrotune.catalogs.sdssv_apogeenet", 3, ""),
 )
 
 INDEX = {spec.key: i for i, spec in enumerate(CATALOGS)}
@@ -56,10 +57,8 @@ INDEX = {spec.key: i for i, spec in enumerate(CATALOGS)}
 #: number of categories, so a model trained with N catalogs cannot be loaded
 #: once N+1 are registered. To promote a candidate, append it to
 #: :data:`CATALOGS` (never insert) and retrain.
-#: The first three candidates were promoted (19 catalogs).
-CANDIDATES: Tuple[CatalogSpec, ...] = (
-    CatalogSpec("sdssv_apogeenet", "SDSS-V (APOGEENet)", "astrotune.catalogs.sdssv_apogeenet", 3, ""),
-)
+#: Empty: every prepared candidate has been promoted (20 catalogs).
+CANDIDATES: Tuple[CatalogSpec, ...] = ()
 
 
 def run_keys(run_dir) -> Tuple[str, ...]:
