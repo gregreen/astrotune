@@ -1453,6 +1453,65 @@ not colored text (some colors are too light to read).
 Not done: marking pairs whose errors are correlated (shared spectra or training
 labels, e.g. APOGEE–ASPCAP), which would be useful given §9.10.
 
+### 9.12 The per-star latent `y` trainer (`astrotune-train-latent`)
+
+A second trainer, separate from `train.py`: every star gets one free harmonized vector `y`,
+fitted by one Gauss–Newton sweep per step with the Jacobian transported through the ODE, and
+the maps are trained against those values. The loss is the per-observation χ², softened by
+`chi2_turnover`, plus the control-point, path-length, div and weight-decay penalties of §9.3.
+It is not yet wired into `astrotune-evaluate`'s comparison tables, so its numbers below are
+its own training/validation figures, not the pair-agreement metrics of §9.4.
+
+**Reference run: `models/latent_adam_lr5e4`** — so far the only latent-`y` run that completed
+its whole schedule without diverging, and the one to copy from.
+
+| Group | Setting | Value |
+|---|---|---|
+| Data | observations | `data/observations_and_ctrl_points_dr1logg.h5` (3,876,479 obs, 1,451,767 stars, 2,942,969 control points; DESI DR1 log g `x_err` loosened) |
+| Shape | batch × epochs | 65,536 × 250 → **13,000 steps** (52 batches/epoch) |
+| Optimiser | `optimizer`, `learning_rate` | `adam`, **5e-4** |
+| | schedule | 8 phases (7 halvings → 3.9e-6), 5 % warmup (650 steps) |
+| | `adam_beta_2`, `adam_amsgrad`, `clip_norm` | 0.99, `True`, 100 |
+| | `skip_norm_factor` | 10 (rejects a step above 10× the running median norm; never fired) |
+| `y` block | `y_solver`, `y_learning_rate` | `gauss_newton`, 1.0 |
+| | `y_ridge`, `y_trust_abs` | 1e-3 (relative), 0.5 (absolute, per parameter) |
+| | `pretrain_steps` | 256 (maps only, `y` held at the precision-weighted mean) |
+| Loss | `chi2_turnover` | 50 |
+| | `l1/l2_path`, `l1/l2_total` | 0.1 each |
+| | `sigma_ctrl`, `eps_div`, `weight_div`, `l2_weights` | 0.3, 0.1, 3.0, 1e-4 |
+| Net | `hidden_size`, `n_hidden`, embedding | 64, 3, 5-dim (19 categories, FiLM + residual + LayerNorm) |
+| | `ode_rtol`, `ode_atol` | 1e-5, 1e-5 |
+| Split | `val_frac`, `seed` | 1/8 of the stars (random per star, not by id), 3 |
+| Files | `checkpoint_every_steps`, `keep_recent`, `keep_milestones` | 128, 8, 32 |
+
+Final state: loss 4.09, **χ² 3.78** (validation 3.8), penalties 0.021 / 0.136 / 0.148 / 0.026,
+lr 3.9e-6, 11 h 2 min on the shared A100. Videos in `models/latent_adam_lr5e4/videos/`.
+
+Why these and not others:
+
+* **The learning rate is the whole story.** Adam at 2e-3 diverged at step ~930 (χ² 4.4 → 11.2),
+  at 1e-3 at ~2,232 (from 4.25, with the penalties ratcheting afterwards); at 5e-4 the same
+  configuration runs all 13,000 steps. The symptom at the high rates is a ~15-step *smooth* ramp
+  of every loss term together, not a single bad step: measured on the 1e-3 run, χ² never exceeded
+  1.25× its level while the gradient norm reached 4.5×, and every layer's gradient rose and fell
+  together (median deviation of a layer from the total's log-change: 0.13 e-folds). Adam is scale
+  free, so gradient clipping does not bound its step — `clip_norm` was active on most steps of the
+  divergent runs.
+* **`y_ridge` 1e-3 rather than 1e-6, and a trust region at 0.5.** Stars whose parameters are
+  poorly constrained otherwise take Gauss–Newton steps of hundreds of σ; the ridge damps the
+  near-flat directions and the trust region scales whole steps down (never per dimension, so the
+  descent direction survives). `dy_max` sits at the cap of 0.5 on essentially every step, i.e.
+  a few stars per batch are always at the limit.
+* **`pretrain_steps` 256** holds `y` at the precision-weighted mean while the maps catch up, so
+  they start consistent with a reasonable `y` instead of chasing a cold one.
+* **Checkpoints every 128 steps, keeping the last 8 plus 32 evenly spaced.** Earlier runs kept
+  three and lost the last healthy state to the next hour of a diverging run, twice.
+
+Known-fragile variants, all on branches, all rejected for now: a breadth rule that rejects a step
+when >50 % of the parameter groups are above 2× their 16-step median (`step-rejection`: it fires
+on exactly the right steps — 0.4 % of them — but the run it produced had damaged [α/Fe] for a few
+surveys, so the rule only limited the damage); and SGD with momentum 0.9 (`sgd-optimizer`).
+
 ### Notes from the original port order (all done; kept for context)
 
 1. `model/` — kept `output_scale=1e-5`, the residual/FiLM defaults and
