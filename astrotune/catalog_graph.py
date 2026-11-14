@@ -211,11 +211,29 @@ def crossing_score(p: np.ndarray, edges: np.ndarray, strength: np.ndarray) -> Tu
 SPREAD = 1.7
 
 
-def dissimilarity(n: int, edges: np.ndarray, strength: np.ndarray) -> np.ndarray:
-    """Target distance between two catalogs: short for strong edges, longer for weak
-    ones, longest for pairs that are not connected."""
-    d = np.full((n, n), 1.4)
-    d[edges[:, 0], edges[:, 1]] = d[edges[:, 1], edges[:, 0]] = 0.55 + 0.65 * (1 - strength)
+#: Target distance between two catalogs: a base, the room the two circles need, and a penalty
+#: for a weak edge. Node size enters the distance on purpose. A fixed distance (what this used
+#: to be) puts every strongly connected pair at the same spacing, which piles the large
+#: catalogs -- connected strongly to everything, hence to each other -- into the middle, while
+#: the weak-edge penalty flings the small, poorly connected ones out to the rim. Making the
+#: distance grow with the two radii gives the large catalogs room, and a mild weak-edge penalty
+#: keeps a VMP or a PIGS next to the core instead of alone in the corner.
+#:
+#: Only the ratios matter: the layout is normalised to fit the figure afterwards, so scaling
+#: every entry leaves the picture unchanged. ``DELTA_FAR`` is therefore the unit and everything
+#: else is a fraction of it. A pair sharing no star that still ends up closest to the unit is
+#: what keeps the sparse catalogs from drifting away from the core.
+DELTA_FAR = 1.0
+DELTA_BASE, DELTA_SIZE, DELTA_WEAK = 0.21, 1.1, 0.25
+
+
+def dissimilarity(n: int, edges: np.ndarray, strength: np.ndarray, radii: np.ndarray) -> np.ndarray:
+    """Target distances: small for a strong edge between two small catalogs, large for a weak
+    edge between two big ones, largest for a pair that is not connected."""
+    d = np.full((n, n), DELTA_FAR)
+    room = radii[:, None] + radii[None]
+    near = DELTA_BASE + DELTA_SIZE * (room[edges[:, 0], edges[:, 1]]) + DELTA_WEAK * (1 - strength)
+    d[edges[:, 0], edges[:, 1]] = d[edges[:, 1], edges[:, 0]] = near
     np.fill_diagonal(d, 0)
     return d
 
@@ -236,8 +254,8 @@ def smacof(delta: np.ndarray, X: np.ndarray, iters: int = 300) -> np.ndarray:
     return X
 
 
-def remove_overlaps(pos: np.ndarray, radii: np.ndarray, gap: float = 0.04, iters: int = 300) -> np.ndarray:
-    """Push circles apart until none overlap (plus ``gap``)."""
+def remove_overlaps(pos: np.ndarray, radii: np.ndarray, gap: float = 0.09, iters: int = 300) -> np.ndarray:
+    """Push circles apart until none overlap (by at least ``gap``)."""
     pos = pos.copy()
     n = len(pos)
     for _ in range(iters):
@@ -255,7 +273,7 @@ def remove_overlaps(pos: np.ndarray, radii: np.ndarray, gap: float = 0.04, iters
 def best_spring_layout(shared, radii, edges, strength, n_restarts, seed):
     """Stress-majorization layout; the restart with the smallest weighted crossing number wins."""
     rng = np.random.default_rng(seed)
-    delta = dissimilarity(len(shared), edges, strength)
+    delta = dissimilarity(len(shared), edges, strength, radii)
     best, best_score = None, (np.inf, np.inf)
     for _ in range(n_restarts):
         p = smacof(delta, rng.normal(size=(len(shared), 2)))
@@ -305,7 +323,7 @@ def circle_layout(shared, edges, strength, seed, n_iter=40000):
 # --- Drawing --------------------------------------------------------------------
 #: Node radius = R_REF * (rows / ROWS_REF) ** NODE_EXPONENT: a power law, so the area grows as
 #: rows**(2 * NODE_EXPONENT). 0.25 keeps 300 rows (VMP) visible next to 4 M (DD-Payne): 11x in radius.
-ROWS_REF, R_REF, NODE_EXPONENT = 4.2e6, 0.22, 0.25
+ROWS_REF, R_REF, NODE_EXPONENT = 4.2e6, 0.24, 0.25
 
 
 def node_radii(rows: np.ndarray) -> np.ndarray:
