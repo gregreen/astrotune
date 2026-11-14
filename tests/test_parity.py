@@ -2,6 +2,11 @@
 
 These run only for catalogs that have already been built with
 ``astrotune-prepare``; everything else is skipped.
+
+A module whose source data release has changed since the legacy notebook can set
+``PARITY_SKIP`` (with a reason) to opt out of the comparison entirely, and one
+that deviates on purpose sets ``PARITY_EXEMPT`` plus ``PARITY_DIFFERS`` to name
+the axes that are allowed to differ.
 """
 
 import numpy as np
@@ -42,6 +47,13 @@ def test_parity_with_legacy(key):
     if not legacy.exists():
         pytest.skip(f"no legacy table for {key}")
 
+    module = registry.get_module(key)
+    reason = getattr(module, "PARITY_SKIP", None)
+    if reason:
+        # The catalog reads a different data release now, so the legacy rows
+        # describe a different sample and there is nothing to compare.
+        pytest.skip(f"parity not applicable: {reason}")
+
     new = Table.read(config.catalog_path(key))
     reference = Table.read(legacy)
     # The [alpha/Fe] floor was lowered on purpose; put the legacy floor back so that every other
@@ -53,7 +65,6 @@ def test_parity_with_legacy(key):
     assert report["ids_match"], io.format_parity(report)
     assert report["same_order"], io.format_parity(report)
 
-    module = registry.get_module(key)
     exempt = getattr(module, "PARITY_EXEMPT", None)
     if exempt:
         # A deliberate deviation must say exactly which parameters of which

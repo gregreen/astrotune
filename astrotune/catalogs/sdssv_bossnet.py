@@ -57,6 +57,11 @@ EXTRA_COLS = ("ra", "dec")
 #: Low confidence overall, so the transformation is weakly constrained.
 X_ERR = (0.3, 0.3, 0.3)
 
+#: The legacy table reproduces DR19. This module now reads DR20, which re-reduces
+#: every DR19 spectrum and adds the southern hemisphere, so the sample itself
+#: changed and a row-for-row comparison with the legacy table is meaningless.
+PARITY_SKIP = "reads DR20 (astra 0.8.1); the legacy table reproduces DR19"
+
 
 def download(ctx) -> None:
     # dr20.sdss.org is public: no SDSS-V credentials, so nothing prompts.

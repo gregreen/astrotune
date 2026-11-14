@@ -43,6 +43,15 @@ PARAM_COLS = ("TEFF", "FEH", "LOGG", "ALPHAFE")
 UNC_COLS = ("TEFF_ERR", "FEH_ERR", "LOGG_ERR", "ALPHAFE_ERR")
 EXTRA_COLS = ("TARGET_RA", "TARGET_DEC")
 
+#: The logg regularization error was raised from ``0.1 + edge_penalty`` to
+#: ``0.2 + 2 * edge_penalty`` after the legacy table was made, so the parity check
+#: is allowed to fail on ``x_err[:, 2]`` only.
+PARITY_EXEMPT = (
+    "x_err[:, 2] is 0.2 + 2*edge_penalty; the legacy table used 0.1 + edge_penalty"
+)
+#: Columns of the table that differ from the legacy one, and which parameters.
+PARITY_DIFFERS = {"x_err": (2,)}
+
 # Points defining the cool-dwarf boundary in the (Teff, logg) plane.
 TEFF_EDGE = (6000.0, 5.0)
 TEFF_EDGE_2 = (5000.0, 3.0)
