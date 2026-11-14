@@ -120,7 +120,7 @@ astrotune/
   videos.py          Kiel / [Fe/H]-[alpha/Fe] / param1v1 videos (`astrotune-videos`)
   apply.py           harmonize each catalog, merge by Gaia id (`astrotune-apply`)
   merge.py           combination of Gaussian estimates + outlier rejection (NumPy only)
-  delta/             post-hoc learned extra uncertainties (§9.10): pairs.py, diagnostics.py
+  delta/             post-hoc learned extra uncertainties (§9.10): stars.py, diagnostics.py
                      (`astrotune-delta-diagnose`), model.py, train.py (`astrotune-delta-train`)
   prep/
     download.py      cached HTTP downloads, SDSS-V auth via env/prompt
@@ -1221,7 +1221,7 @@ data (§10).
   (`data/pairs_*.h5`; new ones record `error_floors` in their attributes) must be rebuilt
   with `astrotune-pairs`; the transform caches (`<run>/harmonized/transform_cache_*`) now
   carry a checksum of `x` and `sigma_x` and are recomputed when it does not match (old ones
-  are treated as stale); the delta pair tables (`<run>/delta/pair_table.npz`) are not
+  are treated as stale); the delta star tables (`<run>/delta/star_table.npz`) are not
   checked: rebuild them with `--rebuild` after `astrotune-apply`.
 - **Number of categories is per run, not global.** `load_bijector` reads the
   catalog list from the run's `config.json` (`registry.run_keys`); `evaluate`,
@@ -1339,11 +1339,28 @@ Idea (owner): after the bijector is trained, learn an extra variance per catalog
 entry, `ln_delta_cov(x, ln σ_x, catalog)` → 4 numbers, as a function of the
 entry's *own* catalog parameters (same transforms, e.g. `5 ln(Teff/5000 K)`),
 the log of its reported uncertainties, and the catalog (FiLM, reusing
-`VectorNetwork`). The output lives in the *harmonized* space. Objective: for each
-pair of entries of one star, the Gaussian likelihood of `d = y_a − y_b` with
-`S = C_a + C_b + diag(exp(ln_δ_a) + exp(ln_δ_b))`, **including `ln det S`** (without
-it the fit would inflate the errors to infinity). Parameters not measured by both
-catalogs are dropped from the quadratic form and the determinant. This is a
+`VectorNetwork`). The output lives in the *harmonized* space.
+
+**Objective (since 2026-11-14: one likelihood term per star).** A star has one
+unknown harmonized value `z`, and each of its entries is a measurement of it:
+`y_k = z + e_k`, `e_k ~ N(0, S_k)`, `S_k = C_k + diag(exp(ln_δ_k))`, independent
+given `z`. Marginalising `z` with a flat prior gives
+`-2 ln p = Σ_k d_kᵀ S_k⁻¹ d_k + ln det A + Σ_k ln det S_k + n_res ln 2π`, with
+`A = Σ_k S_k⁻¹`, `d_k = y_k − z`, `z = A⁻¹ Σ_k S_k⁻¹ y_k` (the precision-weighted
+mean, i.e. the three-cornered hat) and `n_res` the dimension of the space of
+differences. Both determinants are needed (without `ln det S` the fit inflates the
+errors to infinity; `ln det A` is what makes the variance trade between catalogs
+identifiable). Parameters an entry does not measure are dropped from the quadratic
+form *and* from its determinant, and a parameter no entry of the star measures is
+dropped from `ln det A`. For `K = 2` this is algebraically the old pair likelihood,
+constant included, which is also the regression test.
+
+This replaced a likelihood that put one term on each unordered *pair* of entries:
+for a star in `K` catalogs that was `K(K−1)/2` terms built from `K` numbers, 63.6 %
+of them from stars with `K ≥ 3` in the 20-catalog data, neither independent nor
+correctly weighted (a `K = 5` star carried 10 terms; the prior on its `ln_δ` was
+applied 4 times per entry). The file, the functions and the cache are named for
+stars now (`delta/stars.py`, `star_nll`, `star_table.npz`). This is a
 less ambitious, post-hoc replacement for the learned error model the notebook
 trained *jointly* with the bijector (`ln_err_model`, not ported, §9.3). Decisions
 made with the owner: Gaussian likelihood and diagonal, additive-only for now
@@ -1355,25 +1372,34 @@ astrotune-delta-diagnose --run-dir models/X        # calibration, no model; ~30 
 astrotune-delta-train --run-dir models/X           # baselines + network; ~3 min
 ```
 
-Everything goes to `<run>/delta/`: `pair_table.npz` (cache), `diagnostics/`,
+Everything goes to `<run>/delta/`: `star_table.npz` (cache), `diagnostics/`,
 `delta_model.*` + `delta_model_config.json` (`model.load_delta_model`, and
 `model.numpy_delta_fn(model)(x, ln_sigma, catalog)`), `evaluation/`
 (`comparison.txt/json`, calibration figures with `_none` / `_network`,
 `learned_delta.png`). The bijector is frozen, so training uses precomputed `y`,
-`C` per pair (no ODE): it is cheap and has to be redone when the bijector changes.
+`C` per entry (no ODE): it is cheap and has to be redone when the bijector changes.
+The batches are flat arrays of entries plus the star each belongs to, and every
+per-star quantity is a segmented reduction (`unsorted_segment_sum` in TF,
+`np.add.reduceat` in the numpy diagnostics): no loop over observations, no ragged
+tensor, blocks cut on star boundaries so a star is never split across batches.
 
 Design choices to know about: **one row per star per catalog** (the first in the
-table: no many-to-many pairs from repeated spectra, unlike the bijector
-training); the train/validation split is **by star** (id hash, 1/8); pairs are a
-composite likelihood (the three pairs of a triple are correlated; a per-star
-likelihood would be the principled upgrade); `ln_δ` has a smooth floor at
+table: no many-to-many rows from repeated spectra, unlike the bijector training);
+the train/validation split is **by star** (id hash, 1/8) and is the validation set
+the likelihood is evaluated on, so the NLL per star is comparable across catalog
+sets; the per-catalog excess table comes from the stars in exactly two catalogs
+(`delta.diagnostics.three_cornered_hat`), where the residual variance is exactly
+`S_1 + S_2` -- with `K ≥ 3` the entry residual carries `−A⁻¹` and a naive median of
+it recovers about a third of the true extra variance; `ln_δ` has a smooth floor at
 σ = 0.003 and a weak Gaussian prior (center σ = 0.03, width 3 in ln-variance,
-weight 0.01 per sample). The pair difference constrains only `Σ_j + Σ_k`; the
-split between catalogs is identified through triangles of catalogs and the
-likelihood is very flat along it (needs ~1,000 steps at high lr to converge in
-the synthetic test), so poorly connected catalogs (VMP, PIGS, SLAM, MDC) are
-prior-dominated. Tests: `tests/test_delta.py` (likelihood vs scipy incl. masking,
-recovery of known extra variances, diagnostics on synthetic pairs).
+weight 0.01 per entry). A star in two catalogs constrains only `Σ_j + Σ_k`; the
+split between catalogs is identified through stars in three or more catalogs and
+through the smooth dependence of `ln_δ` on `(x, ln σ_x, catalog)`, and the
+likelihood is very flat along it (needs ~1,000 steps at high lr to converge in the
+synthetic test), so poorly connected catalogs (VMP, PIGS, SLAM, MDC) are
+prior-dominated. Tests: `tests/test_delta.py` (K = 2 against scipy exactly; K = 4
+against the difference-space density; recovery of known extra variances;
+diagnostics incl. masking; block coverage).
 
 **Findings on `models/turnover50_8ep` (16 catalogs, 1.43 M pairs, rough)** —
 before any delta (`diagnostics/summary.txt`):
@@ -1411,10 +1437,10 @@ led to lowering the [α/Fe] floor from 0.05 to 0.02 (§9.8); the numbers above a
 
 Prerequisites and API: a run needs its transform cache (`astrotune-apply`), so the
 19-catalog runs have to be applied first (only `models/turnover50_8ep` has been). In
-code: `delta.pairs.get_pair_table`, `delta.diagnostics.diagnose` / `pair_stats`
+code: `delta.stars.get_star_table`, `delta.diagnostics.diagnose` / `entry_stats`
 (accept an optional `delta_fn(x, ln_sigma, catalog) -> ln_delta`, so the same
 calibration measures can be computed with any covariance model),
-`delta.train.fit` / `run`, `delta.model.pair_nll`. To use a learned delta in the merge
+`delta.train.fit` / `run`, `delta.model.star_nll`. To use a learned delta in the merge
 add `diag(exp(ln_delta))` to each entry's covariance in `apply.transform_catalog`
 (only for parameters the catalog measures) and drop the 0.03 floor in `merge.py`;
 the model's `ln σ_x` input is `log(sigma_x)`, set to 0 where a parameter is not measured.

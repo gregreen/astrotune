@@ -4,15 +4,35 @@
 variance added, in the *harmonized* space, to the propagated covariance of an
 entry. The inputs are the entry's own parameters (the catalog's coordinates,
 e.g. ``5 ln(Teff/5000 K)``), the log of its reported uncertainties, and its
-catalog (through FiLM, as in the bijector).
+catalog (through FiLM, as in the bijector). The network is unchanged from the
+pair-based version: only the likelihood it is fitted with has changed.
 
-For a pair of entries of one star the likelihood of the harmonized difference is
+The likelihood is the one of the latent-``y`` paradigm. A star has entries
+``k = 1..K`` in different catalogs, all measurements of one unknown value ``z``:
 
-    d = y_a - y_b ~ N(0, S),   S = C_a + C_b + diag(exp(ln_delta_a) + exp(ln_delta_b)),
+    y_k = z + e_k,   e_k ~ N(0, S_k),   S_k = C_k + diag(exp(ln_delta_k)),
 
-evaluated on the parameters measured by both catalogs (the others are dropped
-from the quadratic form *and* the log determinant). The negative log likelihood
-includes ``ln det S``, so inflating the variance without limit is penalized.
+with the ``e_k`` independent given ``z``. Marginalising ``z`` with a flat prior
+gives, per star,
+
+    -2 ln p = sum_k d_k^T S_k^-1 d_k + ln det A + sum_k ln det S_k + n_res ln 2 pi
+
+with ``d_k = y_k - z``, ``A = sum_k S_k^-1`` and ``z = A^-1 sum_k S_k^-1 y_k``
+(the precision-weighted mean, i.e. the three-cornered hat), and ``n_res`` the
+dimension of the space of differences: the number of parameters the entries measure
+less the number the star has at all. For ``K = 2`` this is *identical* to the old
+pair likelihood, constant included, since
+``det A = det(S_1 + S_2) / (det S_1 det S_2)`` and ``n_res`` is the dimension of
+``y_1 - y_2``; it differs for ``K >= 3``, where the pair version counted
+``K (K-1) / 2`` correlated terms instead of one.
+
+A parameter that an entry does not measure carries a placeholder variance of
+``MISSING_VAR`` in ``C`` and a harmonized value of 0, so its row and column of
+``S_k`` are ``1e9``: its precision ``1e-9`` contributes essentially nothing to
+``A``, its residual is 0, and its ``ln det`` contribution is removed by the
+mask. A parameter that *no* entry of the star measures leaves ``A`` with a
+``1e-8`` diagonal and ``z = 0`` there, which is the same "no information"
+answer the trainer's ``y``-ridge gives; the masked ``ln det A`` drops it too.
 """
 
 from __future__ import annotations
@@ -20,14 +40,14 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Callable, Dict
+from typing import Callable, Dict, Tuple
 
 import numpy as np
 import sonnet as snt
 import tensorflow as tf
 
 from ..model.vector_network import VectorNetwork
-from .pairs import N_PARAMS
+from .stars import N_PARAMS
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +57,9 @@ LN_MIN = float(2 * np.log(3e-3))
 #: Weak Gaussian prior on ln_delta: center (sigma = 0.03, the floor the merge used) and width
 PRIOR_MEAN = float(2 * np.log(0.03))
 PRIOR_SD = 3.0
+
+#: Per-entry batch arrays, plus the star each entry belongs to
+BATCH_KEYS = ("x", "ls", "c", "y", "C", "m")
 
 DeltaFn = Callable[[tf.Tensor, tf.Tensor, tf.Tensor], tf.Tensor]
 
@@ -85,33 +108,67 @@ def fixed_delta(sigma: float) -> DeltaFn:
     return fn
 
 
-def pair_nll(batch: Dict[str, tf.Tensor], delta_fn: DeltaFn):
-    """Negative log likelihood of every pair of a batch, in float64.
+def make_batch(stars, idx, seg) -> Dict[str, object]:
+    """One block of whole stars as tensors: entry arrays plus the star segment."""
+    return {
+        **{k: tf.constant(stars[k][idx]) for k in BATCH_KEYS},
+        "seg": tf.constant(np.asarray(seg, dtype="i4")),
+    }
 
-    Returns ``(nll, ln_delta_a, ln_delta_b)``; ``nll`` is over the parameters
-    measured by both catalogs, including the ``0.5 ln(2 pi)`` terms.
+
+def star_nll(batch: Dict[str, object], delta_fn: DeltaFn) -> Tuple[tf.Tensor, tf.Tensor]:
+    """Per-star negative log likelihood, in float64; also returns the log variances.
+
+    The sum over a star's entries is a segmented reduction, so a batch is a flat
+    array of entries plus the index of the star each belongs to: no loop over
+    observations and no ragged tensor. Every star of the block must have at least
+    one entry, which is what :func:`astrotune.delta.stars.block_indices` yields.
     """
-    f8 = tf.float64
-    la = delta_fn(batch["xa"], batch["lsa"], batch["ca"])
-    lb = delta_fn(batch["xb"], batch["lsb"], batch["cb"])
-    var = tf.exp(tf.cast(la, f8)) + tf.exp(tf.cast(lb, f8))
-    m = tf.cast(batch["m"], f8)
-    S = tf.cast(batch["Ca"], f8) + tf.cast(batch["Cb"], f8) + tf.linalg.diag(var)
-    S = S * m[:, :, None] * m[:, None, :] + tf.linalg.diag(1.0 - m)  # drop unmeasured parameters
-    S = 0.5 * (S + tf.linalg.matrix_transpose(S))
-    d = (tf.cast(batch["ya"], f8) - tf.cast(batch["yb"], f8)) * m
+    seg = batch["seg"]
+    n_star = tf.reduce_max(seg) + 1  # a dynamic segment count: no retracing per block
+    m = tf.cast(batch["m"], tf.float64)  # (N, 4): measured by this entry
+    la = delta_fn(batch["x"], batch["ls"], batch["c"])  # (N, 4) log added variance
+
+    y = tf.cast(batch["y"], tf.float64)
+    S = tf.cast(batch["C"], tf.float64) + tf.linalg.diag(tf.exp(tf.cast(la, tf.float64)))
     L = tf.linalg.cholesky(S)
-    w = tf.linalg.triangular_solve(L, d[..., None], lower=True)
-    quad = tf.reduce_sum(w**2, axis=[1, 2])
-    logdet = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(L)), axis=1)
-    nll = 0.5 * (quad + logdet + tf.reduce_sum(m, axis=1) * tf.cast(np.log(2 * np.pi), f8))
-    return nll, la, lb
+    Sinv = tf.linalg.inv(S)  # symmetric positive definite; the Cholesky is for ln det
+
+    # Star-level quantities: the precision sum A and the precision-weighted mean z.
+    A = tf.math.unsorted_segment_sum(Sinv, seg, n_star)  # (S, 4, 4)
+    b = tf.math.unsorted_segment_sum(tf.linalg.matvec(Sinv, y), seg, n_star)  # (S, 4)
+    LA = tf.linalg.cholesky(A)
+    z = tf.linalg.cholesky_solve(LA, b[..., None])[..., 0]  # (S, 4)
+
+    d = y - tf.gather(z, seg)  # (N, 4)
+    quad = tf.reduce_sum(d * tf.linalg.matvec(Sinv, d), axis=1)  # (N,)
+    # ln det S_k over the parameters this entry measures: the placeholder axes of an
+    # unmeasured parameter are 1e9 and must not contribute ln(1e9).
+    logdet_S = 2.0 * tf.reduce_sum(m * tf.math.log(tf.linalg.diag_part(L)), axis=1)
+    # ln det A over the parameters *some* entry of the star measures.
+    any_m = tf.cast(tf.math.unsorted_segment_max(m, seg, n_star), tf.float64)  # (S, 4)
+    logdet_A = 2.0 * tf.reduce_sum(any_m * tf.math.log(tf.linalg.diag_part(LA)), axis=1)
+
+    quad_s = tf.math.unsorted_segment_sum(quad, seg, n_star)
+    logdetS_s = tf.math.unsorted_segment_sum(logdet_S, seg, n_star)
+    n_meas_s = tf.math.unsorted_segment_sum(tf.reduce_sum(m, axis=1), seg, n_star)
+    # The density lives in the space of the differences, of dimension (measured
+    # parameters over the entries) - (parameters the star has at all). With K = 2
+    # this constant is what makes the expression identical to the pair likelihood,
+    # normalisation included; with K = 1 it is 0, i.e. no information.
+    n_res = n_meas_s - tf.reduce_sum(any_m, axis=1)
+    neg2lnp = quad_s + logdet_A + logdetS_s + n_res * tf.cast(np.log(2 * np.pi), tf.float64)
+    return 0.5 * neg2lnp, la
 
 
-def prior_penalty(batch, la, lb):
-    """Mean over measured parameters of the Gaussian prior on ln_delta (both sides)."""
+def prior_penalty(batch: Dict[str, object], la: tf.Tensor) -> tf.Tensor:
+    """Mean over measured parameters of the Gaussian prior on ln_delta.
+
+    One term per *entry*, which the star framing gives for free: the pair version
+    applied it once per pair, i.e. ``K - 1`` times to the same entry.
+    """
     m = tf.cast(batch["m"], tf.float32)
-    z2 = ((la - PRIOR_MEAN) / PRIOR_SD) ** 2 + ((lb - PRIOR_MEAN) / PRIOR_SD) ** 2
+    z2 = ((la - PRIOR_MEAN) / PRIOR_SD) ** 2
     return 0.5 * tf.reduce_sum(z2 * m) / tf.maximum(tf.reduce_sum(m), 1.0)
 
 
@@ -120,7 +177,7 @@ def l2_penalty(module: snt.Module):
     return tf.add_n([tf.nn.l2_loss(v) for v in ws]) if ws else tf.constant(0.0)
 
 
-# --- Numpy interface (diagnostics, apply) -------------------------------------
+# --- Numpy interface (diagnostics) --------------------------------------------
 def numpy_delta_fn(model, batch_size: int = 65536):
     """``f(x, ln_sigma, catalog) -> ln_delta`` on NumPy arrays, in batches."""
 
@@ -146,11 +203,21 @@ def save_delta_model(out_dir: Path, model: DeltaNetwork, config: dict) -> Path:
     return Path(path)
 
 
-def load_delta_model(out_dir: Path) -> DeltaNetwork:
-    """Restore a model saved by :func:`save_delta_model`."""
+def load_delta_model(out_dir: Path, keys=None) -> DeltaNetwork:
+    """Restore a model saved by :func:`save_delta_model`.
+
+    ``n_cat`` alone would not catch a model trained on a different catalog list of
+    the same length, whose category indices would silently mean other catalogs, so
+    the saved keys are compared whenever ``keys`` is given.
+    """
     out_dir = Path(out_dir)
     with open(out_dir / "delta_model_config.json") as f:
         cfg = json.load(f)
+    if keys is not None and tuple(cfg.get("keys", ())) != tuple(keys):
+        raise ValueError(
+            f"{out_dir}/delta_model was trained on {list(cfg.get('keys', ()))}, "
+            f"not {list(keys)}; retrain it."
+        )
     model = DeltaNetwork(cfg["n_cat"], cfg["hidden_size"], cfg["n_hidden"])
     tf.train.Checkpoint(model=model).read(str(out_dir / "delta_model")).assert_existing_objects_matched()
     return model

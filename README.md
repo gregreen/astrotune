@@ -201,9 +201,11 @@ astrotune-delta-diagnose --run-dir models/my_run   # how well calibrated are the
 astrotune-delta-train --run-dir models/my_run      # learn extra variances per catalog entry
 ```
 
-Both write to `models/my_run/delta/`. See `porting_project.md` §9.10 for the
-method, the findings and the open issues. The model is not yet used by
-`astrotune-apply`.
+Both write to `models/my_run/delta/`: `star_table.npz` is every observation of
+every star (grouped by star), and the fit is the latent-y likelihood with the
+star's value integrated out, so a star counts once however many catalogs saw it.
+See `porting_project.md` §9.10 for the method, the findings and the open issues.
+The model is not yet used by `astrotune-apply`.
 
 ### Merging the harmonized estimates
 
