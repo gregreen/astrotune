@@ -3,15 +3,15 @@
     astrotune-catalog-graph            # -> diagnostic_plots/catalog_graph/
 
 *Nodes* are the catalogs in ``registry.CATALOGS``, plus any candidate that has been
-prepared; candidates are outlined with a dashed ring, since they are not part of the
-model yet. The circle's radius grows with
+prepared. The circle's radius grows with
 ``log10(number of rows)`` and its color marks the family of spectra the catalog
 is based on. The stroke around a node marks a missing parameter: white if the catalog
 measures all four, one color if it has no [alpha/Fe] and another if it has no logg
 (hatched, alternating with white, if only some of its stars lack the parameter; see
-:func:`node_strokes`). Labels are placed next to the nodes, preferably inside their bounding
-box so that they do not shrink the figure; the labels of the two largest nodes
-(``INSIDE_LABELS``) are written inside them. *Edges* join catalogs that share stars (matched on Gaia DR3 id);
+:func:`node_strokes`). A label is written inside its circle when it fits there, folded
+onto at most :data:`MAX_LABEL_LINES` lines; the rest are placed next to the node,
+preferably inside the bounding box of the nodes so that they do not shrink the figure.
+*Edges* join catalogs that share stars (matched on Gaia DR3 id);
 line width, opacity and color (``plasma``) grow with ``log10(number of shared stars)``. Edges below
 ``--min-shared`` are not drawn (the graph is nearly complete, so every pair
 would otherwise be an edge), except that each catalog always keeps its ``--top-k``
@@ -38,7 +38,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -137,7 +137,7 @@ def compute_overlaps(keys: Optional[Sequence[str]] = None) -> dict:
     prepared catalogs."""
     if keys is None:
         # Prepared candidates are included so that the figure shows the catalog set as it
-        # actually stands; the plot marks them, so they cannot be mistaken for model inputs.
+        # actually stands ("stars in catalog" is then approximate, since rows repeat).
         keys = [
             k
             for k in registry.keys() + registry.candidate_keys()
@@ -335,12 +335,11 @@ def edge_color(s):
 #: Width (pt) of the stroke around every node, and the length (pt) of the dashes of a hatched one
 STROKE_PT, HATCH_PT = 2.0, 3.0
 
-#: Catalogs whose label is written inside the node (large enough), with the text to show
-#: (``None``: the catalog's label)
-INSIDE_LABELS: Dict[str, Optional[str]] = {"desi_dr1": None, "lamost_ddp_dr9": "LAMOST\nDD-Payne\n(DR9)"}
+#: Most lines a label may be folded onto to fit inside its circle.
+MAX_LABEL_LINES = 3
 
 #: Height (data units) that the legend needs, and its width from its left edge
-LEGEND_H, LEGEND_W = 2.9, 1.0
+LEGEND_H, LEGEND_W = 2.8, 1.0
 
 
 def points_per_unit(ax) -> float:
@@ -522,13 +521,54 @@ def edge_clearance(P: np.ndarray, pos: np.ndarray, radii: np.ndarray, edges: np.
     return float(dist.min())
 
 
+def label_variants(text: str) -> Iterator[str]:
+    """The label as given, then folded onto 2, 3, ... lines as evenly as possible.
+
+    Only the spaces are broken, so hyphenated names survive intact; of all the ways to
+    split a line into ``n`` parts, the one with the shortest longest line is taken.
+    """
+    words = text.split()
+    for n_lines in range(1, min(MAX_LABEL_LINES, len(words)) + 1):
+        if n_lines == 1:
+            yield text
+            continue
+        best, best_cost = text, None
+        for cuts in itertools.combinations(range(1, len(words)), n_lines - 1):
+            groups, previous = [], 0
+            for cut in (*cuts, len(words)):
+                groups.append(" ".join(words[previous:cut]))
+                previous = cut
+            cost = max(len(g) for g in groups)
+            if best_cost is None or cost < best_cost:
+                best, best_cost = "\n".join(groups), cost
+        yield best
+
+
+def label_fits(ax, fig, text: str, radius: float, ppu: float, fontsize: float = 8.0) -> bool:
+    """Is the centred label ``text`` entirely inside a circle of ``radius`` data units?
+
+    The corners of the text box are the binding constraint, so this compares half of its
+    diagonal with the radius.
+    """
+    probe = ax.text(0.0, 0.0, text, fontsize=fontsize, ha="center", va="center", linespacing=0.95)
+    box = probe.get_window_extent(fig.canvas.get_renderer())  # pixels
+    probe.remove()
+    return 0.5 * float(np.hypot(box.width, box.height)) <= radius * ppu * fig.dpi / 72.0
+
+
+def fitting_label(ax, fig, text: str, radius: float, ppu: float) -> Optional[str]:
+    """The widest-line variant of ``text`` that fits in the circle, or ``None``."""
+    for candidate in label_variants(text):
+        if label_fits(ax, fig, candidate, radius, ppu):
+            return candidate
+    return None
+
+
 def plot_graph(data: dict, out_base: Path, min_shared: int = 1000, layout: str = "spring", top_k: int = 3,
                n_restarts: int = 300, seed: int = 0, curved: bool = True) -> dict:
     keys, rows = data["keys"], np.asarray(data["rows"], float)
     shared = np.asarray(data["shared"])
     labels = list(data["labels"])
-    # Prepared but not in the model yet: drawn with a dashed ring (see the legend).
-    candidates = {k for k, key in enumerate(keys) if key in registry.candidate_keys()}
     radii = node_radii(rows)
     edges, counts = edge_list(shared, min_shared, top_k)
     s_lo, s_hi = float(max(min(min_shared, counts.min()), 1)), float(shared.max())
@@ -552,65 +592,95 @@ def plot_graph(data: dict, out_base: Path, min_shared: int = 1000, layout: str =
     for e in np.argsort(strength):  # weak edges first, so the strong ones are on top
         ax.plot(*curves[e].T, color=edge_color(strength[e]), lw=lw(strength[e]), alpha=al(strength[e]),
                 solid_capstyle="round", zorder=1)
-    inside = {k for k, key in enumerate(keys) if key in INSIDE_LABELS}
-    texts = []
-    for k, key in enumerate(keys):
-        fill = FAMILY_COLORS.get(family_of(key), "k")
-        ax.add_patch(Circle(pos[k], radii[k], fc=fill, ec="none", zorder=3))
-        if k in inside:  # the label goes inside the circle, in a color that contrasts with it
-            texts.append(ax.text(*pos[k], INSIDE_LABELS[key] or labels[k], fontsize=8, ha="center", va="center",
-                                 color=text_color_on(fill), linespacing=0.95, zorder=5))
-            continue
+    fills = [FAMILY_COLORS.get(family_of(key), "k") for key in keys]
+    for k in range(len(keys)):
+        ax.add_patch(Circle(pos[k], radii[k], fc=fills[k], ec="none", zorder=3))
+
+    inside: Dict[int, str] = {}  # node index -> its label, folded to fit
+    texts = [None] * len(keys)
+
+    def make_label(k: int) -> None:
+        """(Re)create the label of node ``k``: inside its circle if fitted, else outside."""
+        if texts[k] is not None:
+            texts[k].remove()
+        if k in inside:
+            texts[k] = ax.text(*pos[k], inside[k], fontsize=8, ha="center", va="center",
+                               color=text_color_on(fills[k]), linespacing=0.95, zorder=5)
+            return
         out = pos[k] - pos.mean(0)
         out = out / (np.linalg.norm(out) + 1e-9)
-        texts.append(ax.text(*(pos[k] + (radii[k] + 0.03) * out), labels[k], fontsize=8, ha="center", va="center",
-                             zorder=5, path_effects=[pe.withStroke(linewidth=2.5, foreground="white")]))
+        texts[k] = ax.text(*(pos[k] + (radii[k] + 0.03) * out), labels[k], fontsize=8, ha="center", va="center",
+                           zorder=5, path_effects=[pe.withStroke(linewidth=2.5, foreground="white")])
+
+    for k in range(len(keys)):
+        make_label(k)
     strokes = node_strokes(data)
     ax.set_aspect("equal")
     ax.axis("off")
 
-    # The figure is scaled to fit the nodes, the legend and the labels. The labels are placed
-    # inside the bounding box of the nodes where possible, so they should not make the nodes
-    # smaller; if a few stick out, the limits grow to include them, and the labels are placed
-    # again (their size in data units depends on the scale).
-    node_lo, node_hi = pos.min(0), pos.max(0)
-    lo, hi = node_lo.copy(), node_hi.copy()
-    margin, w, ring = 0.04, 0.0, radii
-    for _ in range(5):
-        used_lo, used_hi = lo.copy(), hi.copy()
-        ax.set_xlim(used_lo[0] - margin, used_hi[0] + margin + 0.15 + LEGEND_W)
-        ax.set_ylim(min(used_lo[1] - margin, used_hi[1] + margin - LEGEND_H), used_hi[1] + margin)
-        fig.tight_layout()
-        w = STROKE_PT / points_per_unit(ax)
-        ring = radii + w  # the strokes go outside the circles
-        bbox_lo, bbox_hi = (pos - ring[:, None]).min(0), (pos + ring[:, None]).max(0)
-        preferred = (bbox_lo[0], bbox_lo[1], bbox_hi[0], bbox_hi[1])
-        limit = (bbox_lo[0] - 0.6, bbox_lo[1] - 0.6, bbox_hi[0] + 0.6, bbox_hi[1] + 0.6)
-        boxes = place_labels(fig, ax, texts, pos, ring, skip=inside, preferred=preferred, limit=limit)
-        lo = np.minimum(bbox_lo, np.min([b[:2] for b in boxes], axis=0)) if boxes else bbox_lo
-        hi = np.maximum(bbox_hi, np.max([b[2:] for b in boxes], axis=0)) if boxes else bbox_hi
-        if np.allclose(lo, used_lo, atol=1e-3) and np.allclose(hi, used_hi, atol=1e-3):
+    margin = 0.04
+    lo, hi = pos.min(0), pos.max(0)
+    bbox_lo, bbox_hi = lo, hi
+    boxes, n_out = [], 0
+
+    def fit_limits() -> None:
+        """Scale the axes so that the nodes and the outside labels all fit."""
+        nonlocal lo, hi, bbox_lo, bbox_hi, boxes, n_out
+        lo, hi = pos.min(0), pos.max(0)
+        for _ in range(5):
+            used_lo, used_hi = lo.copy(), hi.copy()
+            ax.set_xlim(used_lo[0] - margin, used_hi[0] + margin + 0.15 + LEGEND_W)
+            ax.set_ylim(min(used_lo[1] - margin, used_hi[1] + margin - LEGEND_H), used_hi[1] + margin)
+            fig.tight_layout()
+            ring = radii + STROKE_PT / points_per_unit(ax)  # the strokes go outside the circles
+            bbox_lo, bbox_hi = (pos - ring[:, None]).min(0), (pos + ring[:, None]).max(0)
+            preferred = (bbox_lo[0], bbox_lo[1], bbox_hi[0], bbox_hi[1])
+            limit = (bbox_lo[0] - 0.6, bbox_lo[1] - 0.6, bbox_hi[0] + 0.6, bbox_hi[1] + 0.6)
+            boxes = place_labels(fig, ax, texts, pos, ring, skip=set(inside), preferred=preferred, limit=limit)
+            lo = np.minimum(bbox_lo, np.min([b[:2] for b in boxes], axis=0)) if boxes else bbox_lo
+            hi = np.maximum(bbox_hi, np.max([b[2:] for b in boxes], axis=0)) if boxes else bbox_hi
+            if np.allclose(lo, used_lo, atol=1e-3) and np.allclose(hi, used_hi, atol=1e-3):
+                break
+        n_out = sum(b[0] < bbox_lo[0] or b[1] < bbox_lo[1] or b[2] > bbox_hi[0] or b[3] > bbox_hi[1] for b in boxes)
+
+    fit_limits()
+
+    # A label goes inside its circle when it fits there, folded onto at most MAX_LABEL_LINES
+    # lines. Moving one inside makes the figure smaller, which draws the circles larger in
+    # points, so repeat until nothing more fits.
+    for _ in range(3):
+        ppu = points_per_unit(ax)
+        moved = {}
+        for k in range(len(keys)):
+            if k in inside:
+                continue
+            fitted = fitting_label(ax, fig, labels[k], radii[k], ppu)
+            if fitted:
+                moved[k] = fitted
+        if not moved:
             break
-    n_out = sum(b[0] < bbox_lo[0] or b[1] < bbox_lo[1] or b[2] > bbox_hi[0] or b[3] > bbox_hi[1] for b in boxes)
-    log.info("%d of %d labels stick out of the bounding box of the nodes", n_out, len(boxes))
+        inside.update(moved)
+        for k in moved:
+            make_label(k)
+        fit_limits()
+    # The limits can grow again (an outside label that had to move), so re-check.
     ppu = points_per_unit(ax)
-    renderer = fig.canvas.get_renderer()
-    for k in inside:  # does the label fit in its circle?
-        bb = texts[k].get_window_extent(renderer)
-        if 0.5 * np.hypot(bb.width, bb.height) > radii[k] * ppu * fig.dpi / 72:
-            log.warning("the label of %s does not fit in its circle", keys[k])
+    unfitted = [k for k in inside if not label_fits(ax, fig, inside[k], radii[k], ppu)]
+    if unfitted:
+        for k in unfitted:
+            del inside[k]
+            make_label(k)
+        fit_limits()
+        ppu = points_per_unit(ax)
+    log.info("%d of %d labels inside their circles", len(inside), len(keys))
+    log.info("%d of %d labels stick out of the bounding box of the nodes", n_out, len(boxes))
     for k in range(len(keys)):
         draw_stroke(ax, pos[k], radii[k], STROKE_PT, ppu, *strokes[k])
-    # Ring just outside the parameter strokes, so it never hides them.
-    ring = 1.9 * STROKE_PT / ppu
-    for k in sorted(candidates):
-        ax.add_patch(Circle(pos[k], radii[k] + ring, fill=False, ec="0.2", lw=0.9,
-                            ls=(0, (2.5, 1.5)), zorder=4))
 
     # Legends, drawn in data units to the right of the graph
     x0, y = hi[0] + margin + 0.15, hi[1] + margin - 0.1
     head = dict(fontsize=9, weight="bold", va="center")
-    ax.text(x0, y, "rows in catalog", **head)
+    ax.text(x0, y, "stars in catalog", **head)
     for ref in (1e3, 1e5, 1e6):
         r = float(node_radii(ref))
         y -= max(r + 0.04, 0.1)
@@ -637,11 +707,6 @@ def plot_graph(data: dict, out_base: Path, min_shared: int = 1000, layout: str =
         ax.add_patch(Circle((x0 + 0.05, y), 0.03, fc="0.6", ec="none", zorder=3))
         draw_stroke(ax, (x0 + 0.05, y), 0.03, STROKE_PT, ppu, param, "all")
         ax.text(x0 + 0.13, y, text, fontsize=8, va="center")
-    if candidates:
-        y -= 0.09
-        ax.add_patch(Circle((x0 + 0.05, y), 0.03, fill=False, ec="0.2", lw=0.9,
-                            ls=(0, (2.5, 1.5)), zorder=3))
-        ax.text(x0 + 0.13, y, "not in the model", fontsize=8, va="center")
     ax.text(x0, y - 0.12, f"edges: >= {min_shared:,} shared stars, or a catalog's top {top_k}", fontsize=7, color="0.3", va="center")
     fig.tight_layout()
     for ext in ("png", "pdf"):
