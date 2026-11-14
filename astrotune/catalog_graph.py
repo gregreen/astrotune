@@ -56,7 +56,7 @@ log = logging.getLogger(__name__)
 
 #: Which spectra a catalog is based on (nodes of one family share a color)
 FAMILIES: Dict[str, Tuple[str, ...]] = {
-    "APOGEE": ("apogee_dr17", "sdssv_aspcap"),
+    "APOGEE": ("apogee_dr17", "sdssv_aspcap", "sdssv_apogeenet"),
     "BOSS": ("sdssv_bossnet", "sdssv_slam", "sdssv_mdc", "sdssv_clam"),
     "LAMOST": (
         "lamost_mrs", "lamost_hotpayne", "lamost_ddp_dr9", "lamost_mstar_ding2022",
