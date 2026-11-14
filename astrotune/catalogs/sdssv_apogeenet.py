@@ -17,10 +17,11 @@ DR20 adds no new APOGEE spectra: this is the ``astra`` 0.6.0 product first
 released with DR19 (the file predates DR20), and it mixes SDSS-IV DR17 ``apStar``
 spectra (``release == "dr17"``, 733,901 rows, the same spectra that feed
 ``apogee_dr17``) with SDSS-V spectra (``release == "sdss5"``, 388,416 rows, the
-same stars as ``sdssv_aspcap``). Expect heavy overlap with both.
-
-About a tenth of the rows are repeat measurements of a star already in the table
-(different spectra, so the project's duplicate-id policy keeps them).
+same stars as ``sdssv_aspcap``). Expect heavy overlap with both: 70.5% of these
+stars are already in one of the two APOGEE catalogs and 275,258 are new, and
+about a tenth of the rows repeat a star already in the table. That overlap is
+the point -- cross-calibrating different reductions of the same spectra -- so
+none of it is deduplicated, here or downstream.
 
 APOGEENet v3 predicts from the spectrum alone -- no photometry, no astrometry --
 so a missing-photometry warning says nothing about the parameters, and in this
@@ -55,8 +56,9 @@ with [Fe/H] 0.10-0.14 dex lower between 5500 and 7000 K; those offsets are real
 structure, not error. The scatter -- which is what ``x_err`` models -- is 1.9-2.7%
 in Teff and 0.06-0.10 dex in [Fe/H] below 7000 K, matching the inherited ``x_err``
 of 0.1 on those axes, but 0.17-0.28 dex in logg (0.218 overall), twice the 0.1
-used here and by both sibling catalogs. That one is left as inherited rather than
-changed unilaterally, since it sets the weight of the catalog in the fit.
+used here. The logg axis is kept at 0.1 on purpose: DESI DR1's 0.2 answers
+catalogue-specific logg trends that APOGEENet does not share, and this catalog's
+value should match the other two APOGEE pipelines it is calibrated against.
 
 APOGEENet has no [alpha/Fe], so this catalog has three parameters.
 """

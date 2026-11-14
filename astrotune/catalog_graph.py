@@ -2,7 +2,9 @@
 
     astrotune-catalog-graph            # -> diagnostic_plots/catalog_graph/
 
-*Nodes* are the catalogs in ``registry.CATALOGS``. The circle's radius grows with
+*Nodes* are the catalogs in ``registry.CATALOGS``, plus any candidate that has been
+prepared; candidates are outlined with a dashed ring, since they are not part of the
+model yet. The circle's radius grows with
 ``log10(number of rows)`` and its color marks the family of spectra the catalog
 is based on. The stroke around a node marks a missing parameter: white if the catalog
 measures all four, one color if it has no [alpha/Fe] and another if it has no logg
@@ -133,7 +135,15 @@ def missing_kind(n_measured: int, n_rows: int) -> str:
 def compute_overlaps(keys: Optional[Sequence[str]] = None) -> dict:
     """Rows, unique stars, the matrix of shared stars and the parameters measured by the
     prepared catalogs."""
-    keys = list(registry.keys() if keys is None else keys)
+    if keys is None:
+        # Prepared candidates are included so that the figure shows the catalog set as it
+        # actually stands; the plot marks them, so they cannot be mistaken for model inputs.
+        keys = [
+            k
+            for k in registry.keys() + registry.candidate_keys()
+            if config.catalog_path(k).exists()
+        ]
+    keys = list(keys)
     rows, ids, measured = [], [], []
     for k in keys:
         table = load_catalog(k)
@@ -330,7 +340,7 @@ STROKE_PT, HATCH_PT = 2.0, 3.0
 INSIDE_LABELS: Dict[str, Optional[str]] = {"desi_dr1": None, "lamost_ddp_dr9": "LAMOST\nDD-Payne\n(DR9)"}
 
 #: Height (data units) that the legend needs, and its width from its left edge
-LEGEND_H, LEGEND_W = 2.8, 1.0
+LEGEND_H, LEGEND_W = 2.9, 1.0
 
 
 def points_per_unit(ax) -> float:
@@ -517,6 +527,8 @@ def plot_graph(data: dict, out_base: Path, min_shared: int = 1000, layout: str =
     keys, rows = data["keys"], np.asarray(data["rows"], float)
     shared = np.asarray(data["shared"])
     labels = list(data["labels"])
+    # Prepared but not in the model yet: drawn with a dashed ring (see the legend).
+    candidates = {k for k, key in enumerate(keys) if key in registry.candidate_keys()}
     radii = node_radii(rows)
     edges, counts = edge_list(shared, min_shared, top_k)
     s_lo, s_hi = float(max(min(min_shared, counts.min()), 1)), float(shared.max())
@@ -589,6 +601,11 @@ def plot_graph(data: dict, out_base: Path, min_shared: int = 1000, layout: str =
             log.warning("the label of %s does not fit in its circle", keys[k])
     for k in range(len(keys)):
         draw_stroke(ax, pos[k], radii[k], STROKE_PT, ppu, *strokes[k])
+    # Ring just outside the parameter strokes, so it never hides them.
+    ring = 1.9 * STROKE_PT / ppu
+    for k in sorted(candidates):
+        ax.add_patch(Circle(pos[k], radii[k] + ring, fill=False, ec="0.2", lw=0.9,
+                            ls=(0, (2.5, 1.5)), zorder=4))
 
     # Legends, drawn in data units to the right of the graph
     x0, y = hi[0] + margin + 0.15, hi[1] + margin - 0.1
@@ -620,6 +637,11 @@ def plot_graph(data: dict, out_base: Path, min_shared: int = 1000, layout: str =
         ax.add_patch(Circle((x0 + 0.05, y), 0.03, fc="0.6", ec="none", zorder=3))
         draw_stroke(ax, (x0 + 0.05, y), 0.03, STROKE_PT, ppu, param, "all")
         ax.text(x0 + 0.13, y, text, fontsize=8, va="center")
+    if candidates:
+        y -= 0.09
+        ax.add_patch(Circle((x0 + 0.05, y), 0.03, fill=False, ec="0.2", lw=0.9,
+                            ls=(0, (2.5, 1.5)), zorder=3))
+        ax.text(x0 + 0.13, y, "not in the model", fontsize=8, va="center")
     ax.text(x0, y - 0.12, f"edges: >= {min_shared:,} shared stars, or a catalog's top {top_k}", fontsize=7, color="0.3", va="center")
     fig.tight_layout()
     for ext in ("png", "pdf"):
