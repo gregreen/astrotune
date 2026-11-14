@@ -123,6 +123,20 @@ METRIC_KEYS = (
     "grad_skip",
 )
 
+#: The subset shown in the progress bar and, one line per step, in the log:
+#: ``(metric key, short name)``. These are the ones worth watching while a run is
+#: going; everything in ``METRIC_KEYS`` (the ``y``-solve diagnostics, the per-layer
+#: gradient norms) is in ``metrics_history.json``.
+BAR_KEYS = (
+    ("loss", "loss"),
+    ("chi2", "chi2"),
+    ("penalty_obs", "plty_o"),
+    ("penalty_ctrl", "plty_c"),
+    ("penalty_div", "plty_d"),
+    ("penalty_l2", "plty_l2"),
+    ("norm", "norm"),
+)
+
 
 def layer_of(variable) -> str:
     """The parameter group a variable belongs to: ``film_0``, ``hidden_2``, ``output``...
@@ -1458,21 +1472,27 @@ class LatentTrainer:
         if threading.current_thread() is threading.main_thread():
             old_handler = signal.signal(signal.SIGTERM, _on_sigterm)
 
+        # The bar and the log carry the values of the step that just finished, not
+        # a rolling mean: a mean cannot be inverted back into the steps it was
+        # taken over, and the thing worth catching -- a burst of hard batches --
+        # is a spike in one step that a mean over 16 turns into a bump of a few
+        # tenths. The postfix is refreshed once per chunk, so every step of the
+        # chunk also gets a line of its own, which makes the log the full record
+        # and leaves smoothing to whoever reads it.
+        logged = len(metrics.get("loss", ()))
+
         def report(step):
-            avg = {k: np.mean(v[-16:]) for k, v in metrics.items() if k != "step_val"}
-            pbar.set_postfix(
-                {
-                    "loss": avg["loss"],
-                    "chi2": avg["chi2"],
-                    "plty_o": avg["penalty_obs"],
-                    "plty_c": avg["penalty_ctrl"],
-                    "plty_d": avg["penalty_div"],
-                    "plty_l2": avg["penalty_l2"],
-                    "norm": avg["norm"],
-                    "lr": float(self.learning_rate(step)),
-                },
-                refresh=False,
-            )
+            nonlocal logged
+            for i in range(logged, len(metrics["loss"])):
+                values = "  ".join(
+                    f"{name} {metrics[key][i]:.4g}"
+                    for key, name in BAR_KEYS
+                    if len(metrics.get(key, ())) > i
+                )
+                pbar.write(f"step {i + 1}  {values}  lr {float(self.learning_rate(i + 1)):.2e}")
+            logged = len(metrics["loss"])
+            last = {name: metrics[key][-1] for key, name in BAR_KEYS if metrics.get(key)}
+            pbar.set_postfix({**last, "lr": float(self.learning_rate(step))}, refresh=True)
 
         # Steps per graph call. A chunk costs one host round trip and is not
         # interruptible, so it is kept near a couple of seconds.
