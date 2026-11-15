@@ -154,8 +154,22 @@ writes to `models/my_run/videos/`, in two planes (`kiel`: Teff-logg;
 `kiel_control_10.mp4` (SDSS-V ASPCAP highlighted) and `kiel_pair_3_10.mp4` (the
 stars shared by GALAH DR4 and ASPCAP, as measured by each; they should
 converge), and the same three as `feh_alpha*.mp4`. Stars whose catalog does
-not measure a plotted parameter are not drawn. Use `--plane`, `--highlight KEY`
-and `--pair KEY KEY` for others.
+not measure a plotted parameter are not drawn.
+
+`--plane` and `--highlight` take a list, and there are `--all-planes` (the four
+below) and `--highlight-all` for everything at once:
+
+```
+astrotune-videos --run-dir models/my_run --plane kiel --highlight apogee_dr17 galah_dr4
+astrotune-videos --run-dir models/my_run --all-planes --highlight-all --all-pairs-min 10000
+```
+
+The training file is the one the run used, read from its `config.json`
+(`observations_path` for a latent-y run, `pairs_path` for a pair-loss run);
+`--data-path` overrides it. Everything that has to be integrated is collected
+first and goes through the ODE in a few large batches (`--batch-size`), so the
+integration is seconds; rendering is what takes the time, at one matplotlib
+frame per frame of video.
 
 Two more, pair-only video types compare the two catalogs parameter by parameter
 (2x2 grid, one panel per parameter; catalog j horizontal, catalog k vertical):
