@@ -79,6 +79,18 @@ def test_diagnostics_are_calibrated_when_the_covariance_is_right():
     assert p["frac_sf"][0] == pytest.approx(0.05, abs=0.015)
 
 
+def test_diagnostics_fill_every_star_across_blocks():
+    """Every block numbers its stars from 0, so the per-star arrays must use the table's
+    index; a single block hides the bug (each block used to overwrite the last)."""
+    s = _synthetic_stars(sigma_true=(0, 0, 0), n_star=2000, n_cat=3)
+    res = dg.entry_stats(s, chunk=600)  # 2000 stars x 3 entries -> 10 blocks
+    assert res["star_dof"].min() > 0  # no star left at the initial zero
+    assert res["star_chi2"].min() > 0
+    pit = stats.chi2.cdf(res["star_chi2"], res["star_dof"])
+    assert pit.shape == (2000,)
+    assert abs(np.median(pit) - 0.5) < 0.04
+
+
 def test_excess_variance_recovers_the_per_catalog_extra():
     s = _synthetic_stars(sigma_true=(0.02, 0.05, 0.1), n_star=8000, k=2)
     res = dg.diagnose(s, 3, None, min_entries=1000)

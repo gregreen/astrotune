@@ -130,13 +130,17 @@ def entry_stats(stars: StarTable, delta_fn: Optional[DeltaFn] = None,
         sd[idx] = np.sqrt(np.where(m, resid_var, np.nan))
         chi2[idx] = quad
         dof[idx] = m.sum(1)
-        star_chi2[seg[0] + np.arange(n)] = np.add.reduceat(quad, starts)
+        # Per-star results go to the table's own star index, not the block's: every
+        # block numbers its stars from 0.
+        gseg = stars["seg"][idx]
+        star_idx = gseg[starts]
+        star_chi2[star_idx] = np.add.reduceat(quad, starts)
         shared = np.add.reduceat(mf, starts, axis=0) > 0  # parameter some entry measures
-        star_dof[seg[0] + np.arange(n)] = np.add.reduceat(m.sum(1), starts) - shared.sum(1)
+        star_dof[star_idx] = np.add.reduceat(m.sum(1), starts) - shared.sum(1)
 
         full = m.all(1) & np.isfinite(resid_var).all(1)
         if full.any():
-            resid_cov = S[full] - Ainv[seg[full]]
+            resid_cov = S[full] - Ainv[gseg[full] - gseg[0]]
             s = np.sqrt(np.maximum(np.diagonal(resid_cov, axis1=1, axis2=2), 1e-300))
             corr_sum += (resid_cov / s[:, :, None] / s[:, None, :]).sum(0)
             corr_n += int(full.sum())
