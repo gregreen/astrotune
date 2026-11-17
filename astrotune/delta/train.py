@@ -16,6 +16,7 @@ needs the cache written by ``astrotune-apply --run-dir models/my_run``. It
     diagnostics/                 calibration of the quoted errors (no delta)
     delta_model.*, delta_model_config.json   the trained network
     evaluation/                  baselines, calibration after the fit, figures
+    kiel/                        per-catalog Kiel maps of the learned variance
 
 Every number in the loss and in the validation metric is **per star**, not per
 pair, so a star in nine catalogs counts once.
@@ -37,6 +38,7 @@ from tqdm.auto import tqdm
 
 from .. import registry
 from .diagnostics import PARAM_NAMES, SF_THRESHOLDS, diagnose, plot_diagnostics, to_json
+from .kiel import make_kiel_figures
 from .stars import N_PARAMS, get_star_table, split
 
 log = logging.getLogger(__name__)
@@ -62,6 +64,9 @@ class DeltaConfig:
     const_learning_rate: float = 0.1
     #: Validation stars used for the NLL (all of them are used for the diagnostics)
     val_max_stars: int = 100_000
+    #: Which rows the per-catalog Kiel maps average over: the training stars
+    #: (``model``), every prepared row (``all``), or nothing (``none``).
+    kiel_sample: str = "model"
 
 
 def _spec(tf):
@@ -264,6 +269,9 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     plot_diagnostics(results["network"], labels, ev_dir, "_network")
     plot_diagnostics(results["none (propagated only)"], labels, ev_dir, "_none")
     plot_learned_delta(net, val, labels, ev_dir / "learned_delta.png")
+    if cfg.kiel_sample != "none":
+        # Where in the Kiel diagram the network adds variance, one 4x4 page per catalog.
+        make_kiel_figures(run_dir, out_dir / "kiel", model=net, sample=cfg.kiel_sample, keys=keys)
     return dict(nll=nll, table=table)
 
 
