@@ -30,12 +30,13 @@ def _table(n_star=400, n_cat=3, seed=0):
     return out
 
 
-def _stub(per_cat):
-    """A delta model that returns one ln-variance per catalog."""
-    ln = tf.constant(np.log(per_cat).astype("f4"))
+def _stub(scales):
+    """A delta model that returns one variance scale per catalog and no additive term."""
+    ln = tf.constant(np.log(scales).astype("f4"))
 
     def model(x, ls, c):
-        return tf.tile(tf.gather(ln, tf.cast(c, tf.int32))[:, None], [1, 4])
+        log_scale = tf.tile(tf.gather(ln, tf.cast(c, tf.int32))[:, None], [1, 4])
+        return log_scale, tf.fill(tf.shape(x), tf.constant(-60.0, tf.float32))
 
     return model
 
@@ -45,28 +46,31 @@ def cube(monkeypatch):
     stars = _table()
     keys = ("a", "b", "c")
     monkeypatch.setattr(kiel, "get_star_table", lambda run_dir, out_dir=None: (stars, keys))
-    per_cat = [1e-3, 1e-2, 4e-3]
-    return kiel.build_kiel_cube("run", model=_stub(per_cat), sample="model",
-                                keys=keys, n_bins=(20, 20)), per_cat
+    scales = [4.0, 1.0, 0.25]  # sigma x2, x1, x0.5
+    return kiel.build_kiel_cube("run", model=_stub(scales), sample="model",
+                                keys=keys, n_bins=(20, 20)), scales
 
 
-def test_cube_recovers_the_known_variance(cube):
-    c, per_cat = cube
-    assert c.value.shape == (3, 4, 4, 20, 20)
-    for k, want in enumerate(per_cat):
-        got = c.value[k, 0][np.isfinite(c.value[k, 0])]
+def test_cube_recovers_the_known_scale(cube):
+    c, scales = cube
+    assert c.log_ratio.shape == (3, 4, 4, 20, 20)
+    assert c.sigma_add.shape == c.log_ratio.shape
+    for k, scale in enumerate(scales):
+        got = c.log_ratio[k, 0][np.isfinite(c.log_ratio[k, 0])]
         assert got.size > 100
-        assert np.allclose(got, want, rtol=1e-5)  # the model's Delta C, exactly
+        assert np.allclose(got, 0.5 * np.log(scale), atol=1e-4)  # ln(sigma_out/sigma_in)
+        add = c.sigma_add[k, 0][np.isfinite(c.sigma_add[k, 0])]
+        assert np.all(add < 1e-6)  # no additive term in the stub
     # the [alpha/Fe] column is empty everywhere: nothing measures it
     assert not c.measures[:, 3].any()
-    assert np.all(~np.isfinite(c.value[:, 3]))
+    assert np.all(~np.isfinite(c.log_ratio[:, 3]))
 
 
 def test_empty_bins_are_masked_and_counts_agree(cube):
     c, _ = cube
-    empty = ~np.isfinite(c.value[0, 0])
+    empty = ~np.isfinite(c.log_ratio[0, 0])
     assert empty.any() and (c.count[0, 0][empty] == 0).all()
-    filled = np.isfinite(c.value[0, 0])
+    filled = np.isfinite(c.log_ratio[0, 0])
     assert (c.count[0, 0][filled] > 0).all()
 
 
@@ -74,7 +78,7 @@ def test_all_parameters_are_carried(cube):
     c, _ = cube
     for p in range(3):  # Teff, [Fe/H], logg are measured by every entry
         assert c.measures[:, p].all()
-        assert np.isfinite(c.value[:, p]).any()
+        assert np.isfinite(c.log_ratio[:, p]).any()
 
 
 def test_the_figure_has_one_layout_and_one_colourbar(cube, tmp_path, monkeypatch):
@@ -93,8 +97,8 @@ def test_the_figure_has_one_layout_and_one_colourbar(cube, tmp_path, monkeypatch
         return real(self, *a, **k)
 
     monkeypatch.setattr(plt.Figure, "savefig", spy)
-    vmin, vmax = kiel._scale(c)
-    path = kiel.plot_catalog_cube(c, 0, "Catalog A", tmp_path / "a.png", vmin, vmax)
+    lim = kiel._ratio_limit(c)
+    path = kiel.plot_catalog_cube(c, 0, "Catalog A", tmp_path / "a.png", -lim, lim)
     assert path.exists() and path.stat().st_size > 0
     assert seen["axes"] == 17  # 16 panels + the colourbar
     assert len(set(map(tuple, seen["xlim"]))) == 1  # identical frame everywhere
@@ -104,6 +108,14 @@ def test_the_figure_has_one_layout_and_one_colourbar(cube, tmp_path, monkeypatch
     lo = [float(label.split("\n")[-1].split("…")[0]) for label in seen["ylabels"]]
     assert lo == sorted(lo, reverse=True), seen["ylabels"]
     assert "-0.25" in seen["ylabels"][0] and "-2.50" in seen["ylabels"][-1]
+
+
+def test_the_additive_page_uses_the_same_layout(cube, tmp_path):
+    c, _ = cube
+    vmin, vmax = kiel._add_scale(c, 0)
+    path = kiel.plot_catalog_cube(c, 0, "Catalog A", tmp_path / "a_add.png",
+                                  vmin, vmax, kind="add")
+    assert path.exists() and path.stat().st_size > 0
 
 
 def test_all_sample_reads_the_prepared_catalogs(monkeypatch):
@@ -130,11 +142,11 @@ def test_all_sample_reads_the_prepared_catalogs(monkeypatch):
         return Table({"id": np.arange(n, dtype="i8") + 1, "x": x, "sigma_x": sigma})
 
     monkeypatch.setattr("astrotune.training_data.load_catalog", fake_catalog)
-    per_cat = [1e-3, 1e-2, 4e-3]
-    c = kiel.build_kiel_cube("run", model=_stub(per_cat), sample="all",
+    scales = [4.0, 1.0, 0.25]
+    c = kiel.build_kiel_cube("run", model=_stub(scales), sample="all",
                              keys=keys, n_bins=(10, 10))
-    for k, want in enumerate(per_cat):
-        got = c.value[k, 0][np.isfinite(c.value[k, 0])]
-        assert got.size > 20 and np.allclose(got, want, rtol=1e-5)
+    for k, scale in enumerate(scales):
+        got = c.log_ratio[k, 0][np.isfinite(c.log_ratio[k, 0])]
+        assert got.size > 20 and np.allclose(got, 0.5 * np.log(scale), atol=1e-4)
     assert not c.measures[:, 3].any()
     assert np.all(seen[keys[0]][:, 3] == 1e9)  # the mask came from sigma_x, as in training

@@ -6,8 +6,9 @@ measured in units of the variance that offset should have:
 
     d_k = y_k - z,     Cov(d_k) = S_k - A^-1,     A = sum_k S_k^-1,
 
-where ``S_k = C_k`` (the propagated covariance) or ``S_k = C_k + diag(delta_k)``
-once a delta model exists. The ``-A^-1`` term is what the star framing adds: ``z``
+where ``S_k = C_k`` (the propagated covariance), or
+``S_k = diag(s_k) C_k diag(s_k) + diag(add_k)`` once a delta model exists. The
+``-A^-1`` term is what the star framing adds: ``z``
 is itself estimated from the entries, so an entry's residual is smaller than its
 own covariance by the covariance of the combined value. This module measures how
 far the entries of a :mod:`star table <astrotune.delta.stars>` are from that:
@@ -69,8 +70,8 @@ log = logging.getLogger(__name__)
 PARAM_NAMES = ("Teff", "[Fe/H]", "logg", "[a/Fe]")
 SF_THRESHOLDS = (0.05, 1e-3, 1e-6)
 
-#: ``delta_fn(x, ln_sigma, catalog) -> (n, 4)`` ln of the added variance
-DeltaFn = Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]
+#: ``delta_fn(x, ln_sigma, catalog) -> (ln_scale, ln_add)``, each ``(n, 4)``
+DeltaFn = Callable[[np.ndarray, np.ndarray, np.ndarray], tuple]
 
 
 def robust_scale(v: np.ndarray) -> float:
@@ -84,6 +85,131 @@ def robust_scale(v: np.ndarray) -> float:
 def _segments(seg: np.ndarray) -> np.ndarray:
     """Start offset of every run of equal ``seg`` (a block holds whole stars)."""
     return np.r_[0, np.flatnonzero(np.diff(seg)) + 1]
+
+
+def _entry_cov(stars: StarTable, idx: np.ndarray,
+               delta_fn: Optional[DeltaFn] = None) -> np.ndarray:
+    """``S = diag(s) C diag(s) + diag(add)`` for the entries ``idx``."""
+    S = stars["C"][idx].astype("f8")
+    if delta_fn is not None:
+        ln_scale, ln_add = delta_fn(stars["x"][idx], stars["ls"][idx], stars["c"][idx])
+        s = np.exp(0.5 * ln_scale.astype("f8"))
+        S = S * s[:, :, None] * s[:, None, :]
+        ii = np.arange(N_PARAMS)
+        S[:, ii, ii] += np.exp(ln_add.astype("f8"))
+    return S
+
+
+def pair_chi2(stars: StarTable, delta_fn: Optional[DeltaFn] = None, chunk: int = 100_000,
+              max_pairs: Optional[int] = None, seed: int = 0) -> Dict[str, np.ndarray]:
+    """``chi2`` of every pair of entries of the same star, one number per pair.
+
+    For two entries of one star the difference ``y_a - y_b`` has covariance
+    ``S_a + S_b`` *exactly* -- the two measurement errors are independent and the
+    star's own value cancels, with no estimated quantity in between -- so on the
+    parameters both entries measure, ``d^T (S_a + S_b)^-1 d`` is a chi-squared
+    variable with ``nu`` degrees of freedom when the covariances are right. That
+    makes this a direct test of the covariance model, independent of how the star's
+    value was combined.
+
+    Unlike the star-level chi2 this is *not* a set of independent statistics: the
+    ``K (K - 1) / 2`` pairs of a star share entries. It is a distributional check
+    (does the histogram match the ideal curve), not a test with a p-value.
+    """
+    ii = np.arange(N_PARAMS)
+    chi2, nu = [], []
+    for idx, seg, n in block_indices(stars, None, chunk):
+        S = _entry_cov(stars, idx, delta_fn)
+        y, m = stars["y"][idx].astype("f8"), stars["m"][idx]
+        counts = np.bincount(seg, minlength=n)
+        starts = np.r_[0, np.cumsum(counts)[:-1]]
+        for k in np.unique(counts):
+            if k < 2:
+                continue
+            st = starts[counts == k]
+            iu, ju = np.triu_indices(int(k), 1)
+            a = (st[:, None] + iu[None, :]).ravel()
+            b = (st[:, None] + ju[None, :]).ravel()
+            both = m[a] & m[b]
+            key = both.dot(1 << ii)
+            for kk in np.unique(key):
+                sel = bool_key(kk)
+                dof = int(sel.sum())
+                if dof == 0:
+                    continue
+                rows = key == kk
+                M = (S[a[rows]] + S[b[rows]])[:, sel][:, :, sel]
+                d = (y[a[rows]] - y[b[rows]])[:, sel]
+                sol = np.linalg.solve(M, d[:, :, None])[:, :, 0]
+                chi2.append(np.einsum("ni,ni->n", d, sol))
+                nu.append(np.full(int(rows.sum()), dof, dtype="i4"))
+        if max_pairs is not None and sum(len(v) for v in chi2) > 4 * max_pairs:
+            break  # a subsample is enough for a distribution; see the docstring
+    out = dict(chi2=np.concatenate(chi2) if chi2 else np.zeros(0),
+               nu=np.concatenate(nu) if nu else np.zeros(0, dtype="i4"))
+    if max_pairs is not None and len(out["chi2"]) > max_pairs:
+        keep = np.random.default_rng(seed).choice(len(out["chi2"]), max_pairs, replace=False)
+        keep.sort()
+        out = {k: v[keep] for k, v in out.items()}
+    return out
+
+
+def bool_key(key: int) -> np.ndarray:
+    """The 4-bool mask encoded in an integer key (inverse of ``mask.dot(1 << i)``)."""
+    return np.array([bool(key >> i & 1) for i in range(N_PARAMS)])
+
+
+def chi2_mixture_pdf(x: np.ndarray, nu: np.ndarray) -> np.ndarray:
+    """Density of the chi-squared distribution, mixed over the observed ``nu`` values.
+
+    A pair that shares 4 parameters and a pair that shares 3 are both chi-squared
+    variables, so the ideal curve of the pooled histogram is the mixture weighted by
+    how many pairs have each ``nu`` -- which is what the catalogs' masks dictate, not
+    a free parameter.
+    """
+    nus, counts = np.unique(nu, return_counts=True)
+    w = counts / max(counts.sum(), 1)
+    return sum(float(wi) * stats.chi2.pdf(x, int(nu_i)) for nu_i, wi in zip(nus, w))
+
+
+def pair_chi2_text(before: Dict[str, np.ndarray], after: Dict[str, np.ndarray]) -> str:
+    """Median and tail fractions of ``chi2 / nu``, quoted errors vs the model."""
+    def line(name, d):
+        r = d["chi2"] / np.maximum(d["nu"], 1)
+        return (f"{name:22s} median chi2/nu {np.median(r):5.2f}   "
+                f"P(chi2 < 1) {np.mean(d['chi2'] < 1):6.2%}   "
+                f"P(chi2 > q99.9) {np.mean(d['chi2'] > stats.chi2.ppf(0.999, np.maximum(d['nu'], 1))):7.3%}"
+                f"   ({len(d['chi2']):,} pairs)")
+
+    return "\n".join([line("quoted errors", before), line("with the delta model", after)])
+
+
+def plot_pair_chi2(before: Dict[str, np.ndarray], after: Dict[str, np.ndarray],
+                   path: Path, title: str = "") -> Path:
+    """Histogram of the pair chi2 before and after the model, against the ideal curve."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hi = float(np.percentile(np.concatenate([before["chi2"], after["chi2"]]), 99.5))
+    hi = max(hi, 10.0)
+    bins = np.linspace(0.0, hi, 120)
+    fig, ax = plt.subplots(figsize=(9, 6), layout="constrained")
+    for d, color, label in ((before, "C0", "quoted errors"),
+                            (after, "C3", "with the learned correction")):
+        ax.hist(d["chi2"], bins=bins, density=True, histtype="step", lw=1.4,
+                color=color, label=f"{label}: median $\\chi^2/\\nu$ = "
+                                   f"{np.median(d['chi2'] / np.maximum(d['nu'], 1)):.2f}")
+    x = np.linspace(0.0, hi, 800)
+    ax.plot(x, chi2_mixture_pdf(x, after["nu"]), "k--", lw=1.2, label="ideal (mixture over $\\nu$)")
+    ax.set_yscale("log")
+    ax.set_ylim(1e-6, None)
+    ax.set(xlabel=r"$\chi^2$ of the difference of two observations of one star",
+           ylabel="density per bin (log scale)")
+    ax.set_title(title or "pair chi2, before and after the correction", fontsize=10)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.2)
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
 
 
 def entry_stats(stars: StarTable, delta_fn: Optional[DeltaFn] = None,
@@ -111,7 +237,11 @@ def entry_stats(stars: StarTable, delta_fn: Optional[DeltaFn] = None,
         mf = m.astype("f8")
         S = stars["C"][idx].astype("f8")
         if delta_fn is not None:
-            S[:, ii, ii] += np.exp(delta_fn(stars["x"][idx], stars["ls"][idx], stars["c"][idx]).astype("f8"))
+            ln_scale, ln_add = delta_fn(stars["x"][idx], stars["ls"][idx], stars["c"][idx])
+            # S_ij = s_i C_ij s_j + delta_ij add_i, the congruence of the covariance
+            s = np.exp(0.5 * ln_scale.astype("f8"))
+            S = S * s[:, :, None] * s[:, None, :]
+            S[:, ii, ii] += np.exp(ln_add.astype("f8"))
         Sinv = np.linalg.inv(S)
         starts = _segments(seg)
 
@@ -204,6 +334,27 @@ def three_cornered_hat(stars: StarTable, n_cat: int, min_pairs: int = 200) -> np
     return out
 
 
+def single_partner_share(stars: StarTable, n_cat: int) -> np.ndarray:
+    """Share of each catalog's entries whose star is seen by only one other catalog.
+
+    Such stars pin the *combination* of the two catalogs' error models, not each
+    separately, so a catalog with a high share is weakly identified on its own:
+    ``sdssv_mdc`` on the 20-catalog run has 98 % (almost all of it paired with
+    ``sdssv_apogeenet``), which is why its fitted correction should be read as a
+    difference from that catalog and not as an absolute statement.
+    """
+    n_entry = stars["n_entry"]
+    star = np.repeat(np.arange(len(n_entry)), n_entry)
+    only_two = (n_entry == 2)[star]
+    c = stars["c"]
+    out = np.full(n_cat, np.nan)
+    for k in range(n_cat):
+        sel = c == k
+        if sel.any():
+            out[k] = float(only_two[sel].mean())
+    return out
+
+
 def summarize(stars: StarTable, st: Dict[str, np.ndarray], n_cat: int,
               min_entries: int = 1000) -> dict:
     """All the calibration statistics in one dictionary (JSON-friendly after ``to_json``)."""
@@ -212,11 +363,13 @@ def summarize(stars: StarTable, st: Dict[str, np.ndarray], n_cat: int,
 
     # Per catalog and parameter
     excess = three_cornered_hat(stars, n_cat, min_pairs=max(min_entries // 4, 20))
+    alone = single_partner_share(stars, n_cat)
     per_catalog = []
     for k in range(n_cat):
         in_cat = c == k
         row = dict(catalog=k, n=int(in_cat.sum()), scale_ratio=np.full(N_PARAMS, np.nan),
-                   beyond3=np.full(N_PARAMS, np.nan), excess=excess[k])
+                   beyond3=np.full(N_PARAMS, np.nan), excess=excess[k],
+                   single_partner=float(alone[k]))
         for p in range(N_PARAMS):
             sel = in_cat & m[:, p]
             if sel.sum() < min_entries:
@@ -290,13 +443,14 @@ def format_summary(res: dict, labels: Sequence[str], n_worst: int = 12) -> str:
         "|z| > 3 (0.27% if Gaussian):   " + "  ".join(f"{n} {r:.2%}" for n, r in zip(PARAM_NAMES, p["beyond3"])),
         "",
         f"{'catalog':26s}" + "".join(f"{n:>9s}" for n in PARAM_NAMES)
-        + "".join(f"{'ex ' + n:>12s}" for n in PARAM_NAMES),
+        + "".join(f"{'ex ' + n:>12s}" for n in PARAM_NAMES) + f"{'1-partner':>11s}",
     ]
     for row in res["per_catalog"]:
         lines.append(
             f"{labels[row['catalog']][:26]:26s}"
             + "".join(f"{r:9.2f}" for r in row["scale_ratio"])
             + "".join(f"{np.sqrt(max(e, 0.0)):12.3f}" for e in row["excess"])
+            + f"{row.get('single_partner', float('nan')):11.0%}"
         )
     worst = []
     for row in res["per_catalog"]:
@@ -386,6 +540,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--out-dir", type=Path, default=None, help="default: <run-dir>/delta")
     parser.add_argument("--min-entries", type=int, default=1000)
     parser.add_argument("--rebuild", action="store_true", help="rebuild the star table")
+    parser.add_argument("--model", action="store_true",
+                        help="also compare the pair chi2 with and without the saved delta model")
+    parser.add_argument("--max-pairs", type=int, default=None,
+                        help="subsample this many pairs for the chi2 distribution")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -395,6 +553,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     res = diagnose(stars, len(keys), None, args.min_entries)
     write_diagnostics(res, labels, out_dir / "diagnostics")
     print(format_summary(res, labels))
+    if args.model:
+        from .model import load_delta_model, numpy_delta_fn
+
+        model = load_delta_model(out_dir, keys=keys)
+        log.info("pair chi2: quoted errors")
+        before = pair_chi2(stars, None, max_pairs=args.max_pairs)
+        log.info("pair chi2: with the saved delta model")
+        after = pair_chi2(stars, numpy_delta_fn(model), max_pairs=args.max_pairs)
+        text = pair_chi2_text(before, after)
+        print(text)
+        (out_dir / "diagnostics" / "pair_chi2.txt").write_text(text + "\n")
+        plot_pair_chi2(before, after, out_dir / "diagnostics" / "pair_chi2.png",
+                       title="pair chi2 before and after the learned correction")
     return 0
 
 

@@ -123,6 +123,57 @@ def test_diagnostics_handle_unmeasured_parameters():
     assert abs(np.median(pit) - 0.5) < 0.04
 
 
+def test_pair_chi2_is_calibrated_when_the_covariance_is_right():
+    s = _synthetic_stars(n_star=4000, sigma_true=(0, 0, 0), n_cat=3)
+    r = dg.pair_chi2(s, None)
+    assert r["chi2"].size == 3 * 4000  # 3 pairs per three-entry star
+    assert np.all(r["nu"] == 4)  # every entry measures all four parameters
+    assert np.median(r["chi2"]) == pytest.approx(stats.chi2.median(4), rel=0.06)
+
+
+def test_pair_chi2_rejects_a_quoted_error_that_is_half_the_truth():
+    """Every catalog reports sigma but really scatters by 2 sigma: chi2 quadruples."""
+    from astrotune.delta.model import fixed_delta
+
+    extra = np.sqrt(3.0) * 0.03  # sqrt(0.03^2 + extra^2) = 2 x 0.03
+    s = _synthetic_stars(n_star=4000, sigma_true=(extra, extra), n_cat=2)
+    bad = dg.pair_chi2(s, None)
+    assert np.median(bad["chi2"]) == pytest.approx(4 * stats.chi2.median(4), rel=0.10)
+    # the additive term that fixes it exactly (as a numpy callable)
+    from astrotune.delta.model import fixed_delta
+
+    inner = fixed_delta(extra)
+
+    def good_fn(x, ln_sigma, c):
+        a, b = inner(tf.constant(x), tf.constant(ln_sigma), tf.constant(c, tf.int32))
+        return a.numpy(), b.numpy()
+
+    good = dg.pair_chi2(s, good_fn)
+    assert np.median(good["chi2"]) == pytest.approx(stats.chi2.median(4), rel=0.08)
+
+
+def test_pair_chi2_counts_only_the_parameters_both_entries_share():
+    s = _synthetic_stars(sigma_true=(0, 0, 0), n_star=200, n_cat=2)
+    s["m"][1::2, 3] = False  # every second entry has no [alpha/Fe]
+    s["C"][1::2, 3, :] = 0.0
+    s["C"][1::2, :, 3] = 0.0
+    s["C"][1::2, 3, 3] = 1e9
+    r = dg.pair_chi2(s, None)
+    assert np.all(r["nu"] == 3)
+    assert np.median(r["chi2"]) == pytest.approx(stats.chi2.median(3), rel=0.12)
+
+
+def test_the_ideal_curve_is_a_normalised_mixture():
+    from astrotune.delta.diagnostics import chi2_mixture_pdf
+
+    nu = np.array([3] * 3 + [4] * 7)
+    x = np.linspace(0, 60, 3001)
+    assert np.trapz(chi2_mixture_pdf(x, nu), x) == pytest.approx(1.0, rel=2e-3)
+    # 70 % of the pairs share all four parameters, so the mixture follows chi2_4 there
+    assert chi2_mixture_pdf(np.array([3.357]), nu)[0] == pytest.approx(
+        0.7 * stats.chi2.pdf(3.357, 4) + 0.3 * stats.chi2.pdf(3.357, 3), rel=1e-6)
+
+
 tf = pytest.importorskip("tensorflow")
 
 
@@ -204,7 +255,7 @@ def test_constant_model_recovers_the_true_extra_variance():
     from astrotune.delta.train import DeltaConfig, fit
 
     s = _synthetic_stars(sigma_true=(0.02, 0.05, 0.1), n_star=20000)
-    cfg = DeltaConfig(batch_size=8192, prior_weight=0.0, l2_weights=0.0)
+    cfg = DeltaConfig(batch_size=8192, prior_weight=0.0, l2_weights=0.0, n_control=0)
     m = ConstDelta(3)
     fit(m, s, cfg, epochs=40, lr=0.2, desc="test")  # flat split direction: many steps
     sig = np.exp(0.5 * m.raw.numpy())  # (3, 4)
@@ -213,20 +264,27 @@ def test_constant_model_recovers_the_true_extra_variance():
 
 def test_prior_is_applied_once_per_entry():
     """The pair version charged the prior K-1 times for the same entry."""
-    from astrotune.delta.model import PRIOR_MEAN, prior_penalty
+    from astrotune.delta.model import LN_MIN, PRIOR_ADD_SD, PRIOR_SCALE_SD, prior_penalty
 
     s = _synthetic_stars(n_star=5, n_cat=3)
-    la = tf.constant(np.full((15, 4), PRIOR_MEAN + 3.0), tf.float32)
-    pen = float(prior_penalty(_batch(s), la).numpy())
-    assert pen == pytest.approx(0.5, rel=1e-5)  # one sigma^2 per measured parameter
+    zero = tf.zeros((15, 4), tf.float32)
+    one_sigma_up = tf.fill((15, 4), LN_MIN + float(PRIOR_ADD_SD))
+    pen = float(prior_penalty(_batch(s), (zero, one_sigma_up)).numpy())
+    assert pen == pytest.approx(0.5, rel=1e-5)  # one z^2, once per measured parameter
+    pen_scale = float(prior_penalty(_batch(s), (tf.fill((15, 4), 2.0 * PRIOR_SCALE_SD),
+                                              tf.fill((15, 4), LN_MIN))).numpy())
+    assert pen_scale == pytest.approx(2.0, rel=1e-5)  # (2 sigma)^2 / 2, add term at rest
+    at_rest = float(prior_penalty(_batch(s), (zero, tf.fill((15, 4), LN_MIN))).numpy())
+    assert at_rest == pytest.approx(0.0, abs=1e-6)  # scale 1 and add on the floor
 
 
 def test_delta_model_refuses_a_different_catalog_list(tmp_path):
-    from astrotune.delta.model import DeltaNetwork, load_delta_model, save_delta_model
+    from astrotune.delta.model import ScaleAddNetwork, load_delta_model, save_delta_model
 
-    net = DeltaNetwork(3)
+    net = ScaleAddNetwork(3)
     save_delta_model(tmp_path, net, dict(n_cat=3, hidden_size=64, n_hidden=3,
-                                         keys=["a", "b", "c"], config={}))
+                                         keys=["a", "b", "c"], model_type="scale_add",
+                                         config={}))
     load_delta_model(tmp_path, keys=["a", "b", "c"])
     with pytest.raises(ValueError):
         load_delta_model(tmp_path, keys=["a", "b", "d"])

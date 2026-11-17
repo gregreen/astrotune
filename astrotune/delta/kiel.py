@@ -1,15 +1,24 @@
-"""Where the learned extra variance sits in the Kiel diagram, per catalog.
+"""Where the learned correction sits in the Kiel diagram, per catalog.
 
-One figure per catalog, a 4x4 grid: a column per parameter (the variance the model
-adds for Teff, [Fe/H], logg and [alpha/Fe]), a row per [Fe/H] bin -- metal-rich at
-the top and metal-poor at the bottom, so [Fe/H] descends down the figure like the
-luminosity does in a Kiel diagram. Inside each panel a Kiel projection (5 ln
-Teff/5000 K against logg) is coloured by the median of ``Delta C`` -- the learned
-extra *variance*, in harmonized units squared -- in that (Teff, logg) bin.
+One figure per catalog, a 4x4 grid: a column per parameter (Teff, [Fe/H], logg,
+[alpha/Fe]), a row per [Fe/H] bin -- metal-rich at the top and metal-poor at the
+bottom, so [Fe/H] descends down the figure like the luminosity does in a Kiel
+diagram. Inside each panel a Kiel projection (5 ln Teff/5000 K against logg) is
+coloured by the model's correction, twice over:
 
-The model is a function of a single entry (``ln_delta_cov(x, ln sigma_x, catalog)``),
-so it can be evaluated on any prepared catalog row; the question is only which rows
-to show:
+``<key>.png``
+    ``ln(sigma_out / sigma_in)`` = ``0.5 ln(scale + add/C)``, the dimensionless
+    inflation of the quoted error: 0 is "left alone" (grey), negative is "shrunk"
+    (red) and positive is "widened" (blue), the astronomical sense of the colour.
+    It is directly comparable between catalogs of different precision.
+``<key>_add.png``
+    the additive sigma on its own, in harmonized units -- the quantity that behaves
+    like the old ``Delta C``, and the one that says where a fixed floor is not
+    enough.
+
+The model is a function of a single entry (``(theta, catalog) -> ln_scale,
+ln_add``), so it can be evaluated on any prepared catalog row; the question is only
+which rows to show:
 
 ``sample="model"`` (default)
     the entries of the star table: stars that at least two catalogs observe, which
@@ -49,7 +58,7 @@ if not os.environ.get("DISPLAY"):  # headless by default
     matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
+from matplotlib.colors import LogNorm, TwoSlopeNorm
 from matplotlib.ticker import FuncFormatter
 
 from .. import registry
@@ -65,19 +74,26 @@ FEH_EDGES = np.array([-2.5, -1.75, -1.0, -0.25, 0.5])
 #: Which of the four parameters each column shows, in the order of ``PARAM_NAMES``
 COLUMNS = tuple(range(N_PARAMS))
 
-#: The variance that stands for "nothing is added" (the model's smooth floor)
-DC_MIN = float(np.exp(LN_MIN))
+#: The additive sigma that stands for "nothing is added" (the model's smooth floor)
+ADD_MIN = float(np.exp(0.5 * LN_MIN))
 
 
 @dataclass
 class KielCube:
-    """Median ``Delta C`` per catalog, parameter, [Fe/H] row and Kiel pixel."""
+    """Per catalog, parameter, [Fe/H] row and Kiel pixel: the two corrections.
+
+    ``log_ratio`` is the median of ``ln(sigma_out / sigma_in)`` = the dimensionless
+    inflation of the quoted error, which is what the merge sees (0 = unchanged,
+    negative = shrunk); ``sigma_add`` is the median additive term on its own, in
+    harmonized units, which is the quantity that behaves like the old ``Delta C``.
+    """
 
     teff_edges: np.ndarray
     logg_edges: np.ndarray
     feh_edges: np.ndarray
     #: ``(n_cat, 4, n_feh, n_teff, n_logg)``; NaN where a bin has no entries
-    value: np.ndarray
+    log_ratio: np.ndarray
+    sigma_add: np.ndarray
     #: entries per bin, same shape
     count: np.ndarray
     #: ``(n_cat, 4)``: does this catalog measure that parameter at all
@@ -88,6 +104,13 @@ class KielCube:
     def limits(self) -> Tuple[Tuple[float, float], Tuple[float, float]]:
         return ((self.teff_edges[0], self.teff_edges[-1]),
                 (self.logg_edges[0], self.logg_edges[-1]))
+
+    def values(self, kind: str) -> np.ndarray:
+        if kind == "ratio":
+            return self.log_ratio
+        if kind == "add":
+            return self.sigma_add
+        raise ValueError(f"unknown kind {kind!r}: use 'ratio' or 'add'")
 
 
 def _entries(run_dir: Path, sample: str, keys: Sequence[str], out_dir: Optional[Path]):
@@ -144,7 +167,8 @@ def build_kiel_cube(run_dir, model=None, sample: str = "model", keys=None,
 
     n_feh = len(FEH_EDGES) - 1
     shape = (N_PARAMS, n_feh, len(teff_edges) - 1, len(logg_edges) - 1)
-    value = np.full((n_cat,) + shape, np.nan, dtype="f4")
+    log_ratio = np.full((n_cat,) + shape, np.nan, dtype="f4")
+    sigma_add = np.full((n_cat,) + shape, np.nan, dtype="f4")
     count = np.zeros((n_cat,) + shape, dtype="i4")
     measures = np.zeros((n_cat, N_PARAMS), dtype=bool)
 
@@ -156,7 +180,11 @@ def build_kiel_cube(run_dir, model=None, sample: str = "model", keys=None,
             log.warning("%s: no entry measures Teff, logg and [Fe/H]; skipped",
                         registry.get_spec(keys[k]).label)
             continue
-        dc = np.exp(delta_fn(x, ls, np.full(len(x), k, dtype="i4")))  # (n, 4) variance
+        ln_scale, ln_add = delta_fn(x, ls, np.full(len(x), k, dtype="i4"))
+        # sigma_out / sigma_in, per parameter: 1 means the quoted error is left alone
+        var = np.exp(ln_scale.astype("f8")) + np.exp(ln_add.astype("f8")) / np.exp(2.0 * ls.astype("f8"))
+        lr = 0.5 * np.log(np.maximum(var, 1e-300))
+        sa = np.exp(0.5 * ln_add.astype("f8"))
         for p in range(N_PARAMS):
             sel = base & measured[:, p]
             if sel.sum() < 10:
@@ -165,35 +193,47 @@ def build_kiel_cube(run_dir, model=None, sample: str = "model", keys=None,
             sample3 = np.stack([x[sel, 0], x[sel, 2], x[sel, 1]], axis=1)  # Teff, logg, [Fe/H]
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)  # empty bins -> NaN
-                stat, _, _ = binned_statistic_dd(
-                    sample3, dc[sel, p], statistic="median",
-                    bins=[teff_edges, logg_edges, FEH_EDGES],
-                )
+                for dest, arr in ((log_ratio, lr), (sigma_add, sa)):
+                    stat, _, _ = binned_statistic_dd(
+                        sample3, arr[sel, p], statistic="median",
+                        bins=[teff_edges, logg_edges, FEH_EDGES],
+                    )
+                    dest[k, p] = np.moveaxis(stat, -1, 0).astype("f4")  # ([Fe/H], Teff, logg)
                 n, _, _ = binned_statistic_dd(
-                    sample3, dc[sel, p], statistic="count",
+                    sample3, lr[sel, p], statistic="count",
                     bins=[teff_edges, logg_edges, FEH_EDGES],
                 )
-            value[k, p] = np.moveaxis(stat, -1, 0).astype("f4")   # ([Fe/H], Teff, logg)
             count[k, p] = np.moveaxis(n, -1, 0).astype("i4")
 
-    return KielCube(teff_edges, logg_edges, FEH_EDGES.copy(), value, count, measures,
-                    keys, sample)
+    return KielCube(teff_edges, logg_edges, FEH_EDGES.copy(), log_ratio, sigma_add,
+                    count, measures, keys, sample)
+
+
+def _ratio_limit(cube: KielCube, k: Optional[int] = None, percentile: float = 99.5) -> float:
+    """Symmetric colour limit for ``ln(sigma_out/sigma_in)``.
+
+    Centred on 0 (no change) by construction, so the diverging palette is honest;
+    the limit is a high percentile of ``|value|`` so a few bins cannot flatten it.
+    """
+    v = cube.log_ratio if k is None else cube.log_ratio[k]
+    v = v[np.isfinite(v)]
+    lim = float(np.percentile(np.abs(v), percentile)) if v.size else 0.1
+    return max(lim, 0.05)
+
+
+def _add_scale(cube: KielCube, k: Optional[int] = None,
+               percentile: float = 99.5) -> Tuple[float, float]:
+    """Colour limits for the additive sigma: from the floor to a high percentile."""
+    v = cube.sigma_add if k is None else cube.sigma_add[k]
+    v = v[np.isfinite(v)]
+    vmax = float(np.percentile(v, percentile)) if v.size else 2 * ADD_MIN
+    return ADD_MIN, max(vmax, 2 * ADD_MIN)
 
 
 def _scale(cube: KielCube, k: Optional[int] = None,
            percentile: float = 99.5) -> Tuple[float, float]:
-    """Colour limits for one catalog (``k``) or for the whole cube (``k=None``).
-
-    ``vmin`` is always the floor the model can return, so the darkest colour means
-    "the model adds nothing here"; ``vmax`` is a high percentile, so a handful of
-    outlier bins cannot flatten the palette. The medians span three decades across
-    catalogs (APOGEE 4e-5, Pristine 5e-2), which is why a per-catalog ``vmax`` is
-    the default: on a shared scale the quiet catalogs collapse onto the floor.
-    """
-    v = cube.value if k is None else cube.value[k]
-    v = v[np.isfinite(v)]
-    vmax = float(np.percentile(v, percentile)) if v.size else 1e-2
-    return DC_MIN, max(vmax, 2 * DC_MIN)
+    """Backwards-compatible alias for the additive colour limits."""
+    return _add_scale(cube, k, percentile)
 
 
 def _tick(v: float, _pos=None) -> str:
@@ -203,11 +243,28 @@ def _tick(v: float, _pos=None) -> str:
 
 def plot_catalog_cube(cube: KielCube, k: int, label: str, path: Path,
                       vmin: float, vmax: float, min_count: int = 1,
-                      dpi: int = 120) -> Path:
-    """One catalog: 4x4 panels, a single colourbar, a fixed layout."""
+                      dpi: int = 120, kind: str = "ratio") -> Path:
+    """One catalog: 4x4 panels, a single colourbar, a fixed layout.
+
+    ``kind="ratio"`` draws ``ln(sigma_out/sigma_in)`` on a diverging palette centred
+    on 0; ``kind="add"`` draws the additive sigma on a log palette starting at the
+    floor. The axes, rows, titles and layout are identical, so the two pages of a
+    catalog line up panel for panel.
+    """
     (teff_lo, teff_hi), (logg_lo, logg_hi) = cube.limits()
     extent = (teff_lo, teff_hi, logg_lo, logg_hi)
-    norm = LogNorm(vmin=vmin, vmax=vmax)
+    values = cube.values(kind)
+    if kind == "ratio":
+        norm = TwoSlopeNorm(vcenter=0.0, vmin=-abs(vmin), vmax=abs(vmax))
+        # coolwarm_r: blue for a larger error (the astronomical direction, as in
+        # blueshift), red for a smaller one, and a grey neutral at zero so that
+        # "unchanged" cannot be confused with the white "no data" mask.
+        cmap, cbar_label = "coolwarm_r", r"$\ln(\sigma_{\rm out}/\sigma_{\rm in})$"
+        title = f"{label}: learned error inflation ({cube.sample} sample)"
+    else:
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+        cmap, cbar_label = "turbo", r"$\sigma_{\rm add}$ (harmonized units)"
+        title = f"{label}: learned additive error ({cube.sample} sample)"
 
     fig = plt.figure(figsize=(13.5, 12.0))
     margins = dict(left=0.085, right=0.885, bottom=0.055, top=0.925,
@@ -221,7 +278,7 @@ def plot_catalog_cube(cube: KielCube, k: int, label: str, path: Path,
         feh = n_feh - 1 - row  # [Fe/H] descends down the figure: metal-rich on top
         for col in range(len(COLUMNS)):
             ax = fig.add_subplot(gs[row, col])
-            img = cube.value[k, col, feh].T  # rows = logg, columns = Teff
+            img = values[k, col, feh].T  # rows = logg, columns = Teff
             img = np.ma.masked_invalid(img)
             img = np.ma.masked_where(cube.count[k, col, feh].T < min_count, img)
             if img.mask.all():
@@ -231,7 +288,7 @@ def plot_catalog_cube(cube: KielCube, k: int, label: str, path: Path,
                 ax.text(0.5, 0.5, note, ha="center", va="center",
                         transform=ax.transAxes, color="0.6", fontsize=8)
             im = ax.imshow(img, origin="lower", extent=extent, aspect="auto",
-                           cmap="turbo", norm=norm, interpolation="nearest")
+                           cmap=cmap, norm=norm, interpolation="nearest")
             ax.set_xlim(teff_hi, teff_lo)  # hot to the left, like the video planes
             ax.set_ylim(logg_hi, logg_lo)
             ax.xaxis.set_major_formatter(FuncFormatter(_tick))
@@ -250,9 +307,9 @@ def plot_catalog_cube(cube: KielCube, k: int, label: str, path: Path,
 
     cax = fig.add_axes([0.905, 0.10, 0.018, 0.80])
     cb = fig.colorbar(im, cax=cax)
-    cb.set_label(r"median $\Delta C$ (harmonized units$^2$)", fontsize=9)
+    cb.set_label(cbar_label, fontsize=9)
     cb.ax.tick_params(labelsize=7)
-    fig.suptitle(f"{label}: learned extra variance ({cube.sample} sample)", fontsize=11)
+    fig.suptitle(title, fontsize=11)
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,21 +322,28 @@ def make_kiel_figures(run_dir, out_dir=None, model=None, sample: str = "model",
                       keys=None, n_bins: Tuple[int, int] = (80, 70),
                       batch_size: int = 262144, min_count: int = 1,
                       scale: str = "catalog", dpi: int = 120) -> List[Path]:
-    """Build the cube and draw one figure per catalog; returns the paths."""
+    """Build the cube and draw two pages per catalog; returns the paths."""
     run_dir = Path(run_dir)
     delta_dir = run_dir / "delta"
     out_dir = Path(out_dir) if out_dir else delta_dir / "kiel"
     out_dir.mkdir(parents=True, exist_ok=True)
     cube = build_kiel_cube(run_dir, model, sample, keys, n_bins, batch_size, delta_dir)
-    global_vmax = _scale(cube)[1]
-    scales = {key: _scale(cube, None if scale == "global" else k)
-              for k, key in enumerate(cube.keys)}
+    ratio_global = _ratio_limit(cube)
+    add_global = _add_scale(cube)[1]
+    limits = {}
+    for k, key in enumerate(cube.keys):
+        if scale == "global":
+            limits[key] = (_ratio_limit(cube), add_global)
+        else:
+            limits[key] = (_ratio_limit(cube, k), _add_scale(cube, k)[1])
     json.dump(dict(sample=sample, keys=list(cube.keys), scale=scale,
                    teff_edges=cube.teff_edges.tolist(), logg_edges=cube.logg_edges.tolist(),
-                   feh_edges=cube.feh_edges.tolist(), global_vmax=global_vmax,
-                   vmax={key: v[1] for key, v in scales.items()}),
+                   feh_edges=cube.feh_edges.tolist(),
+                   ratio_limit_global=ratio_global, add_vmax_global=add_global,
+                   limits={key: list(v) for key, v in limits.items()}),
               open(out_dir / "kiel_cube.json", "w"), indent=1)
-    np.savez_compressed(out_dir / "kiel_cube.npz", value=cube.value, count=cube.count,
+    np.savez_compressed(out_dir / "kiel_cube.npz", log_ratio=cube.log_ratio,
+                        sigma_add=cube.sigma_add, count=cube.count,
                         measures=cube.measures, teff_edges=cube.teff_edges,
                         logg_edges=cube.logg_edges, feh_edges=cube.feh_edges)
     paths = []
@@ -287,12 +351,15 @@ def make_kiel_figures(run_dir, out_dir=None, model=None, sample: str = "model",
         if not cube.measures[k].any():
             log.warning("%s: nothing to plot", registry.get_spec(key).label)
             continue
-        vmin, vmax = scales[key]
-        paths.append(plot_catalog_cube(
-            cube, k, registry.get_spec(key).label,
-            out_dir / f"{key}.png", vmin, vmax, min_count, dpi,
-        ))
-        log.info("Wrote %s", paths[-1])
+        ratio_lim, add_max = limits[key]
+        label = registry.get_spec(key).label
+        for kind, vmin, vmax, suffix in (("ratio", -ratio_lim, ratio_lim, ""),
+                                         ("add", ADD_MIN, add_max, "_add")):
+            paths.append(plot_catalog_cube(
+                cube, k, label, out_dir / f"{key}{suffix}.png", vmin, vmax,
+                min_count, dpi, kind=kind,
+            ))
+        log.info("Wrote %s", out_dir / f"{key}.png")
     return paths
 
 

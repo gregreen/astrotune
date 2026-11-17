@@ -67,6 +67,13 @@ class DeltaConfig:
     #: Which rows the per-catalog Kiel maps average over: the training stars
     #: (``model``), every prepared row (``all``), or nothing (``none``).
     kiel_sample: str = "model"
+    #: Dispersed points per catalog at which the model is nudged to scale 1, add 0.
+    #: They are the prior away from the data: 0 switches them off.
+    n_control: int = 1024
+    control_weight: float = 0.01
+    #: Pair chi2 distribution of the validation stars, before and after the fit
+    pair_chi2: bool = True
+    pair_chi2_max: Optional[int] = 2_000_000
 
 
 def _spec(tf):
@@ -108,12 +115,12 @@ def _first_stars(stars, n_star: int):
 
 
 def fit(model, stars, cfg: DeltaConfig, epochs: int, lr: float, val=None,
-        desc: str = "training") -> list:
-    """Minimise the star NLL (+ prior) with Adam and a cosine schedule; returns the history."""
+        desc: str = "training", control: Optional[dict] = None) -> list:
+    """Minimise the star NLL (+ priors) with Adam and a cosine schedule; returns the history."""
     import tensorflow as tf
     from tensorflow import keras
 
-    from .model import l2_penalty, make_batch, prior_penalty, star_nll
+    from .model import control_penalty, l2_penalty, make_batch, prior_penalty, star_nll
     from .stars import block_indices
 
     rng = np.random.default_rng(cfg.seed)
@@ -126,10 +133,14 @@ def fit(model, stars, cfg: DeltaConfig, epochs: int, lr: float, val=None,
     @tf.function(input_signature=[_spec(tf)])
     def step(batch):
         with tf.GradientTape() as tape:
-            nll, la = star_nll(batch, model)
+            nll, params = star_nll(batch, model)
             data = tf.reduce_mean(nll)
-            prior = cfg.prior_weight * prior_penalty(batch, la)
+            prior = cfg.prior_weight * prior_penalty(batch, params)
             loss = data + tf.cast(prior, tf.float64) + tf.cast(cfg.l2_weights * l2_penalty(model), tf.float64)
+            if control is not None and cfg.control_weight:
+                # Away from the data the model is pulled to scale 1, add 0: the same
+                # prior, evaluated on points the likelihood never sees.
+                loss += tf.cast(cfg.control_weight * control_penalty(control, model), tf.float64)
         grads = tape.gradient(loss, variables)
         grads, _ = tf.clip_by_global_norm(grads, cfg.clip_norm)
         opt.apply_gradients(zip(grads, variables))
@@ -152,7 +163,13 @@ def fit(model, stars, cfg: DeltaConfig, epochs: int, lr: float, val=None,
 
 
 def plot_learned_delta(model, stars, labels: Sequence[str], path: Path) -> Path:
-    """Median sigma_delta (harmonized units) in bins of the catalog's own Teff coordinate."""
+    """Median effective error inflation against the catalog's own Teff coordinate.
+
+    The y axis is ``sigma_out / sigma_in = sqrt(scale + add/C)``: 1 means the quoted
+    error is left alone, below 1 that the catalog is being shrunk, above 1 that it is
+    being widened. Dimensionless, so catalogs of very different precision share one
+    axis (the additive sigma alone does not).
+    """
     import matplotlib
 
     if not os.environ.get("DISPLAY"):
@@ -164,7 +181,8 @@ def plot_learned_delta(model, stars, labels: Sequence[str], path: Path) -> Path:
 
     fn = numpy_delta_fn(model)
     x, ls, c, m = stars["x"], stars["ls"], stars["c"], stars["m"]
-    sig = np.exp(0.5 * fn(x, ls, c))
+    ln_scale, ln_add = fn(x, ls, c)
+    ratio = np.sqrt(np.exp(ln_scale.astype("f8")) + np.exp(ln_add.astype("f8")) / np.exp(2.0 * ls.astype("f8")))
     colors = catalog_colors(len(labels))
     fig, axes = plt.subplots(2, 2, figsize=(12, 9), layout="constrained", sharex=True)
     edges = np.quantile(x[:, 0], np.linspace(0, 1, 13))
@@ -179,10 +197,11 @@ def plot_learned_delta(model, stars, labels: Sequence[str], path: Path) -> Path:
                 s = which[sel] == b
                 if s.sum() >= 100:
                     xc.append(np.median(x[sel][s, 0]))
-                    yc.append(np.median(sig[sel][s, p]))
+                    yc.append(np.median(ratio[sel][s, p]))
             ax.plot(xc, yc, "-", color=colors[k], label=lab, lw=1.2)
         ax.set_yscale("log")
-        ax.set(title=PARAM_NAMES[p], ylabel=r"median $\sigma_\delta$ (harmonized units)")
+        ax.axhline(1.0, color="0.5", lw=0.8)
+        ax.set(title=PARAM_NAMES[p], ylabel=r"median $\sigma_{\rm out}/\sigma_{\rm in}$")
         ax.grid(True, alpha=0.2)
     for ax in axes[1]:
         ax.set_xlabel(r"catalog's own $5\ln(T_{\rm eff}/5000\,{\rm K})$")
@@ -214,7 +233,8 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         rebuild: bool = False, min_entries: int = 1000) -> dict:
     import tensorflow as tf
 
-    from .model import ConstDelta, DeltaNetwork, fixed_delta, numpy_delta_fn, save_delta_model
+    from .model import (ConstDelta, ConstScaleAdd, ScaleAddNetwork, control_points, fixed_delta,
+                        numpy_delta_fn, save_delta_model)
 
     cfg = cfg or DeltaConfig()
     run_dir = Path(run_dir)
@@ -227,26 +247,37 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     labels = [registry.get_spec(k).label for k in keys]
     n_cat = len(keys)
     train, val = split(stars)
+    ctrl = control_points(stars, keys, cfg.n_control, cfg.seed) if cfg.n_control else None
     del stars
     log.info("%d training stars (%d entries), %d validation stars (%d entries)",
              len(train["id"]), int(train["off"][-1]), len(val["id"]), int(val["off"][-1]))
+    if ctrl is not None:
+        log.info("%d control points (%d per catalog, weight %.3g)",
+                 len(ctrl["c"]), cfg.n_control, cfg.control_weight)
 
-    # Baselines on the validation stars
+    # Baselines on the validation stars. The three constant arms separate the two
+    # corrections: additive only, scale only, and both.
     models = {
         "none (propagated only)": fixed_delta(0.0),
         "floor 0.03 (as merge)": fixed_delta(0.03),
     }
-    const = ConstDelta(n_cat)
-    hist_const = fit(const, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val, desc="const")
-    models["constant per catalog"] = const
+    const_add = ConstDelta(n_cat)
+    hist_const = fit(const_add, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
+                     desc="const add", control=ctrl)
+    models["constant add"] = const_add
 
-    net = DeltaNetwork(n_cat, cfg.hidden_size, cfg.n_hidden)
-    hist = fit(net, train, cfg, cfg.epochs, cfg.learning_rate, val, desc="network")
-    models["network"] = net
+    const = ConstScaleAdd(n_cat)
+    hist_const_sa = fit(const, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
+                        desc="const scale+add", control=ctrl)
+    models["constant scale+add"] = const
+
+    net = ScaleAddNetwork(n_cat, cfg.hidden_size, cfg.n_hidden)
+    hist = fit(net, train, cfg, cfg.epochs, cfg.learning_rate, val, desc="network", control=ctrl)
+    models["network scale+add"] = net
 
     save_delta_model(out_dir, net, dict(
         n_cat=n_cat, hidden_size=cfg.hidden_size, n_hidden=cfg.n_hidden, keys=list(keys),
-        config=dataclasses.asdict(cfg), val_history=hist,
+        model_type="scale_add", config=dataclasses.asdict(cfg), val_history=hist,
     ))
 
     nll, results = {}, {}
@@ -258,21 +289,78 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     table = compare(results, nll)
     log.info("\n%s", table)
     (ev_dir / "comparison.txt").write_text(table + "\n")
-    # The constant model is the maximum-likelihood three-cornered hat: one excess
-    # variance per catalog and parameter that makes the entries agree.
-    const_sigma = np.exp(0.5 * const.raw.numpy())
-    np.savez(ev_dir / "const_delta.npz", sigma=const_sigma, keys=list(keys))
+    # The scale/add table says what the two corrections actually did, per catalog, at
+    # the catalog's own median quoted error - the quantity the merge will see.
+    sa_table = scale_add_table(models, val, labels)
+    log.info("\n%s", sa_table)
+    (ev_dir / "scale_add.txt").write_text(sa_table + "\n")
+    # The additive-only constant model is the maximum-likelihood three-cornered hat:
+    # one excess variance per catalog and parameter that makes the entries agree.
+    const_sigma = np.exp(0.5 * const_add.raw.numpy())
+    np.savez(ev_dir / "const_delta.npz", sigma=const_sigma, keys=list(keys),
+             scale=const.scale_sigma(), add_sigma=const.add_sigma())
     with open(ev_dir / "comparison.json", "w") as f:
         json.dump(to_json(dict(nll=nll, results={k: {kk: vv for kk, vv in v.items() if kk != "entries"}
                                                    for k, v in results.items()},
-                               const_sigma=const_sigma, history=hist, const_history=hist_const)), f, indent=1)
-    plot_diagnostics(results["network"], labels, ev_dir, "_network")
+                               const_sigma=const_sigma, const_scale=const.scale_sigma(),
+                               const_add=const.add_sigma(), history=hist,
+                               const_history=hist_const, const_scale_add_history=hist_const_sa)),
+                  f, indent=1)
+    plot_diagnostics(results["network scale+add"], labels, ev_dir, "_network")
     plot_diagnostics(results["none (propagated only)"], labels, ev_dir, "_none")
     plot_learned_delta(net, val, labels, ev_dir / "learned_delta.png")
+    if cfg.pair_chi2:
+        # Two observations of one star: the difference's covariance is S_a + S_b with
+        # nothing estimated in between, so the chi2 distribution is a direct test.
+        from .diagnostics import pair_chi2, pair_chi2_text, plot_pair_chi2
+
+        before = pair_chi2(val, None, max_pairs=cfg.pair_chi2_max)
+        after = pair_chi2(val, numpy_delta_fn(net), max_pairs=cfg.pair_chi2_max)
+        text = pair_chi2_text(before, after)
+        log.info("\n%s", text)
+        (ev_dir / "pair_chi2.txt").write_text(text + "\n")
+        plot_pair_chi2(before, after, ev_dir / "pair_chi2.png")
     if cfg.kiel_sample != "none":
-        # Where in the Kiel diagram the network adds variance, one 4x4 page per catalog.
+        # Where in the Kiel diagram the correction sits, one page pair per catalog.
         make_kiel_figures(run_dir, out_dir / "kiel", model=net, sample=cfg.kiel_sample, keys=keys)
-    return dict(nll=nll, table=table)
+    return dict(nll=nll, table=table, scale_add=sa_table)
+
+
+def scale_add_table(models: Dict[str, object], stars, labels: Sequence[str],
+                    max_entries: int = 400_000) -> str:
+    """Per catalog and parameter: the fitted sigma scale and the additive sigma.
+
+    Medians over the validation entries of each catalog, so the network is described
+    by the same two numbers as the constant arms. ``sigma ratio`` is the combined
+    effect at that catalog's median quoted error, ``sqrt(scale + add/C)`` -- the
+    inflation of the error the merge actually applies.
+    """
+    from .model import numpy_delta_fn
+
+    x, ls, c, m = stars["x"], stars["ls"], stars["c"], stars["m"]
+    if len(x) > max_entries:  # a stable subsample is enough for medians
+        step = int(np.ceil(len(x) / max_entries))
+        x, ls, c, m = x[::step], ls[::step], c[::step], m[::step]
+    rows = []
+    for name, fn in models.items():
+        if not hasattr(fn, "trainable_variables"):
+            continue
+        scale, add = numpy_delta_fn(fn)(x, ls, c)
+        s2, a = np.exp(scale.astype("f8")), np.exp(add.astype("f8"))
+        C = np.exp(2.0 * ls.astype("f8"))
+        ratio = np.sqrt(s2 + a / C)
+        for k, lab in enumerate(labels):
+            for p, pname in enumerate(PARAM_NAMES):
+                sel = (c == k) & m[:, p]
+                if sel.sum() < 100:
+                    continue
+                rows.append((name, lab, pname, float(np.sqrt(s2[sel, p].mean())),
+                             float(np.sqrt(a[sel, p].mean())), float(np.median(ratio[sel, p]))))
+    head = f"{'model':22s}{'catalog':24s}{'param':7s}{'scale(sig)':>11s}{'add sig':>9s}{'sig ratio':>10s}"
+    lines = [head, "-" * len(head)]
+    for name, lab, pname, s, a, r in rows:
+        lines.append(f"{name:22s}{lab[:24]:24s}{pname:7s}{s:11.2f}{a:9.4f}{r:10.2f}")
+    return "\n".join(lines)
 
 
 def _fixed_np(fn):
@@ -281,7 +369,8 @@ def _fixed_np(fn):
     def wrap(x, ls, c):
         import tensorflow as tf
 
-        return fn(tf.constant(x), tf.constant(ls), tf.constant(c, tf.int32)).numpy()
+        a, b = fn(tf.constant(x), tf.constant(ls), tf.constant(c, tf.int32))
+        return a.numpy(), b.numpy()
 
     return wrap
 
@@ -297,7 +386,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--min-entries", type=int, default=1000)
     parser.add_argument("--cpu", action="store_true", help="do not use the GPU")
     for f in dataclasses.fields(DeltaConfig):
-        parser.add_argument("--" + f.name.replace("_", "-"), type=type(f.default), default=f.default)
+        flag = "--" + f.name.replace("_", "-")
+        if isinstance(f.default, bool):  # --flag / --no-flag, not bool("False")
+            parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=f.default)
+        else:
+            parser.add_argument(flag, type=type(f.default), default=f.default)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 

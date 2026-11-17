@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Sequence, Tuple
 
 import numpy as np
 import sonnet as snt
@@ -58,10 +58,28 @@ LN_MIN = float(2 * np.log(3e-3))
 PRIOR_MEAN = float(2 * np.log(0.03))
 PRIOR_SD = 3.0
 
+#: Soft bounds on the covariance scale, in variance units: sigma stays within 1/8 .. 8
+#: times the quoted error. Symmetric in log space, so the clamp has no preference.
+SCALE_MIN = 1.0 / 64.0
+SCALE_MAX = 64.0
+LOG_SCALE_MIN = float(np.log(SCALE_MIN))
+LOG_SCALE_MAX = float(np.log(SCALE_MAX))
+
+#: Prior widths: "the quoted errors are right" and "nothing is added", both weak
+PRIOR_SCALE_SD = 1.0
+PRIOR_ADD_SD = 4.0
+
+#: Where a fresh additive term starts: on the floor, so it can only be raised by data
+ADD_INIT = LN_MIN - 10.0
+
+#: The additive sigma at the floor (0.003): "nothing is added"
+ADD_MIN_SIGMA = float(np.exp(0.5 * LN_MIN))
+
 #: Per-entry batch arrays, plus the star each entry belongs to
 BATCH_KEYS = ("x", "ls", "c", "y", "C", "m")
 
-DeltaFn = Callable[[tf.Tensor, tf.Tensor, tf.Tensor], tf.Tensor]
+#: ``fn(x, ln_sigma, catalog) -> (ln_scale, ln_add)``, each ``(n, 4)``
+DeltaFn = Callable[[tf.Tensor, tf.Tensor, tf.Tensor], Tuple[tf.Tensor, tf.Tensor]]
 
 
 def floor_ln_delta(raw):
@@ -70,8 +88,27 @@ def floor_ln_delta(raw):
     return LN_MIN + tf.math.softplus(raw - LN_MIN)
 
 
+def soft_clamp(raw, lo, hi, sharpness: float = 8.0):
+    """Identity between ``lo`` and ``hi``, saturating smoothly outside.
+
+    The two-sided analogue of :func:`floor_ln_delta`, which is the same thing written
+    for a single bound. ``sharpness`` narrows the rounding region, so that the
+    identity part covers most of ``[lo, hi]``: with the default bounds (``+-ln 16``)
+    the map is within 1e-3 of the identity on ``[-2, 2]`` and never leaves
+    ``[lo - 0.004, hi]``.
+    """
+    def sp(y):
+        return tf.math.softplus(sharpness * y) / sharpness
+
+    return hi - sp(hi - lo - sp(raw - lo))
+
+
 class DeltaNetwork(snt.Module):
-    """FiLM network ``(x, ln_sigma_x, catalog) -> ln_delta_cov`` (4 values)."""
+    """FiLM network ``(x, ln_sigma_x, catalog) -> ln_delta_cov`` (4 values).
+
+    The additive model: the covariance scale is fixed at 1. Kept so that runs trained
+    before the scale term existed still load and still compare.
+    """
 
     def __init__(self, n_cat: int, hidden_size: int = 64, n_hidden: int = 3, name=None):
         super().__init__(name=name)
@@ -84,26 +121,80 @@ class DeltaNetwork(snt.Module):
         self(tf.zeros([1, N_PARAMS]), tf.zeros([1, N_PARAMS]), tf.zeros([1], dtype=tf.int32))  # build
 
     def __call__(self, x, ln_sigma, c):
-        return floor_ln_delta(self.net(tf.concat([x, ln_sigma], axis=1), c))
+        return tf.zeros(tf.shape(x), tf.float32), floor_ln_delta(self.net(tf.concat([x, ln_sigma], axis=1), c))
+
+
+class ScaleAddNetwork(snt.Module):
+    """Two FiLM heads ``(theta, catalog) -> (ln_scale, ln_add)``.
+
+    The correction is a function of the stellar parameters only: ``ln_sigma`` is part
+    of the signature but is deliberately not fed to either head, so the model answers
+    "what is wrong with this catalog here", not "what is wrong with this measurement".
+    How much that matters is measured by the scale itself, which multiplies the quoted
+    error rather than adding a fixed amount to it.
+
+    ``ln_scale`` is the log of a *variance* scale, soft-clamped to
+    ``[ln 1/16, ln 16]``; ``ln_add`` is floored at ``LN_MIN`` and starts there.
+    """
+
+    def __init__(self, n_cat: int, hidden_size: int = 64, n_hidden: int = 3, name=None):
+        super().__init__(name=name)
+        self.n_cat = n_cat
+        kw = dict(use_residual=True, use_film=True, use_layer_norm=True)
+        self.scale = VectorNetwork(n_cat, N_PARAMS, n_hidden, hidden_size,
+                                   output_scale=1e-3, output_bias=0.0, **kw)
+        self.add = VectorNetwork(n_cat, N_PARAMS, n_hidden, hidden_size,
+                                 output_scale=1e-3, output_bias=ADD_INIT, **kw)
+        self(tf.zeros([1, N_PARAMS]), tf.zeros([1, N_PARAMS]), tf.zeros([1], dtype=tf.int32))  # build
+
+    def __call__(self, x, ln_sigma, c):
+        log_scale = soft_clamp(self.scale(x, c), LOG_SCALE_MIN, LOG_SCALE_MAX)
+        return log_scale, floor_ln_delta(self.add(x, c))
 
 
 class ConstDelta(snt.Module):
-    """One ln_delta per catalog and parameter (the simplest baseline)."""
+    """One ln_delta per catalog and parameter (the additive-only baseline)."""
 
     def __init__(self, n_cat: int, name=None):
         super().__init__(name=name)
         self.raw = tf.Variable(tf.fill([n_cat, N_PARAMS], PRIOR_MEAN), name="raw")
 
     def __call__(self, x, ln_sigma, c):
-        return floor_ln_delta(tf.gather(self.raw, c))
+        return tf.zeros(tf.shape(x), tf.float32), floor_ln_delta(tf.gather(self.raw, c))
+
+
+class ConstScaleAdd(snt.Module):
+    """One scale and one additive term per catalog and parameter.
+
+    Eight parameters per catalog instead of four. This is the arm that says whether
+    the signal is multiplicative at all, and it is the reference the network has to
+    beat; ``raw_scale`` starts at 0 (scale 1) and ``raw_add`` on the floor.
+    """
+
+    def __init__(self, n_cat: int, name=None):
+        super().__init__(name=name)
+        self.raw_scale = tf.Variable(tf.zeros([n_cat, N_PARAMS]), name="raw_scale")
+        self.raw_add = tf.Variable(tf.fill([n_cat, N_PARAMS], ADD_INIT), name="raw_add")
+
+    def __call__(self, x, ln_sigma, c):
+        log_scale = soft_clamp(tf.gather(self.raw_scale, c), LOG_SCALE_MIN, LOG_SCALE_MAX)
+        return log_scale, floor_ln_delta(tf.gather(self.raw_add, c))
+
+    def scale_sigma(self) -> np.ndarray:
+        """The fitted sigma scale per catalog and parameter (``(n_cat, 4)``)."""
+        return np.exp(0.5 * soft_clamp(self.raw_scale, LOG_SCALE_MIN, LOG_SCALE_MAX).numpy())
+
+    def add_sigma(self) -> np.ndarray:
+        return np.exp(0.5 * floor_ln_delta(self.raw_add).numpy())
 
 
 def fixed_delta(sigma: float) -> DeltaFn:
-    """The same added sigma everywhere (``0`` for no added variance)."""
+    """The same added sigma everywhere (``0`` for no added variance), scale 1."""
     value = -60.0 if sigma <= 0 else float(2 * np.log(sigma))
 
     def fn(x, ln_sigma, c):
-        return tf.fill(tf.shape(x), tf.constant(value, dtype=x.dtype))
+        zero = tf.fill(tf.shape(x), tf.constant(0.0, dtype=x.dtype))
+        return zero, tf.fill(tf.shape(x), tf.constant(value, dtype=x.dtype))
 
     return fn
 
@@ -116,21 +207,29 @@ def make_batch(stars, idx, seg) -> Dict[str, object]:
     }
 
 
-def star_nll(batch: Dict[str, object], delta_fn: DeltaFn) -> Tuple[tf.Tensor, tf.Tensor]:
-    """Per-star negative log likelihood, in float64; also returns the log variances.
+def star_nll(batch: Dict[str, object], delta_fn: DeltaFn) -> Tuple[tf.Tensor, tuple]:
+    """Per-star negative log likelihood, in float64; also returns the model's parameters.
 
     The sum over a star's entries is a segmented reduction, so a batch is a flat
     array of entries plus the index of the star each belongs to: no loop over
     observations and no ragged tensor. Every star of the block must have at least
     one entry, which is what :func:`astrotune.delta.stars.block_indices` yields.
+
+    The entry covariance is ``S_ij = s_i C_ij s_j + delta_ij add_i`` with
+    ``s_i = exp(ln_scale_i / 2)``: a per-parameter scale applied to the whole
+    propagated matrix (positive definite for any ``s > 0``, since it is a congruence
+    of ``C``) plus a diagonal term. ``ln_scale = 0`` and ``ln_add -> -inf``
+    reproduce the untransformed covariance exactly.
     """
     seg = batch["seg"]
     n_star = tf.reduce_max(seg) + 1  # a dynamic segment count: no retracing per block
     m = tf.cast(batch["m"], tf.float64)  # (N, 4): measured by this entry
-    la = delta_fn(batch["x"], batch["ls"], batch["c"])  # (N, 4) log added variance
+    ln_scale, ln_add = delta_fn(batch["x"], batch["ls"], batch["c"])  # (N, 4) each
 
     y = tf.cast(batch["y"], tf.float64)
-    S = tf.cast(batch["C"], tf.float64) + tf.linalg.diag(tf.exp(tf.cast(la, tf.float64)))
+    s = tf.exp(0.5 * tf.cast(ln_scale, tf.float64))
+    S = (tf.cast(batch["C"], tf.float64) * s[:, :, None] * s[:, None, :]
+         + tf.linalg.diag(tf.exp(tf.cast(ln_add, tf.float64))))
     L = tf.linalg.cholesky(S)
     Sinv = tf.linalg.inv(S)  # symmetric positive definite; the Cholesky is for ln det
 
@@ -158,18 +257,90 @@ def star_nll(batch: Dict[str, object], delta_fn: DeltaFn) -> Tuple[tf.Tensor, tf
     # normalisation included; with K = 1 it is 0, i.e. no information.
     n_res = n_meas_s - tf.reduce_sum(any_m, axis=1)
     neg2lnp = quad_s + logdet_A + logdetS_s + n_res * tf.cast(np.log(2 * np.pi), tf.float64)
-    return 0.5 * neg2lnp, la
+    return 0.5 * neg2lnp, (ln_scale, ln_add)
 
 
-def prior_penalty(batch: Dict[str, object], la: tf.Tensor) -> tf.Tensor:
-    """Mean over measured parameters of the Gaussian prior on ln_delta.
+def prior_penalty(batch: Dict[str, object], params: tuple) -> tf.Tensor:
+    """Mean over measured parameters of the two Gaussian priors.
 
-    One term per *entry*, which the star framing gives for free: the pair version
-    applied it once per pair, i.e. ``K - 1`` times to the same entry.
+    ``ln_scale ~ N(0, PRIOR_SCALE_SD)``: the quoted errors are right unless the data
+    say otherwise. ``ln_add ~ N(LN_MIN, PRIOR_ADD_SD)``: the additive term sits on the
+    floor unless the data lift it, which is why the centre is the floor and not the
+    0.03 the merge uses. One term per *entry*, which the star framing gives for free:
+    the pair version applied it once per pair, i.e. ``K - 1`` times to the same entry.
     """
+    ln_scale, ln_add = params
     m = tf.cast(batch["m"], tf.float32)
-    z2 = ((la - PRIOR_MEAN) / PRIOR_SD) ** 2
-    return 0.5 * tf.reduce_sum(z2 * m) / tf.maximum(tf.reduce_sum(m), 1.0)
+    z2_scale = (tf.cast(ln_scale, tf.float32) / PRIOR_SCALE_SD) ** 2
+    # Anything at or below the floor is "nothing added": the floor is the smallest
+    # term the model can return, so it is where the prior's centre belongs.
+    ln_add = tf.maximum(tf.cast(ln_add, tf.float32), LN_MIN)
+    z2_add = ((ln_add - LN_MIN) / PRIOR_ADD_SD) ** 2
+    return 0.5 * tf.reduce_sum((z2_scale + z2_add) * m) / tf.maximum(tf.reduce_sum(m), 1.0)
+
+
+def control_points(stars, keys: Sequence[str], n_per_catalog: int = 1024,
+                   seed: int = 0) -> Dict[str, np.ndarray]:
+    """Dispersed points in the stellar-parameter box, one set per catalog.
+
+    The priors above act where there *is* data; these act everywhere else, which is
+    where a per-catalog network is otherwise free to say anything. They are drawn
+    from a low-discrepancy sequence over the box spanned by the 1st to 99th percentile
+    of the training stars (per parameter, over the entries that measure it), so a
+    fixed budget covers the box evenly instead of clustering in the middle the way a
+    wide Gaussian would.
+
+    A parameter that a catalog does not measure is set to 0 -- the placeholder the
+    network sees in the data itself -- and masked out of the penalty, so the model is
+    never pinned on an axis the catalog cannot see.
+    """
+    x, m, c = stars["x"], stars["m"], stars["c"]
+    lo = np.zeros(N_PARAMS)
+    hi = np.ones(N_PARAMS)
+    for p in range(N_PARAMS):
+        sel = m[:, p]
+        if sel.sum() >= 10:
+            lo[p], hi[p] = np.percentile(x[sel, p].astype("f8"), [1.0, 99.0])
+    # Which parameters each catalog measures at all (a catalog absent from the star
+    # table has no entries, so it is pinned on every axis)
+    measures = np.zeros((len(keys), N_PARAMS), dtype=bool)
+    for k in range(len(keys)):
+        in_cat = c == k
+        measures[k] = m[in_cat].any(0) if in_cat.any() else True
+
+    unit = _dispersed_unit(n_per_catalog * len(keys), N_PARAMS, seed)
+    xs, cs, ms = [], [], []
+    for k in range(len(keys)):
+        u = unit[k * n_per_catalog:(k + 1) * n_per_catalog]
+        pts = lo[None, :] + (hi - lo)[None, :] * u
+        pts[:, ~measures[k]] = 0.0
+        xs.append(pts.astype("f4"))
+        cs.append(np.full(n_per_catalog, k, dtype="i4"))
+        ms.append(np.tile(measures[k], (n_per_catalog, 1)))
+    return dict(x=np.concatenate(xs), c=np.concatenate(cs), m=np.concatenate(ms))
+
+
+def _dispersed_unit(n: int, dim: int, seed: int) -> np.ndarray:
+    """``n`` points in ``[0, 1]^dim``: a Sobol sequence if scipy has one, else uniform."""
+    try:
+        from scipy.stats import qmc
+
+        m = int(np.ceil(np.log2(max(n, 2))))
+        return qmc.Sobol(dim, scramble=True, seed=seed).random_base2(m)[:n]
+    except Exception:  # pragma: no cover - older scipy
+        return np.random.default_rng(seed).random((n, dim))
+
+
+def control_penalty(ctrl: Dict[str, np.ndarray], model) -> tf.Tensor:
+    """The same prior as :func:`prior_penalty`, evaluated away from the data."""
+    ln_scale, ln_add = model(tf.constant(ctrl["x"], tf.float32),
+                             tf.zeros_like(tf.constant(ctrl["x"], tf.float32)),
+                             tf.constant(ctrl["c"], tf.int32))
+    m = tf.constant(ctrl["m"].astype("f4"))
+    z2_scale = (ln_scale / PRIOR_SCALE_SD) ** 2
+    ln_add = tf.maximum(ln_add, LN_MIN)
+    z2_add = ((ln_add - LN_MIN) / PRIOR_ADD_SD) ** 2
+    return 0.5 * tf.reduce_sum((z2_scale + z2_add) * m) / tf.maximum(tf.reduce_sum(m), 1.0)
 
 
 def l2_penalty(module: snt.Module):
@@ -179,22 +350,30 @@ def l2_penalty(module: snt.Module):
 
 # --- Numpy interface (diagnostics) --------------------------------------------
 def numpy_delta_fn(model, batch_size: int = 65536):
-    """``f(x, ln_sigma, catalog) -> ln_delta`` on NumPy arrays, in batches."""
+    """``f(x, ln_sigma, catalog) -> (ln_scale, ln_add)`` on NumPy arrays, in batches."""
 
     def fn(x, ln_sigma, c):
-        out = []
+        scale, add = [], []
         for i in range(0, len(x), batch_size):
             sl = slice(i, i + batch_size)
-            out.append(
-                model(tf.constant(x[sl], tf.float32), tf.constant(ln_sigma[sl], tf.float32),
-                      tf.constant(c[sl], tf.int32)).numpy()
-            )
-        return np.concatenate(out) if out else np.zeros((0, N_PARAMS), dtype="f4")
+            la, lb = model(tf.constant(x[sl], tf.float32),
+                           tf.constant(ln_sigma[sl], tf.float32),
+                           tf.constant(c[sl], tf.int32))
+            scale.append(np.asarray(la.numpy()))
+            add.append(np.asarray(lb.numpy()))
+        if not scale:
+            empty = np.zeros((0, N_PARAMS), dtype="f4")
+            return empty, empty
+        return np.concatenate(scale), np.concatenate(add)
 
     return fn
 
 
-def save_delta_model(out_dir: Path, model: DeltaNetwork, config: dict) -> Path:
+#: Which module a saved ``delta_model_config.json`` was written for
+MODEL_TYPES: Dict[str, type] = {"scale_add": ScaleAddNetwork, "add": DeltaNetwork}
+
+
+def save_delta_model(out_dir: Path, model, config: dict) -> Path:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = tf.train.Checkpoint(model=model).write(str(out_dir / "delta_model"))
@@ -203,21 +382,25 @@ def save_delta_model(out_dir: Path, model: DeltaNetwork, config: dict) -> Path:
     return Path(path)
 
 
-def load_delta_model(out_dir: Path, keys=None) -> DeltaNetwork:
+def load_delta_model(out_dir: Path, keys=None):
     """Restore a model saved by :func:`save_delta_model`.
 
     ``n_cat`` alone would not catch a model trained on a different catalog list of
     the same length, whose category indices would silently mean other catalogs, so
-    the saved keys are compared whenever ``keys`` is given.
+    the saved keys are compared whenever ``keys`` is given. Configs written before
+    the scale term existed carry no ``model_type`` and are read as additive-only.
     """
     out_dir = Path(out_dir)
     with open(out_dir / "delta_model_config.json") as f:
         cfg = json.load(f)
+    model_type = cfg.get("model_type", "add")
+    if model_type not in MODEL_TYPES:
+        raise ValueError(f"unknown delta model type {model_type!r} in {out_dir}")
     if keys is not None and tuple(cfg.get("keys", ())) != tuple(keys):
         raise ValueError(
             f"{out_dir}/delta_model was trained on {list(cfg.get('keys', ()))}, "
             f"not {list(keys)}; retrain it."
         )
-    model = DeltaNetwork(cfg["n_cat"], cfg["hidden_size"], cfg["n_hidden"])
+    model = MODEL_TYPES[model_type](cfg["n_cat"], cfg["hidden_size"], cfg["n_hidden"])
     tf.train.Checkpoint(model=model).read(str(out_dir / "delta_model")).assert_existing_objects_matched()
     return model
