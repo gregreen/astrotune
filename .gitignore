@@ -76,3 +76,8 @@ dist/
 .DS_Store
 .vscode/
 .idea/
+
+# Test and TensorFlow scratch files written into the working directory
+__autograph_generated_file*.py
+pytest-of-*/
+.nfs*
