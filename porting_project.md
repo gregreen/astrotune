@@ -1445,6 +1445,45 @@ add `diag(exp(ln_delta))` to each entry's covariance in `apply.transform_catalog
 (only for parameters the catalog measures) and drop the 0.03 floor in `merge.py`;
 the model's `ln σ_x` input is `log(sigma_x)`, set to 0 where a parameter is not measured.
 
+#### Star likelihood instead of the pair likelihood (2026-11-17)
+
+Everything above was written for a pair likelihood (one row per catalog pair, the
+difference of the two harmonized values). 63.6 % of those rows come from stars in
+three or more catalogs, so the same measurement was counted several times and the
+"pairs" were not independent. The delta model is now fitted to the **star**
+likelihood: each star has one latent true value `y` with a flat prior, a catalog `a`
+reports `x_a = y + ε_a` with `Cov = S_a + ΔC_a(x_a, ln σ_a)`, and `y` is integrated
+out analytically, giving one NLL term per star (see `delta/model.py:star_nll`). For
+`K = 2` this is algebraically the old pair likelihood; for `K > 2` it is not, and it
+is the correct one. The three-cornered-hat estimator for the excess covariance also
+had to change: the naive per-entry `Σ_a (S_a − A⁻¹)` over the star's own entries is
+biased low when `K ≥ 3`, so `delta.diagnostics.three_cornered_hat` uses only the
+two-entry stars, where the estimator is unbiased.
+
+On `models/latent_adam_lr2e4_20cat` (20 catalogs, 2 248 647 stars, 5 392 548
+entries), validation NLL per star: none −2.186, floor 0.03 −3.765, constant per
+catalog −4.782, **network −5.646**. The learned σ_δ is at the 0.003 floor for
+APOGEE, ASCAP and GALAH (their errors needed shrinking, which an additive term
+cannot do) and largest for the narrow-line catalogs (DESI Nagaraj, MDC, BOSSNet).
+Calibration improves but is not solved: median PIT 0.324 (0.5 is calibrated) and
+per-catalog scale ratios 0.76–1.00 mean the Gaussian excess still buys tail
+coverage by over-widening the core; `P(sf < 1e-3)` falls from 15.8 % to 0.67 %
+(nominal 0.1 %). The heavy-tailed likelihood is still the next step.
+
+#### Where the variance is added (`astrotune-delta-kiel`)
+
+`delta/kiel.py` turns the fitted model into pictures: for each catalog a 4×4 page,
+a column per parameter and a row per [Fe/H] bin ([Fe/H] descending downwards), with
+the median ΔC in (Teff, logg) bins inside each panel, on a log colour scale whose
+bottom is the model's floor. The sample is the star table by default (`--all` uses
+every prepared row, encoded as in training; the network just extrapolates, so that
+is only useful in comparison). On the 20-catalog run this says: APOGEE asks for
+nothing over half its diagram (49 % of bins within a factor of three of the floor)
+and asks only on the giant branch; CLAM sits at 1.6e-2 with hot spots at the cool
+metal-poor edge; Pristine asks for the most (median 5.4e-2); nobody asks for
+anything in APOGEE [α/Fe]. SDSS-V (MDw Cannon) cannot be drawn: it measures no logg
+at all.
+
 ### 9.11 Catalog connectivity figure (`astrotune-catalog-graph`)
 
 For the paper (owner's idea): nodes = catalogs (radius ~ log10 rows), edges = pairs

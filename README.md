@@ -199,11 +199,16 @@ shared stars, plus every catalog's `--top-k` strongest links), plus a matrix of 
 ```
 astrotune-delta-diagnose --run-dir models/my_run   # how well calibrated are the errors? (needs astrotune-apply first)
 astrotune-delta-train --run-dir models/my_run      # learn extra variances per catalog entry
+astrotune-delta-kiel --run-dir models/my_run       # where in the Kiel diagram did it add them?
 ```
 
-Both write to `models/my_run/delta/`: `star_table.npz` is every observation of
+All write to `models/my_run/delta/`: `star_table.npz` is every observation of
 every star (grouped by star), and the fit is the latent-y likelihood with the
 star's value integrated out, so a star counts once however many catalogs saw it.
+`kiel/` holds one 4x4 page per catalog — a column per parameter, a row per
+[Fe/H] bin with [Fe/H] descending downwards, the median learned variance in
+(Teff, logg) bins — plus `kiel_cube.npz` for other cuts. `astrotune-delta-train`
+draws them too unless `--kiel-sample none`.
 See `porting_project.md` §9.10 for the method, the findings and the open issues.
 The model is not yet used by `astrotune-apply`.
 
