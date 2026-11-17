@@ -101,7 +101,8 @@ def _entry_cov(stars: StarTable, idx: np.ndarray,
 
 
 def pair_chi2(stars: StarTable, delta_fn: Optional[DeltaFn] = None, chunk: int = 100_000,
-              max_pairs: Optional[int] = None, seed: int = 0) -> Dict[str, np.ndarray]:
+              max_pairs: Optional[int] = None, seed: int = 0,
+              nu: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
     """``chi2`` of every pair of entries of the same star, one number per pair.
 
     For two entries of one star the difference ``y_a - y_b`` has covariance
@@ -112,12 +113,17 @@ def pair_chi2(stars: StarTable, delta_fn: Optional[DeltaFn] = None, chunk: int =
     makes this a direct test of the covariance model, independent of how the star's
     value was combined.
 
+    ``nu`` (one tail weight per catalog) is recorded per pair as ``tail``: under a
+    Student's t the same quadratic form is ``d * F(d, tail)``, so the reference curve
+    changes shape even though the statistic does not.
+
     Unlike the star-level chi2 this is *not* a set of independent statistics: the
     ``K (K - 1) / 2`` pairs of a star share entries. It is a distributional check
     (does the histogram match the ideal curve), not a test with a p-value.
     """
     ii = np.arange(N_PARAMS)
-    chi2, nu = [], []
+    tail = _star_nu(stars, nu)
+    chi2, nu_dim, nu_val = [], [], []
     for idx, seg, n in block_indices(stars, None, chunk):
         S = _entry_cov(stars, idx, delta_fn)
         y, m = stars["y"][idx].astype("f8"), stars["m"][idx]
@@ -132,6 +138,7 @@ def pair_chi2(stars: StarTable, delta_fn: Optional[DeltaFn] = None, chunk: int =
             b = (st[:, None] + ju[None, :]).ravel()
             both = m[a] & m[b]
             key = both.dot(1 << ii)
+            star_of_pair = tail[stars["seg"][idx][a]] if nu is not None else None
             for kk in np.unique(key):
                 sel = bool_key(kk)
                 dof = int(sel.sum())
@@ -142,11 +149,16 @@ def pair_chi2(stars: StarTable, delta_fn: Optional[DeltaFn] = None, chunk: int =
                 d = (y[a[rows]] - y[b[rows]])[:, sel]
                 sol = np.linalg.solve(M, d[:, :, None])[:, :, 0]
                 chi2.append(np.einsum("ni,ni->n", d, sol))
-                nu.append(np.full(int(rows.sum()), dof, dtype="i4"))
+                nu_dim.append(np.full(int(rows.sum()), dof, dtype="i4"))
+                nu_val.append(np.full(int(rows.sum()), np.inf) if star_of_pair is None
+                              else star_of_pair[rows])
         if max_pairs is not None and sum(len(v) for v in chi2) > 4 * max_pairs:
             break  # a subsample is enough for a distribution; see the docstring
     out = dict(chi2=np.concatenate(chi2) if chi2 else np.zeros(0),
-               nu=np.concatenate(nu) if nu else np.zeros(0, dtype="i4"))
+               nu=np.concatenate(nu_dim) if nu_dim else np.zeros(0, dtype="i4"),
+               tail=np.concatenate(nu_val) if nu_val else np.zeros(0))
+    if nu is None:
+        del out["tail"]
     if max_pairs is not None and len(out["chi2"]) > max_pairs:
         keep = np.random.default_rng(seed).choice(len(out["chi2"]), max_pairs, replace=False)
         keep.sort()
@@ -159,27 +171,42 @@ def bool_key(key: int) -> np.ndarray:
     return np.array([bool(key >> i & 1) for i in range(N_PARAMS)])
 
 
-def chi2_mixture_pdf(x: np.ndarray, nu: np.ndarray) -> np.ndarray:
-    """Density of the chi-squared distribution, mixed over the observed ``nu`` values.
+def chi2_mixture_pdf(x: np.ndarray, nu: np.ndarray,
+                     tail: Optional[np.ndarray] = None) -> np.ndarray:
+    """Density of the ideal reference, mixed over the observed masks (and tail).
 
     A pair that shares 4 parameters and a pair that shares 3 are both chi-squared
     variables, so the ideal curve of the pooled histogram is the mixture weighted by
     how many pairs have each ``nu`` -- which is what the catalogs' masks dictate, not
-    a free parameter.
+    a free parameter. With a Student's t of ``tail`` degrees of freedom the quadratic
+    form is ``d * F(d, tail)`` instead, so the reference becomes the same mixture of
+    F distributions (scaled back to the quadratic-form units the histogram uses).
     """
-    nus, counts = np.unique(nu, return_counts=True)
-    w = counts / max(counts.sum(), 1)
-    return sum(float(wi) * stats.chi2.pdf(x, int(nu_i)) for nu_i, wi in zip(nus, w))
+    nu = np.asarray(nu)
+    if tail is None:
+        nus, counts = np.unique(nu, return_counts=True)
+        w = counts / max(counts.sum(), 1)
+        return sum(float(wi) * stats.chi2.pdf(x, int(n)) for n, wi in zip(nus, w))
+    tail = np.asarray(tail, dtype="f8")
+    # bucket the continuous dof so that the mixture has a manageable number of terms
+    keys, counts = np.unique(np.stack([nu, np.round(tail * 2.0) / 2.0], axis=1),
+                             axis=0, return_counts=True)
+    w = counts / counts.sum()
+    out = np.zeros(np.shape(x), dtype="f8")
+    for (d, t), wi in zip(keys, w):
+        out += float(wi) * stats.f.pdf(np.asarray(x) / d, int(d), max(t, 2.01)) / d
+    return out
 
 
 def pair_chi2_text(before: Dict[str, np.ndarray], after: Dict[str, np.ndarray]) -> str:
-    """Median and tail fractions of ``chi2 / nu``, quoted errors vs the model."""
+    """The pair chi2 distribution: median, core and tail, quoted errors vs the model."""
     def line(name, d):
         r = d["chi2"] / np.maximum(d["nu"], 1)
+        sf = _null_sf(d["chi2"], d["nu"], d.get("tail", np.full(len(r), np.inf)))
         return (f"{name:22s} median chi2/nu {np.median(r):5.2f}   "
                 f"P(chi2 < 1) {np.mean(d['chi2'] < 1):6.2%}   "
-                f"P(chi2 > q99.9) {np.mean(d['chi2'] > stats.chi2.ppf(0.999, np.maximum(d['nu'], 1))):7.3%}"
-                f"   ({len(d['chi2']):,} pairs)")
+                f"P(null sf < 1e-3) {np.mean(sf < 1e-3):7.3%}   "
+                f"({len(d['chi2']):,} pairs)")
 
     return "\n".join([line("quoted errors", before), line("with the delta model", after)])
 
@@ -199,7 +226,10 @@ def plot_pair_chi2(before: Dict[str, np.ndarray], after: Dict[str, np.ndarray],
                 color=color, label=f"{label}: median $\\chi^2/\\nu$ = "
                                    f"{np.median(d['chi2'] / np.maximum(d['nu'], 1)):.2f}")
     x = np.linspace(0.0, hi, 800)
-    ax.plot(x, chi2_mixture_pdf(x, after["nu"]), "k--", lw=1.2, label="ideal (mixture over $\\nu$)")
+    tail = after.get("tail")
+    ax.plot(x, chi2_mixture_pdf(x, after["nu"], tail), "k--", lw=1.2,
+            label="ideal (mixture over $\\nu$ and tail weight)" if tail is not None
+            else "ideal (mixture over $\\nu$)")
     ax.set_yscale("log")
     ax.set_ylim(1e-6, None)
     ax.set(xlabel=r"$\chi^2$ of the difference of two observations of one star",
@@ -213,13 +243,18 @@ def plot_pair_chi2(before: Dict[str, np.ndarray], after: Dict[str, np.ndarray],
 
 
 def entry_stats(stars: StarTable, delta_fn: Optional[DeltaFn] = None,
-                chunk: int = 200_000) -> Dict[str, np.ndarray]:
+                chunk: int = 200_000, nu: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
     """Residuals of every entry against its star's combined value.
 
     Returns, per entry, ``d``, ``sd`` (the residual standard deviation), ``z`` (NaN
     where a parameter is not measured), ``chi2``, ``dof``, ``c`` and ``x``; per
-    star, ``star_chi2``, ``star_dof`` and ``star_n``; and the summed predicted
-    correlation matrix (``corr_pred``) of the residual covariance.
+    star, ``star_chi2``, ``star_dof``, ``star_nu`` and ``star_n``; the survival
+    function and PIT of the star chi2 under the model's null; and the summed
+    predicted correlation matrix (``corr_pred``) of the residual covariance.
+
+    With ``nu`` (one degrees of freedom per catalog) the null of the star chi2 is
+    ``dof * F(dof, nu)`` rather than ``chi2_dof``: under a Student's t the quadratic
+    form carries the random scale, so the exact reference is an F distribution.
     """
     n_ent = int(stars["off"][-1])
     n_star = len(stars["id"])
@@ -275,13 +310,52 @@ def entry_stats(stars: StarTable, delta_fn: Optional[DeltaFn] = None,
             corr_sum += (resid_cov / s[:, :, None] / s[:, None, :]).sum(0)
             corr_n += int(full.sum())
 
+    star_nu = _star_nu(stars, nu)
     return dict(
         d=d, sd=sd, z=d / sd, chi2=chi2, dof=dof,
-        sf=stats.chi2.sf(np.maximum(star_chi2, 0), np.maximum(star_dof, 1)),
+        sf=_null_sf(star_chi2, star_dof, star_nu),
+        pit=_null_sf(star_chi2, star_dof, star_nu, cdf=True),
         c=stars["c"], x=stars["x"], m=stars["m"],
-        star_chi2=star_chi2, star_dof=star_dof, star_n=stars["n_entry"].astype("i4"),
+        star_chi2=star_chi2, star_dof=star_dof, star_nu=star_nu,
+        star_n=stars["n_entry"].astype("i4"),
         corr_pred=corr_sum / max(corr_n, 1),
     )
+
+
+def _star_nu(stars: StarTable, nu: Optional[np.ndarray]) -> np.ndarray:
+    """The star's tail weight: the mean over its entries of its catalogs' nu.
+
+    A star's entries share one scale variable in the likelihood (that is what makes
+    the t marginal analytic), so when its catalogs disagree the star gets their mean
+    -- the only choice that reduces to the global-nu model when they agree.
+    """
+    n_star = len(stars["id"])
+    if nu is None:
+        return np.full(n_star, np.inf)
+    nu_e = np.asarray(nu, dtype="f8")[stars["c"]]
+    off = stars["off"][:-1]
+    out = np.add.reduceat(nu_e, off) / stars["n_entry"] if n_star else np.zeros(0)
+    return out
+
+
+def _null_sf(star_chi2: np.ndarray, star_dof: np.ndarray, star_nu: np.ndarray,
+             cdf: bool = False) -> np.ndarray:
+    """Survival function (or CDF) of the star chi2 under the model's own null.
+
+    Gaussian: ``star_chi2 ~ chi2_dof``. Student's t: ``star_chi2 / dof ~ F(dof, nu)``,
+    which is the same statistic divided by its dimension -- hence ``q`` in one branch
+    and the raw chi2 in the other.
+    """
+    q = np.maximum(star_chi2, 0.0) / np.maximum(star_dof, 1)
+    out = np.ones_like(q)
+    finite = np.isfinite(star_nu)
+    if (~finite).any():
+        args = (np.maximum(star_chi2[~finite], 0.0), np.maximum(star_dof[~finite], 1))
+        out[~finite] = stats.chi2.cdf(*args) if cdf else stats.chi2.sf(*args)
+    if finite.any():
+        args = (q[finite], np.maximum(star_dof[finite], 1), star_nu[finite])
+        out[finite] = stats.f.cdf(*args) if cdf else stats.f.sf(*args)
+    return out
 
 
 def three_cornered_hat(stars: StarTable, n_cat: int, min_pairs: int = 200) -> np.ndarray:
@@ -380,7 +454,7 @@ def summarize(stars: StarTable, st: Dict[str, np.ndarray], n_cat: int,
 
     # Pooled, over stars (independent) and over entries (for the per-parameter widths)
     ok = st["star_dof"] > 0
-    pit = stats.chi2.cdf(np.maximum(st["star_chi2"][ok], 0), st["star_dof"][ok])
+    pit = st["pit"][ok]
     core = np.all(np.abs(z) < 3, axis=1) & m.all(1)
     corr_obs = np.corrcoef(z[core].T) if core.sum() > 100 else np.full((N_PARAMS,) * 2, np.nan)
 
@@ -391,8 +465,7 @@ def summarize(stars: StarTable, st: Dict[str, np.ndarray], n_cat: int,
         n_stars=int(ok.sum()),
         n_entries=int(len(z)),
         median_pit=float(np.median(pit)),
-        frac_sf=[float(np.mean(stats.chi2.sf(st["star_chi2"][ok], st["star_dof"][ok]) < t))
-                 for t in SF_THRESHOLDS],
+        frac_sf=[float(np.mean(st["sf"][ok] < t)) for t in SF_THRESHOLDS],
         beyond3=[float(np.nanmean(np.abs(z[m[:, p], p]) > 3)) for p in range(N_PARAMS)],
         scale_ratio=[robust_scale(z[m[:, p], p]) for p in range(N_PARAMS)],
         pit_hist=np.histogram(pit, bins=20, range=(0, 1))[0],
@@ -428,8 +501,9 @@ def to_json(obj):
 
 
 def diagnose(stars: StarTable, n_cat: int, delta_fn: Optional[DeltaFn] = None,
-             min_entries: int = 1000) -> dict:
-    return summarize(stars, entry_stats(stars, delta_fn), n_cat, min_entries)
+             min_entries: int = 1000, nu: Optional[np.ndarray] = None) -> dict:
+    """Every calibration statistic, with the null of the model that produced ``nu``."""
+    return summarize(stars, entry_stats(stars, delta_fn, nu=nu), n_cat, min_entries)
 
 
 def format_summary(res: dict, labels: Sequence[str], n_worst: int = 12) -> str:
@@ -554,13 +628,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write_diagnostics(res, labels, out_dir / "diagnostics")
     print(format_summary(res, labels))
     if args.model:
-        from .model import load_delta_model, numpy_delta_fn
+        from .model import load_delta_model, model_nu, numpy_delta_fn
 
         model = load_delta_model(out_dir, keys=keys)
+        nu = model_nu(model)
+        if nu is not None:
+            log.info("tail weight per catalog: nu = %s", np.round(nu, 1).tolist())
         log.info("pair chi2: quoted errors")
         before = pair_chi2(stars, None, max_pairs=args.max_pairs)
         log.info("pair chi2: with the saved delta model")
-        after = pair_chi2(stars, numpy_delta_fn(model), max_pairs=args.max_pairs)
+        after = pair_chi2(stars, numpy_delta_fn(model), max_pairs=args.max_pairs, nu=nu)
         text = pair_chi2_text(before, after)
         print(text)
         (out_dir / "diagnostics" / "pair_chi2.txt").write_text(text + "\n")

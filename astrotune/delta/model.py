@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Callable, Dict, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import sonnet as snt
@@ -74,6 +74,40 @@ ADD_INIT = LN_MIN - 10.0
 
 #: The additive sigma at the floor (0.003): "nothing is added"
 ADD_MIN_SIGMA = float(np.exp(0.5 * LN_MIN))
+
+# --- Student's t tail weight ---------------------------------------------------
+#: nu = NU_MIN + softplus(raw): the degrees of freedom of every catalog, kept above 2
+#: so the variance exists. Softplus can reach any large value, so a catalog that wants
+#: Gaussian tails is free to say so.
+NU_MIN = 2.0
+
+#: Prior on the unconstrained coordinate: centred on nu = 8 (a tail heavy enough to
+#: matter -- excess kurtosis 6 / (nu - 4) = 1.5 -- but close enough to Gaussian that
+#: "no evidence" changes nothing), with sd 2 in theta, i.e. nu in [4.1, 12.0] at 95 %.
+NU_PRIOR_MEAN = 6.0
+NU_PRIOR_SD = 2.0
+NU_INIT_RAW = 6.0
+
+
+class TailWeight(snt.Module):
+    """One degrees-of-freedom parameter per catalog, ``nu_c = 2 + softplus(raw_c)``.
+
+    A single number per catalog is the right granularity: the outlier fraction is a
+    property of the pipeline (blends, bad matches, unmodelled binaries), not of the
+    star. The prior is Gaussian on ``raw``, which keeps ``nu > 2`` without a clamp and
+    lets a catalog go to effectively Gaussian tails if the data ask for it.
+    """
+
+    def __init__(self, n_cat: int, raw_init: float = NU_INIT_RAW, name=None):
+        super().__init__(name=name)
+        self.raw = tf.Variable(tf.fill([n_cat], float(raw_init)), name="raw_nu")
+
+    def __call__(self):
+        return NU_MIN + tf.math.softplus(self.raw)
+
+    def prior_penalty(self, mean: float = NU_PRIOR_MEAN, sd: float = NU_PRIOR_SD):
+        """Mean over catalogs of ``0.5 ((raw - mean) / sd)^2``."""
+        return 0.5 * tf.reduce_mean(((self.raw - mean) / sd) ** 2)
 
 #: Per-entry batch arrays, plus the star each entry belongs to
 BATCH_KEYS = ("x", "ls", "c", "y", "C", "m")
@@ -113,6 +147,7 @@ class DeltaNetwork(snt.Module):
     def __init__(self, n_cat: int, hidden_size: int = 64, n_hidden: int = 3, name=None):
         super().__init__(name=name)
         self.n_cat = n_cat
+        self.tail = TailWeight(n_cat)
         self.net = VectorNetwork(
             n_cat, N_PARAMS, n_hidden, hidden_size,
             output_scale=1e-3, output_bias=PRIOR_MEAN,
@@ -122,6 +157,9 @@ class DeltaNetwork(snt.Module):
 
     def __call__(self, x, ln_sigma, c):
         return tf.zeros(tf.shape(x), tf.float32), floor_ln_delta(self.net(tf.concat([x, ln_sigma], axis=1), c))
+
+    def nu(self):
+        return self.tail()
 
 
 class ScaleAddNetwork(snt.Module):
@@ -140,6 +178,7 @@ class ScaleAddNetwork(snt.Module):
     def __init__(self, n_cat: int, hidden_size: int = 64, n_hidden: int = 3, name=None):
         super().__init__(name=name)
         self.n_cat = n_cat
+        self.tail = TailWeight(n_cat)
         kw = dict(use_residual=True, use_film=True, use_layer_norm=True)
         self.scale = VectorNetwork(n_cat, N_PARAMS, n_hidden, hidden_size,
                                    output_scale=1e-3, output_bias=0.0, **kw)
@@ -151,6 +190,9 @@ class ScaleAddNetwork(snt.Module):
         log_scale = soft_clamp(self.scale(x, c), LOG_SCALE_MIN, LOG_SCALE_MAX)
         return log_scale, floor_ln_delta(self.add(x, c))
 
+    def nu(self):
+        return self.tail()
+
 
 class ConstDelta(snt.Module):
     """One ln_delta per catalog and parameter (the additive-only baseline)."""
@@ -158,9 +200,13 @@ class ConstDelta(snt.Module):
     def __init__(self, n_cat: int, name=None):
         super().__init__(name=name)
         self.raw = tf.Variable(tf.fill([n_cat, N_PARAMS], PRIOR_MEAN), name="raw")
+        self.tail = TailWeight(n_cat)
 
     def __call__(self, x, ln_sigma, c):
         return tf.zeros(tf.shape(x), tf.float32), floor_ln_delta(tf.gather(self.raw, c))
+
+    def nu(self):
+        return self.tail()
 
 
 class ConstScaleAdd(snt.Module):
@@ -175,10 +221,14 @@ class ConstScaleAdd(snt.Module):
         super().__init__(name=name)
         self.raw_scale = tf.Variable(tf.zeros([n_cat, N_PARAMS]), name="raw_scale")
         self.raw_add = tf.Variable(tf.fill([n_cat, N_PARAMS], ADD_INIT), name="raw_add")
+        self.tail = TailWeight(n_cat)
 
     def __call__(self, x, ln_sigma, c):
         log_scale = soft_clamp(tf.gather(self.raw_scale, c), LOG_SCALE_MIN, LOG_SCALE_MAX)
         return log_scale, floor_ln_delta(tf.gather(self.raw_add, c))
+
+    def nu(self):
+        return self.tail()
 
     def scale_sigma(self) -> np.ndarray:
         """The fitted sigma scale per catalog and parameter (``(n_cat, 4)``)."""
@@ -207,7 +257,8 @@ def make_batch(stars, idx, seg) -> Dict[str, object]:
     }
 
 
-def star_nll(batch: Dict[str, object], delta_fn: DeltaFn) -> Tuple[tf.Tensor, tuple]:
+def star_nll(batch: Dict[str, object], delta_fn: DeltaFn,
+             nu: Optional[tf.Tensor] = None) -> Tuple[tf.Tensor, tuple]:
     """Per-star negative log likelihood, in float64; also returns the model's parameters.
 
     The sum over a star's entries is a segmented reduction, so a batch is a flat
@@ -220,6 +271,23 @@ def star_nll(batch: Dict[str, object], delta_fn: DeltaFn) -> Tuple[tf.Tensor, tu
     propagated matrix (positive definite for any ``s > 0``, since it is a congruence
     of ``C``) plus a diagonal term. ``ln_scale = 0`` and ``ln_add -> -inf``
     reproduce the untransformed covariance exactly.
+
+    ``nu`` (one degrees of freedom per catalog, or None for Gaussian errors) turns the
+    marginal into a multivariate Student's t. The likelihood above is a Gaussian
+    density in the ``n_res`` differences with quadratic form ``quad_s``; giving the
+    star's noise a Gamma-distributed precision ``u`` and integrating ``u`` out turns
+    it into ``t_nu``, because
+
+        integral u^(nu/2 - 1) e^(-nu u / 2) u^(n_res/2) e^(-u quad/2) du
+
+    is a Gamma integral: the result is ``(nu + n_res) ln(1 + quad/nu)`` plus constants.
+    So the t costs no iteration, needs no augmentation, and keeps every other line of
+    the model -- masks, determinants, priors -- unchanged. The star's ``u`` is shared
+    by all its entries, because that is what "this star is a binary / a bad match"
+    means; for a star whose catalogs have different nu we use their mean, which is the
+    only choice that reduces to the global-nu model when all of them agree. Per-*entry*
+    heavy tails are a different model: the product of t densities has no closed-form
+    marginal over ``z`` and would need data augmentation.
     """
     seg = batch["seg"]
     n_star = tf.reduce_max(seg) + 1  # a dynamic segment count: no retracing per block
@@ -256,7 +324,18 @@ def star_nll(batch: Dict[str, object], delta_fn: DeltaFn) -> Tuple[tf.Tensor, tu
     # this constant is what makes the expression identical to the pair likelihood,
     # normalisation included; with K = 1 it is 0, i.e. no information.
     n_res = n_meas_s - tf.reduce_sum(any_m, axis=1)
-    neg2lnp = quad_s + logdet_A + logdetS_s + n_res * tf.cast(np.log(2 * np.pi), tf.float64)
+    if nu is None:
+        neg2lnp = (quad_s + logdet_A + logdetS_s
+                   + n_res * tf.cast(np.log(2 * np.pi), tf.float64))
+    else:
+        # nu is per catalog; the star's tail weight is the mean over its entries
+        nu_s = tf.math.unsorted_segment_mean(
+            tf.gather(tf.cast(nu, tf.float64), batch["c"]), seg, n_star)
+        k = tf.cast(n_res, tf.float64)
+        neg2lnp = (logdet_A + logdetS_s
+                   + (nu_s + k) * tf.math.log1p(quad_s / nu_s)
+                   + 2.0 * tf.math.lgamma(0.5 * nu_s) - 2.0 * tf.math.lgamma(0.5 * (nu_s + k))
+                   + k * tf.math.log(nu_s * tf.cast(np.pi, tf.float64)))
     return 0.5 * neg2lnp, (ln_scale, ln_add)
 
 
@@ -367,6 +446,11 @@ def numpy_delta_fn(model, batch_size: int = 65536):
         return np.concatenate(scale), np.concatenate(add)
 
     return fn
+
+
+def model_nu(model) -> Optional[np.ndarray]:
+    """The fitted ``nu`` per catalog, or None if the model is Gaussian."""
+    return model.nu().numpy().astype("f8") if hasattr(model, "nu") else None
 
 
 #: Which module a saved ``delta_model_config.json`` was written for

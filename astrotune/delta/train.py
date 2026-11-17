@@ -74,6 +74,11 @@ class DeltaConfig:
     #: Pair chi2 distribution of the validation stars, before and after the fit
     pair_chi2: bool = True
     pair_chi2_max: Optional[int] = 2_000_000
+    #: Learn a per-catalog degrees of freedom for a Student's t (False: Gaussian)
+    learn_nu: bool = True
+    nu_prior_mean: float = 6.0  # in the unconstrained coordinate: nu = 2 + softplus(6) = 8
+    nu_prior_sd: float = 2.0  # 95 % of the prior mass on nu in [4.1, 12.0]
+    nu_prior_weight: float = 0.01
 
 
 def _spec(tf):
@@ -99,8 +104,9 @@ def mean_star_nll(stars, delta_fn, batch_size: int = 131072, max_stars: Optional
     if max_stars is not None and len(stars["id"]) > max_stars:
         stars = _first_stars(stars, max_stars)
     total, n = 0.0, 0
+    nu = delta_fn.nu() if hasattr(delta_fn, "nu") else None
     for idx, seg, n_star in block_indices(stars, None, batch_size):
-        nll, _ = star_nll(make_batch(stars, idx, seg), delta_fn)
+        nll, _ = star_nll(make_batch(stars, idx, seg), delta_fn, nu=nu)
         total += float(tf.reduce_sum(nll))
         n += n_star
     return total / max(n, 1)
@@ -132,11 +138,16 @@ def fit(model, stars, cfg: DeltaConfig, epochs: int, lr: float, val=None,
 
     @tf.function(input_signature=[_spec(tf)])
     def step(batch):
+        nu = model.nu() if cfg.learn_nu and hasattr(model, "nu") else None
         with tf.GradientTape() as tape:
-            nll, params = star_nll(batch, model)
+            nll, params = star_nll(batch, model, nu=nu)
             data = tf.reduce_mean(nll)
             prior = cfg.prior_weight * prior_penalty(batch, params)
             loss = data + tf.cast(prior, tf.float64) + tf.cast(cfg.l2_weights * l2_penalty(model), tf.float64)
+            if getattr(model, "tail", None) is not None:
+                # One Gaussian prior per catalog on the unconstrained dof coordinate
+                loss += tf.cast(cfg.nu_prior_weight * model.tail.prior_penalty(
+                    cfg.nu_prior_mean, cfg.nu_prior_sd), tf.float64)
             if control is not None and cfg.control_weight:
                 # Away from the data the model is pulled to scale 1, add 0: the same
                 # prior, evaluated on points the likelihood never sees.
@@ -234,7 +245,7 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     import tensorflow as tf
 
     from .model import (ConstDelta, ConstScaleAdd, ScaleAddNetwork, control_points, fixed_delta,
-                        numpy_delta_fn, save_delta_model)
+                        model_nu, numpy_delta_fn, save_delta_model)
 
     cfg = cfg or DeltaConfig()
     run_dir = Path(run_dir)
@@ -280,11 +291,14 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         model_type="scale_add", config=dataclasses.asdict(cfg), val_history=hist,
     ))
 
-    nll, results = {}, {}
+    nll, results, nus = {}, {}, {}
     for name, fn in models.items():
         nll[name] = mean_star_nll(val, fn, max_stars=cfg.val_max_stars)
         np_fn = numpy_delta_fn(fn) if hasattr(fn, "trainable_variables") else _fixed_np(fn)
-        results[name] = diagnose(val, n_cat, np_fn, min_entries)
+        # With a learned tail weight the null of every chi2 diagnostic is an F
+        # distribution, so the diagnostics need nu as well as the covariance.
+        nus[name] = model_nu(fn) if hasattr(fn, "trainable_variables") else None
+        results[name] = diagnose(val, n_cat, np_fn, min_entries, nu=nus[name])
         log.info("%s: validation NLL per star %.4f", name, nll[name])
     table = compare(results, nll)
     log.info("\n%s", table)
@@ -294,6 +308,10 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     sa_table = scale_add_table(models, val, labels)
     log.info("\n%s", sa_table)
     (ev_dir / "scale_add.txt").write_text(sa_table + "\n")
+    nu_table = format_nu(nus, labels)
+    if nu_table:
+        log.info("\n%s", nu_table)
+        (ev_dir / "nu.txt").write_text(nu_table + "\n")
     # The additive-only constant model is the maximum-likelihood three-cornered hat:
     # one excess variance per catalog and parameter that makes the entries agree.
     const_sigma = np.exp(0.5 * const_add.raw.numpy())
@@ -302,6 +320,7 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     with open(ev_dir / "comparison.json", "w") as f:
         json.dump(to_json(dict(nll=nll, results={k: {kk: vv for kk, vv in v.items() if kk != "entries"}
                                                    for k, v in results.items()},
+                               nus=nus, keys=list(keys),
                                const_sigma=const_sigma, const_scale=const.scale_sigma(),
                                const_add=const.add_sigma(), history=hist,
                                const_history=hist_const, const_scale_add_history=hist_const_sa)),
@@ -315,7 +334,7 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         from .diagnostics import pair_chi2, pair_chi2_text, plot_pair_chi2
 
         before = pair_chi2(val, None, max_pairs=cfg.pair_chi2_max)
-        after = pair_chi2(val, numpy_delta_fn(net), max_pairs=cfg.pair_chi2_max)
+        after = pair_chi2(val, numpy_delta_fn(net), max_pairs=cfg.pair_chi2_max, nu=nus["network scale+add"])
         text = pair_chi2_text(before, after)
         log.info("\n%s", text)
         (ev_dir / "pair_chi2.txt").write_text(text + "\n")
@@ -324,6 +343,19 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         # Where in the Kiel diagram the correction sits, one page pair per catalog.
         make_kiel_figures(run_dir, out_dir / "kiel", model=net, sample=cfg.kiel_sample, keys=keys)
     return dict(nll=nll, table=table, scale_add=sa_table)
+
+
+def format_nu(nus: Dict[str, Optional[np.ndarray]], labels: Sequence[str]) -> str:
+    """The fitted degrees of freedom per catalog, one column per trained arm."""
+    arms = [(name, nu) for name, nu in nus.items() if nu is not None]
+    if not arms:
+        return ""
+    name_w = max(len(n) for n in ["catalog"] + list(labels))
+    head = f"{'catalog':{name_w}s}" + "".join(f"{n:>22s}" for n, _ in arms)
+    lines = [head, "-" * len(head)]
+    for k, lab in enumerate(labels):
+        lines.append(f"{lab:{name_w}s}" + "".join(f"{nu[k]:22.1f}" for _, nu in arms))
+    return "\n".join(lines)
 
 
 def scale_add_table(models: Dict[str, object], stars, labels: Sequence[str],
