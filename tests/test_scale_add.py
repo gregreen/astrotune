@@ -168,3 +168,22 @@ def test_single_partner_share_flags_weakly_identified_catalogs():
     share = dg.single_partner_share(s, 3)
     assert share[0] == pytest.approx(0.5) and share[1] == pytest.approx(0.5)
     assert share[2] == pytest.approx(0.0)  # catalog 2 only appears in three-catalog stars
+
+
+def test_the_per_catalog_table_reports_the_four_numbers():
+    """Scale 1 and an add term on the floor: the table has to say so, and the volume
+    may only change by what the floor adds."""
+    from astrotune.delta.model import ADD_MIN_SIGMA, ConstScaleAdd
+    from astrotune.delta.train import per_catalog_table
+
+    s = _stars(n_star=400, scale=(1.0, 1.0, 1.0))
+    rows = per_catalog_table(ConstScaleAdd(3), s, ("a", "b", "c")).splitlines()
+    body = {row.split()[0]: row.split() for row in rows[2:]}
+    assert set(body) == {"a", "b", "c"}
+    for row in body.values():
+        assert int(row[1].replace(",", "")) == 400  # entries of that catalog
+        assert float(row[2]) == pytest.approx(1.0, abs=0.02)  # sigma scale
+        assert float(row[3]) == pytest.approx(ADD_MIN_SIGMA, rel=0.02)
+        assert float(row[4]) == pytest.approx(8.0, abs=0.05)  # nu = 2 + softplus(6)
+        # ln det of (C + floor) is 4 ln(1 + floor^2 / C) above ln det C
+        assert 0.0 < float(row[5]) < 0.2

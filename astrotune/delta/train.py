@@ -368,6 +368,11 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     if shared_table:
         log.info("\n%s", shared_table)
         (ev_dir / "shared.txt").write_text(shared_table + "\n")
+    # One line per catalog: what the fit did to it, in the four numbers that describe
+    # an entry's covariance (size, sigma scale, additive sigma, tail weight, volume).
+    cat_table = per_catalog_table(net, val, keys)
+    log.info("\n%s", cat_table)
+    (ev_dir / "per_catalog.txt").write_text(cat_table + "\n")
     # The additive-only constant model is the maximum-likelihood three-cornered hat:
     # one excess variance per catalog and parameter that makes the entries agree.
     const_sigma = np.exp(0.5 * const_add.raw.numpy())
@@ -452,6 +457,70 @@ def format_nu(nus: Dict[str, Optional[np.ndarray]], labels: Sequence[str]) -> st
     lines = [head, "-" * len(head)]
     for k, lab in enumerate(labels):
         lines.append(f"{lab:{name_w}s}" + "".join(f"{nu[k]:22.1f}" for _, nu in arms))
+    return "\n".join(lines)
+
+
+def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) -> str:
+    """One row per catalog: size, the two learned terms, the tail weight, and the effect.
+
+    The rows are the *validation* entries of each catalog (the sample every other
+    number in ``evaluation/`` is measured on). ``median scale`` is the median of the
+    sigma scale ``exp(ln_scale / 2)`` over those entries and the parameters they
+    measure (1 = the quoted error is left alone), ``median add`` the same for the
+    additive sigma (the floor is 0.003), ``nu`` the group's degrees of freedom, and
+    ``median dln det`` the median change in the log determinant of the entry
+    covariance, ``ln det S_m - ln det C_m`` over the measured submatrix -- how much
+    volume the correction adds or removes, and the one number that combines the two
+    terms (four parameters at scale 0.35 with nothing additive would be
+    ``8 ln 0.35 = -8.4``). The group's shared variance is *not* in these columns,
+    since it is not a property of the catalog; ``evaluation/shared.txt`` has it, and
+    for the members of a group it is the part that does not shrink.
+    """
+    from .model import model_nu, numpy_delta_fn
+
+    fn = numpy_delta_fn(model)
+    nu = model_nu(model)
+    n_cat, n_par = len(keys), N_PARAMS
+    n_ent = int(stars["off"][-1])
+    s_val = np.zeros((n_ent, n_par), dtype="f4")  # sigma scale
+    a_val = np.zeros((n_ent, n_par), dtype="f4")  # additive sigma
+    dlndet = np.full(n_ent, np.nan)
+    for lo in range(0, n_ent, chunk):
+        sl = slice(lo, min(lo + chunk, n_ent))
+        ln_scale, ln_add = fn(stars["x"][sl], stars["ls"][sl], stars["g"][sl])
+        s = np.exp(0.5 * ln_scale.astype("f8"))
+        a = np.exp(0.5 * ln_add.astype("f8"))
+        s_val[sl], a_val[sl] = s, a
+        # The determinant over the parameters the entry measures (a placeholder axis of
+        # 1e9 would otherwise dominate it), grouped by mask so the subset is exact.
+        C = stars["C"][sl].astype("f8")
+        masks, which = np.unique(stars["m"][sl], axis=0, return_inverse=True)
+        for j, mask in enumerate(masks):
+            rows = which == j
+            if not mask.any() or not rows.any():
+                continue
+            sm, am, Cm = s[rows][:, mask], a[rows][:, mask], C[rows][:, mask][:, :, mask]
+            i = np.arange(int(mask.sum()))
+            Sm = sm[:, :, None] * Cm * sm[:, None, :]
+            Sm[:, i, i] += am**2
+            dlndet[lo + np.flatnonzero(rows)] = (np.linalg.slogdet(Sm)[1]
+                                                 - np.linalg.slogdet(Cm)[1])
+
+    lines = [f"{'catalog':24s}{'n':>9s}{'median scale':>14s}{'median add':>12s}"
+             f"{'nu':>7s}{'median dln det':>16s}",
+             "-" * 82]
+    for k, key in enumerate(keys):
+        label = registry.get_spec(key).label if key in registry.keys() else key
+        in_cat = stars["c"] == k
+        measured = in_cat[:, None] & stars["m"]
+        if not measured.any():
+            continue
+        sc = float(np.median(s_val[measured]))
+        ad = float(np.median(a_val[measured]))
+        de = dlndet[in_cat & np.isfinite(dlndet)]
+        nu_k = "-" if nu is None else f"{nu[stars['g'][np.argmax(in_cat)]]:.1f}"
+        lines.append(f"{label[:24]:24s}{int(in_cat.sum()):9,d}{sc:14.2f}{ad:12.4f}"
+                     f"{nu_k:>7s}{np.median(de) if de.size else np.nan:16.2f}")
     return "\n".join(lines)
 
 
