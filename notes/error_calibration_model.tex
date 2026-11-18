@@ -1,0 +1,320 @@
+% Error calibration model for the AstroTune harmonized catalog.
+% Compile with: tectonic -X compile notes/error_calibration_model.tex
+% (any XeLaTeX/pdfLaTeX will do; only amsmath, amssymb, booktabs, geometry are used.)
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+
+\newcommand{\bv}[1]{\boldsymbol{#1}}          % vector
+\newcommand{\bM}[1]{\boldsymbol{#1}}          % matrix
+\newcommand{\T}{^{\mathsf T}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\lndet}{\ln\det}
+\newcommand{\N}{\mathcal{N}}
+
+\title{\bfseries Error calibration for the harmonized catalog}
+\author{AstroTune notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent
+Each input catalog measures the same star, in its own units and with its own
+quoted uncertainties. After harmonization every measurement is a vector of four
+stellar parameters with a covariance. This note describes the model that then
+asks: \emph{are those covariances right, and if not, what is the correction?}
+It is fitted after the main model, on the stars that more than one catalog
+observes, and it is used to replace the covariances before the merge.
+
+\noindent
+Sections~\ref{sec:gauss}--\ref{sec:cov} and \ref{sec:t}--\ref{sec:est} describe
+the model as implemented and fitted. Section~\ref{sec:groups} describes the
+grouping extension, which is the current specification: groups are the right way
+to represent two catalogs that run the same pipeline on the same spectra, and the
+reason is spelled out there.
+
+\section{Notation}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+symbol & meaning \\
+\midrule
+$d = 4$ & number of parameters: $5\ln(T_{\rm eff}/5000\,\mathrm{K})$, [Fe/H], $\log g$, [$\alpha$/Fe] \\
+$\bv\theta_a$ & the catalog's own parameters of entry $a$ (its own units, not harmonized) \\
+$\bv y_a \in \mathbb{R}^d$ & harmonized parameter values of entry $a$ \\
+$\bM C_a$ & covariance propagated to the harmonized space from the quoted errors, \\
+         & the transformation Jacobian and the error floors \\
+$\bM m_a \in \{0,1\}^d$ & which of the $d$ parameters entry $a$ measures; $d_a = \bv 1\T \bM m_a$ \\
+$c(a)$ & catalog of entry $a$; \quad $g(a)$: its \emph{group} (Section~\ref{sec:groups}) \\
+$K$, $K_g$ & number of entries of the star, and of those in group $g$ \\
+$\bM S_a$ & corrected \emph{independent} covariance of entry $a$ \\
+$\bM G_g$ & \emph{shared} (pipeline-level) covariance of group $g$ \\
+$\bv z$ & the star's true parameters (latent) \\
+$\bv t_g$ & the value group $g$'s pipeline effectively reports (latent) \\
+$\bM A_g$, $\hat{\bv z}_g$, $\bM V_g$ & group precision sum, estimate and effective covariance \\
+$n_{\rm res}$ & dimension of the space of differences (defined below) \\
+$\nu_g$ & degrees of freedom of the Student's $t$ of group $g$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A parameter an entry does not measure carries a placeholder variance of $10^9$
+in $\bM C_a$ and is masked out of every determinant and quadratic form, so the
+bookkeeping below is written as if every entry measured all $d$ parameters.
+
+\section{The independent Gaussian model}
+\label{sec:gauss}
+
+Take one star with entries $a = 1,\dots,K$, and assume each entry measures the
+star's value with independent Gaussian noise,
+\begin{equation}
+  \bv y_a = \bv z + \bv\varepsilon_a, \qquad
+  \bv\varepsilon_a \sim \N(\bv 0, \bM S_a) \ \text{independent},
+  \qquad p(\bv z) \propto 1 .
+\end{equation}
+Marginalizing the star's value is a Gaussian integral. With
+\begin{equation}
+  \bM A = \sum_{a} \bM S_a^{-1}, \qquad
+  \hat{\bv z} = \bM A^{-1}\sum_a \bM S_a^{-1}\bv y_a, \qquad
+  q = \sum_a \bv d_a\T \bM S_a^{-1}\bv d_a, \quad \bv d_a = \bv y_a - \hat{\bv z},
+\end{equation}
+the likelihood of the star's entries is
+\begin{equation}
+  -2\ln p\big(\{\bv y_a\}\big)
+  = q + \lndet\bM A + \sum_a \lndet \bM S_a + n_{\rm res}\ln 2\pi ,
+  \label{eq:gauss}
+\end{equation}
+where $\hat{\bv z}$ is the precision-weighted mean of the entries (the
+``three-cornered hat'') and $n_{\rm res} = \sum_a d_a - d_{\rm shared}$ is the
+number of independent differences the star provides: all measured parameters
+over all entries, minus the $d_{\rm shared}$ a star has (those at least one
+entry measures). The density lives in that difference space; there is nothing
+left to say about a star with one entry, where $n_{\rm res}=0$.
+
+For $K=2$ equation~\eqref{eq:gauss} is exactly the likelihood of the difference
+$\bv y_1-\bv y_2 \sim \N(\bv 0, \bM S_1+\bM S_2)$, since
+$\lndet\bM A = \lndet(\bM S_1+\bM S_2) - \lndet\bM S_1 - \lndet\bM S_2$ and
+$n_{\rm res}=d$; this identity is the cheapest unit test of any change to it.
+
+\section{The corrected covariance}
+\label{sec:cov}
+
+The model does not add an error to the diagonal and leave the rest alone. It
+rescales the whole propagated matrix and then adds a diagonal term,
+\begin{equation}
+  \bM S_a = \bM M_a \bM C_a \bM M_a + \diag(\bv\alpha_a), \qquad
+  \bM M_a = \diag\!\left(e^{\bv\ell_a/2}\right),
+  \label{eq:cov}
+\end{equation}
+with $\bv\ell_a$ the per-parameter \emph{log variance scale} and $\bv\alpha_a$
+the per-parameter \emph{additive variance}. The congruence
+$\bM M\bM C\bM M$ keeps $\bM S_a$ positive definite for any scale (it is a
+change of units), and $\bM M=\bM I$, $\bv\alpha\to\bv 0$ reproduce the quoted
+covariance exactly.
+
+Both are outputs of a small neural network, $\bv\ell_a = f_\ell(\bv\theta_a, g(a))$
+and $\bv\alpha_a = f_\alpha(\bv\theta_a, g(a))$, so the correction varies over
+the stellar parameters and is shared by the catalogs of a group
+(Section~\ref{sec:groups}). Two smooth clamps keep it in a sane range:
+\begin{equation}
+  \ell^{(p)} \in [\ln\!\tfrac{1}{64}, \ln 64] \quad\text{(so $\sigma$ within a factor 8),}
+  \qquad
+  \alpha^{(p)} \ge (3\times 10^{-3})^2 .
+\end{equation}
+The clamps are soft (a softplus tail outside the range), so gradients do not
+vanish at the boundaries.
+
+\section{Groups and the shared systematic}
+\label{sec:groups}
+
+Some pairs of catalogs are not independent: they apply the \emph{same}
+parameter-estimation pipeline to the \emph{same} spectra, e.g.\ APOGEE DR17 and
+the SDSS-V ASPCAP release, both of which are ASPCAP. Their estimates then share
+their mistakes, and no amount of rescaling the two covariances can represent
+that: an additive correction inflates both and therefore also inflates their
+\emph{difference}, whereas what is observed is a difference far smaller than the
+quoted errors predict.
+
+\paragraph{Model.} Partition the catalogs into groups and give each group a
+latent value between the star and the entries,
+\begin{equation}
+  \bv t_g = \bv z + \bv u_g, \quad \bv u_g \sim \N(\bv 0, \bM G_g); \qquad
+  \bv y_a = \bv t_{g(a)} + \bv\varepsilon_a, \quad \bv\varepsilon_a \sim \N(\bv 0, \bM S_a).
+\end{equation}
+Entries of one group share $\bv u_g$ for a given star, so the shared error
+cancels in the differences \emph{within} a group but not \emph{between} groups:
+\begin{align}
+  \bv y_a-\bv y_b &\sim \N\big(\bv 0,\ \bM S_a+\bM S_b\big)
+  && \text{if } g(a)=g(b),\\
+  \bv y_a-\bv y_b &\sim \N\big(\bv 0,\ \bM S_a+\bM S_b+\bM G_{g(a)}+\bM G_{g(b)}\big)
+  && \text{otherwise.}
+\end{align}
+
+\paragraph{Step 1: eliminate the group value.} Condition on $\bv z$ and stack the
+entries of group $g$. Their covariance is $\bM\Sigma_g = \bM D_g + \bM U_g\bM G_g\bM U_g\T$,
+with $\bM D_g = \mathrm{blockdiag}(\bM S_a)$, $\bM U_g = \bv 1\otimes \bM I_d$, and the
+precision sum $\bM A_g = \sum_{a\in g}\bM S_a^{-1}$ as before. Woodbury's identity gives
+\begin{equation}
+  \bM U_g\T\bM\Sigma_g^{-1}\bM U_g
+  = \bM A_g - \bM A_g\big(\bM G_g^{-1}+\bM A_g\big)^{-1}\bM A_g
+  = \bM A_g\big(\bM G_g^{-1}+\bM A_g\big)^{-1}\bM G_g^{-1}
+  = \big(\bM A_g^{-1}+\bM G_g\big)^{-1},
+\end{equation}
+so completing the square turns the group's likelihood into a single effective
+observation of the star's value,
+\begin{equation}
+  -2\ln p(\{\bv y_a\}_{a\in g}\mid \bv z)
+  = (\bv z-\hat{\bv z}_g)\T \bM V_g^{-1}(\bv z-\hat{\bv z}_g)
+  + \underbrace{\lndet\bM\Sigma_g - \lndet\bM V_g}_{\text{within-group scatter}}
+  + K_g d\ln 2\pi ,
+  \label{eq:group}
+\end{equation}
+with
+\begin{equation}
+  \boxed{\ \hat{\bv z}_g = \bM A_g^{-1}\sum_{a\in g}\bM S_a^{-1}\bv y_a,
+  \qquad \bM V_g = \bM A_g^{-1} + \bM G_g\ }
+  \label{eq:Vg}
+\end{equation}
+The group's \emph{central value is unchanged} -- it is still the precision-weighted
+mean -- and only its covariance grows, by the shared part. Two checks: with
+$K_g$ identical entries of covariance $\bM S$ and a common $\bM G$, equation
+\eqref{eq:Vg} gives $\bM S/K_g+\bM G$, i.e.\ the independent part averages down
+and the systematic does not; and for $K_g=2$ with $d=1$ the bracket in
+\eqref{eq:group} is $\ln(S_1+S_2)$, independent of $G$ --- the within-group
+disagreement still constrains the $\bM S_a$, through the determinant rather than
+through the quadratic form.
+
+\paragraph{Step 2: eliminate the star value.} The star now has $N_{\rm grp}$
+effective observations $(\hat{\bv z}_g,\bM V_g)$, so equation~\eqref{eq:gauss}
+applies unchanged to them, with $n_{\rm res}=\sum_g d_g-d_{\rm shared}$ counting
+\emph{groups} instead of entries, plus the constants from \eqref{eq:group}:
+\begin{equation}
+  -2\ln p = \Big[\textstyle\sum_g q_g + \lndet\bM A + \sum_g \lndet\bM V_g + n_{\rm res}\ln 2\pi\Big]
+  + \sum_g\big[\lndet\bM\Sigma_g - \lndet\bM V_g\big] ,
+  \label{eq:hier}
+\end{equation}
+where now $\bM A = \sum_g \bM V_g^{-1}$ is summed over the occupied groups.
+The total number of differences is unchanged,
+$n_{\rm res}+\sum_g(K_gd_g-d_g)=\sum_a d_a-d_{\rm shared}$, so the model has exactly
+as many degrees of freedom as the data. Both limits are informative:
+$\bM G_g=\bM 0$ gives $\bM V_g=\bM A_g^{-1}$ and \eqref{eq:hier} collapses to
+\eqref{eq:gauss} (the group is transparent); $\bM G_g\to\infty$ makes the group
+one measurement with a systematic error.
+
+\paragraph{Two covariances.} It is essential to keep apart
+\begin{align}
+  \bM S_a &:\ \text{the independent part, constrained within the group}, \\
+  \bM S_a^{\rm tot} = \bM S_a + \bM G_{g(a)} &:\ \text{the error to use outside the group}.
+\end{align}
+The second is what a measurement's error is when it is compared with anything
+outside its group, and it is what the merge must use. Reporting only $\bM S_a$
+understates the error of the group's members by exactly the shared part.
+
+\paragraph{Identifiability and why the model is shared.} For a group of two, the
+data provide two observables: the sum $\bM S_1+\bM S_2$ (from within-group
+differences) and $h+\bM G_g$ with $h=(\bM S_1^{-1}+\bM S_2^{-1})^{-1}$ (from
+comparisons with other groups). With $(\bM S_1,\bM S_2,\bM G_g)$ free that leaves
+one flat direction, in which a larger shared term is traded against a more
+unequal split. The model therefore \emph{shares} the correction within a group
+--- one $\bv\ell_g$, one $\bv\alpha_g$ for all its catalogs, applied to each
+catalog's own $\bM C_a$ --- which fixes the split by construction, gives the
+observed ratio of quoted errors back, and leaves both observables determining one
+parameter each. The assumption is testable: it predicts the \emph{composition} of
+the within-group difference, not only its size.
+
+\section{Student's $t$ tails}
+\label{sec:t}
+
+Even with the right variances, a Gaussian cannot describe the tails: a sizeable
+fraction of pairs disagree far more than any Gaussian allows, while the core is
+already slightly too wide. A Student's $t$ handles both, because it is a Gaussian
+with a random scale. Give the star's noise a Gamma-distributed precision $u$,
+\begin{equation}
+  \bv y_a \mid u \sim \N(\bv z, \bM S_a/u), \qquad
+  u \sim \mathrm{Gamma}\!\left(\tfrac\nu2,\tfrac\nu2\right), \quad \mathbb E[u]=1 .
+\end{equation}
+All the star's entries share one $u$: that is the statement ``this star is a
+binary / a bad match / blended'', which is a property of the star and not of a
+single measurement.
+
+Conditionally on $u$, equation~\eqref{eq:gauss} holds with $\bM S_a\to\bM S_a/u$,
+i.e.\ $\bM A\to u\bM A$, $q\to uq$ and $\lndet(u\bM A)+\sum_a\lndet(\bM S_a/u)
+= \lndet\bM A+\sum_a\lndet\bM S_a - n_{\rm res}\ln u$, because
+$\sum_a d_a - d_{\rm shared} = n_{\rm res}$. Hence
+\begin{equation}
+  p\big(\{\bv y_a\}\mid u\big) = \mathcal L_G\, u^{\,n_{\rm res}/2}e^{-uq/2},
+\end{equation}
+where $\mathcal L_G$ collects the $u$-independent factors of
+\eqref{eq:gauss}. Multiplying by the Gamma density and integrating,
+\begin{equation}
+  \int_0^\infty u^{\frac{\nu+n_{\rm res}}{2}-1}e^{-u(\nu+q)/2}\dd u
+  = \Gamma\!\left(\tfrac{\nu+n_{\rm res}}{2}\right)
+    \left(\tfrac{\nu+q}{2}\right)^{-\frac{\nu+n_{\rm res}}{2}},
+\end{equation}
+which is a Gamma integral --- the reason a $t$ costs no iteration here. The
+result is the multivariate-$t$ law of the $n_{\rm res}$-dimensional difference
+vector, with $\nu$ degrees of freedom and scale given by the $\bM S_a$:
+\begin{equation}
+  -2\ln p = \lndet\bM A + \sum_a \lndet\bM S_a
+  + (\nu+n_{\rm res})\ln\!\left(1+\frac{q}{\nu}\right)
+  + 2\ln\Gamma\!\left(\tfrac\nu2\right) - 2\ln\Gamma\!\left(\tfrac{\nu+n_{\rm res}}{2}\right)
+  + n_{\rm res}\ln(\nu\pi).
+  \label{eq:t}
+\end{equation}
+As $\nu\to\infty$, $(\nu+n_{\rm res})\ln(1+q/\nu)\to q$ and Stirling gives
+$n_{\rm res}\ln(\nu\pi)+2\ln\Gamma(\nu/2)-2\ln\Gamma((\nu+n_{\rm res})/2)\to n_{\rm res}\ln 2\pi$,
+so \eqref{eq:t} reduces to \eqref{eq:gauss} term for term.
+
+$\nu$ is one number per group, $\nu_g = 2+\mathrm{softplus}(\vartheta_g)$, so the
+tail weight is a property of the pipeline and $\nu>2$ is automatic. Under
+\eqref{eq:t} a quadratic form is no longer $\chi^2$: if the marginal is
+$t_\nu$ with scale $\bM W$ in $n_{\rm res}$ dimensions, then
+$q/n_{\rm res}\sim F(n_{\rm res},\nu)$, which is the reference distribution for
+the coverage and pair-consistency diagnostics.
+
+\section{Priors and estimation}
+\label{sec:est}
+
+The loss is the mean star log-likelihood plus weak penalties that say what the
+correction should be when the data are silent (the bar averages over entries and
+measured parameters):
+\begin{align}
+  \bv\ell:\quad &\tfrac12\,\overline{(\bv\ell/\sigma_\ell)^2},
+  \quad \sigma_\ell=1 \ \ \text{(the quoted errors are right, $\bM M=\bM I$)} \\
+  \bv\alpha:\quad &\tfrac12\,\overline{\big((\ln\bv\alpha-\ln\bv\alpha_{\min})/\sigma_\alpha\big)^2},
+  \quad \sigma_\alpha=4 \ \ \text{(nothing is added unless the data lift it)} \\
+  \vartheta:\quad &\tfrac12\,\overline{\big((\vartheta-6)/2\big)^2},
+  \quad \nu_0 = 2+\mathrm{softplus}(6)=8 \ \ \text{(heavy enough to matter, harmless if not)} \\
+  \bv\tau:\quad &\tfrac12\,\overline{\big(\bv\tau/\sigma_\tau\big)^2},
+  \quad \sigma_\tau \ \text{small} \ \ \text{(no shared term unless needed)}
+\end{align}
+The same prior is also imposed away from the data at a fixed low-discrepancy set
+of $\bv\theta$ points (``control points'', masked to the parameters a group
+measures), which is what stops the network from inventing corrections where a
+group has no stars. All parameters are fitted jointly by Adam on the training
+stars (a hash of the source id puts $\approx 1/8$ of stars aside for validation),
+and the model is compared against nested baselines: no correction, the flat
+$0.03$ floor, and constant per-group scale and additive terms.
+
+\section{What the data identify}
+\label{sec:ident}
+
+Three degeneracies are worth knowing when reading the fitted numbers.
+\begin{enumerate}
+  \item \emph{Scale versus additive term.} Within one group they are separated
+  only by the \emph{spread} of quoted uncertainties: a catalog quoting one
+  $\sigma$ for every star cannot tell them apart, and the fit then follows the
+  priors.
+  \item \emph{Inside a group.} The sum $\bM S_1+\bM S_2$ is measured; the split
+  is not, unless the correction is shared (Section~\ref{sec:groups}).
+  \item \emph{Weakly connected groups.} A catalog whose stars are almost all in
+  one other group pins only the combination of the two; the per-group numbers are
+  then prior-dominated and should be read as differences, not absolutes.
+\end{enumerate}
+\end{document}
