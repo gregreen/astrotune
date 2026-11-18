@@ -272,7 +272,7 @@ def star_nll(batch: Dict[str, object], delta_fn: DeltaFn,
     of ``C``) plus a diagonal term. ``ln_scale = 0`` and ``ln_add -> -inf``
     reproduce the untransformed covariance exactly.
 
-    ``nu`` (one degrees of freedom per catalog, or None for Gaussian errors) turns the
+    ``nu`` (one degree of freedom per catalog, or None for Gaussian errors) turns the
     marginal into a multivariate Student's t. The likelihood above is a Gaussian
     density in the ``n_res`` differences with quadratic form ``quad_s``; giving the
     star's noise a Gamma-distributed precision ``u`` and integrating ``u`` out turns

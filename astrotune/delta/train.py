@@ -138,8 +138,10 @@ def fit(model, stars, cfg: DeltaConfig, epochs: int, lr: float, val=None,
 
     @tf.function(input_signature=[_spec(tf)])
     def step(batch):
-        nu = model.nu() if cfg.learn_nu and hasattr(model, "nu") else None
         with tf.GradientTape() as tape:
+            # nu must be read *inside* the tape, or its variable is a constant to the
+            # tape and the tail weight silently stays at its initial value.
+            nu = model.nu() if cfg.learn_nu and hasattr(model, "nu") else None
             nll, params = star_nll(batch, model, nu=nu)
             data = tf.reduce_mean(nll)
             prior = cfg.prior_weight * prior_penalty(batch, params)

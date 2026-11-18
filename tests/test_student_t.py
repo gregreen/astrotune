@@ -117,5 +117,8 @@ def test_a_learnt_tail_weight_absorbs_outliers_without_inflating_the_core():
     fit(gauss, s, DeltaConfig(**{**base.__dict__, "learn_nu": False}), epochs=40, lr=0.1,
         desc="gauss")
     nu = t.nu().numpy()
+    # The tail weight must have *moved*: reading it outside the gradient tape leaves it
+    # at its initial value, which is exactly the bug this asserts against.
+    assert np.all(np.abs(nu - 8.0) > 0.5), nu
     assert np.all(nu < 15.0), nu  # the t is preferred over Gaussian tails
     assert np.all(t.scale_sigma() < gauss.scale_sigma() * 0.8)  # and the scale is smaller
