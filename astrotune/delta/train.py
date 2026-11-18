@@ -466,30 +466,34 @@ def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) ->
     The rows are the *validation* entries of each catalog (the sample every other
     number in ``evaluation/`` is measured on). ``median scale`` is the median of the
     sigma scale ``exp(ln_scale / 2)`` over those entries and the parameters they
-    measure (1 = the quoted error is left alone), ``median add`` the same for the
-    additive sigma (the floor is 0.003), ``nu`` the group's degrees of freedom, and
-    ``median dln det`` the median change in the log determinant of the entry
-    covariance, ``ln det S_m - ln det C_m`` over the measured submatrix -- how much
-    volume the correction adds or removes, and the one number that combines the two
-    terms (four parameters at scale 0.35 with nothing additive would be
-    ``8 ln 0.35 = -8.4``). The group's shared variance is *not* in these columns,
-    since it is not a property of the catalog; ``evaluation/shared.txt`` has it, and
-    for the members of a group it is the part that does not shrink.
+    measure (1 = the quoted error is left alone), ``median add*`` the same for the
+    additive sigma *including the group's shared variance* (the floor is 0.003, so a
+    value above it is the systematic the catalog shares with the rest of its group),
+    ``nu`` the group's degrees of freedom, and ``median dln det*`` the median change in
+    the log determinant of the total entry covariance ``S + diag(tau^2)``,
+    ``ln det - ln det C_m`` over the measured submatrix -- how much volume the
+    correction adds or removes, and the one number that combines all three terms
+    (four parameters at scale 0.35 with nothing additive would be ``8 ln 0.35 =
+    -8.4``). The starred columns are the covariance the merge will use; the scale is
+    the part that is independent between the catalogs of a group.
     """
-    from .model import model_nu, numpy_delta_fn
+    from .model import model_nu, model_shared, numpy_delta_fn
 
     fn = numpy_delta_fn(model)
     nu = model_nu(model)
+    shared = model_shared(model)
     n_cat, n_par = len(keys), N_PARAMS
     n_ent = int(stars["off"][-1])
     s_val = np.zeros((n_ent, n_par), dtype="f4")  # sigma scale
-    a_val = np.zeros((n_ent, n_par), dtype="f4")  # additive sigma
+    a_val = np.zeros((n_ent, n_par), dtype="f4")  # additive sigma, shared included
     dlndet = np.full(n_ent, np.nan)
     for lo in range(0, n_ent, chunk):
         sl = slice(lo, min(lo + chunk, n_ent))
         ln_scale, ln_add = fn(stars["x"][sl], stars["ls"][sl], stars["g"][sl])
         s = np.exp(0.5 * ln_scale.astype("f8"))
         a = np.exp(0.5 * ln_add.astype("f8"))
+        if shared is not None:
+            a = np.sqrt(a**2 + np.asarray(shared, dtype="f8")[stars["g"][sl]])
         s_val[sl], a_val[sl] = s, a
         # The determinant over the parameters the entry measures (a placeholder axis of
         # 1e9 would otherwise dominate it), grouped by mask so the subset is exact.
@@ -506,9 +510,9 @@ def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) ->
             dlndet[lo + np.flatnonzero(rows)] = (np.linalg.slogdet(Sm)[1]
                                                  - np.linalg.slogdet(Cm)[1])
 
-    lines = [f"{'catalog':24s}{'n':>9s}{'median scale':>14s}{'median add':>12s}"
-             f"{'nu':>7s}{'median dln det':>16s}",
-             "-" * 82]
+    lines = [f"{'catalog':24s}{'n':>9s}{'median scale':>14s}{'median add*':>13s}"
+             f"{'nu':>7s}{'median dln det*':>17s}",
+             "-" * 83]
     for k, key in enumerate(keys):
         label = registry.get_spec(key).label if key in registry.keys() else key
         in_cat = stars["c"] == k
@@ -521,6 +525,17 @@ def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) ->
         nu_k = "-" if nu is None else f"{nu[stars['g'][np.argmax(in_cat)]]:.1f}"
         lines.append(f"{label[:24]:24s}{int(in_cat.sum()):9,d}{sc:14.2f}{ad:12.4f}"
                      f"{nu_k:>7s}{np.median(de) if de.size else np.nan:16.2f}")
+    if shared is not None and np.any(np.asarray(shared) > 0):
+        # Name the groups whose additive column carries a systematic, so the starred
+        # numbers are not mistaken for a per-catalog property.
+        known = all(key in registry.keys() for key in keys)
+        g_labels = registry.group_labels(keys) if known else tuple(keys)
+        for gi in np.flatnonzero(np.max(np.asarray(shared), axis=1) > 0):
+            tau = np.sqrt(np.maximum(np.asarray(shared)[gi], 0.0))
+            lines.append("")
+            lines.append(f"* {g_labels[gi]}: shared sigma "
+                         + "/".join(f"{t:.4f}" for t in tau)
+                         + " (" + ", ".join(PARAM_NAMES) + "), part of the starred columns")
     return "\n".join(lines)
 
 
