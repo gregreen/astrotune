@@ -63,7 +63,7 @@ from matplotlib.ticker import FuncFormatter
 
 from .. import registry
 from .diagnostics import PARAM_NAMES
-from .model import LN_MIN, load_delta_model, numpy_delta_fn
+from .model import LN_MIN, load_delta_model, model_shared, numpy_delta_fn
 from .stars import N_PARAMS, get_star_table
 
 log = logging.getLogger(__name__)
@@ -165,6 +165,10 @@ def build_kiel_cube(run_dir, model=None, sample: str = "model", keys=None,
     teff_edges, logg_edges = _frame(stars["x"][:, 0], stars["x"][:, 2], n_bins)
     del stars
 
+    # The model's category is the group; the shared systematic of a group is part of
+    # the error its catalogs have when compared with the rest of the sky.
+    group_of = registry.group_index(keys)
+    shared = model_shared(model)
     n_feh = len(FEH_EDGES) - 1
     shape = (N_PARAMS, n_feh, len(teff_edges) - 1, len(logg_edges) - 1)
     log_ratio = np.full((n_cat,) + shape, np.nan, dtype="f4")
@@ -180,9 +184,16 @@ def build_kiel_cube(run_dir, model=None, sample: str = "model", keys=None,
             log.warning("%s: no entry measures Teff, logg and [Fe/H]; skipped",
                         registry.get_spec(keys[k]).label)
             continue
-        ln_scale, ln_add = delta_fn(x, ls, np.full(len(x), k, dtype="i4"))
-        # sigma_out / sigma_in, per parameter: 1 means the quoted error is left alone
-        var = np.exp(ln_scale.astype("f8")) + np.exp(ln_add.astype("f8")) / np.exp(2.0 * ls.astype("f8"))
+        ln_scale, ln_add = delta_fn(x, ls, np.full(len(x), group_of[k], dtype="i4"))
+        shared_k = 0.0 if shared is None else shared[group_of[k]]
+        # sigma_out / sigma_in, per parameter: 1 means the quoted error is left alone.
+        # The group's shared variance is in absolute units, so it is divided by the
+        # entry's own variance to become part of the ratio; the additive page below
+        # keeps the model's own additive term, since the shared part is a constant of
+        # the group and would only shift every panel's colour scale.
+        c_in = np.exp(2.0 * ls.astype("f8"))
+        var = ((np.exp(ln_scale.astype("f8")) * c_in + np.exp(ln_add.astype("f8"))
+                + shared_k) / c_in)
         lr = 0.5 * np.log(np.maximum(var, 1e-300))
         sa = np.exp(0.5 * ln_add.astype("f8"))
         for p in range(N_PARAMS):

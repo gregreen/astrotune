@@ -37,6 +37,7 @@ def _stars(n_star=200, n_cat=3, sigma=(0.02, 0.05, 0.1), c_reported=0.03, seed=0
            for k, v in flat.items()}
     out["m"] = np.ones((n * K, 4), dtype=bool)
     out["c"] = out["c"].astype("i4")
+    out["g"] = out["c"].copy()
     out["id"] = np.arange(n, dtype="i8") + 1
     out["n_entry"] = np.full(n, K, dtype="i4")
     out["off"] = np.r_[0, np.cumsum(out["n_entry"])].astype("i8")
@@ -80,14 +81,15 @@ def test_the_two_catalog_marginal_is_a_multivariate_t():
         assert float(nll[i].numpy()) == pytest.approx(ref, rel=1e-6, abs=1e-6)
 
 
-def test_the_star_tail_weight_is_the_mean_over_its_catalogs():
+def test_the_star_tail_weight_is_the_mean_over_its_groups():
+    """The tail weight belongs to the group, so that is what the mean runs over."""
     from astrotune.delta.diagnostics import _star_nu
 
     s = _stars(n_star=3, n_cat=3)
     nu = np.array([4.0, 6.0, 11.0])
     assert np.allclose(_star_nu(s, nu), 7.0)  # every star sees all three
-    s["c"][0] = 1  # star 0 now sees catalogs 1, 1, 2 (edge case: repetition cannot
-    # happen in a real table, but the mean must still be well defined)
+    s["g"][0] = 1  # star 0 now sees groups 1, 1, 2 (repetition cannot happen in a
+    # real table, but the mean must still be well defined)
     assert _star_nu(s, nu)[0] == pytest.approx((6 + 6 + 11) / 3)
     assert np.all(np.isinf(_star_nu(s, None)))
 

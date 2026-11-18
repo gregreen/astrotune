@@ -22,6 +22,7 @@ def _table(n_star=400, n_cat=2, sigma=0.03, alpha=True):
            for k, v in dict(x=x, ls=ls, y=n / 2 + 0 * x, C=C).items()}
     out["m"] = np.ascontiguousarray(m.reshape(n * K, 4))
     out["c"] = np.tile(np.arange(K, dtype="i4"), n)
+    out["g"] = out["c"].copy()
     out["id"] = np.arange(n, dtype="i8") + 1
     out["n_entry"] = np.full(n, K, dtype="i4")
     out["off"] = np.r_[0, np.cumsum(out["n_entry"])].astype("i8")

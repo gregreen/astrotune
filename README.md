@@ -205,6 +205,11 @@ astrotune-delta-kiel --run-dir models/my_run       # where in the Kiel diagram d
 All write to `models/my_run/delta/`: `star_table.npz` is every observation of
 every star (grouped by star), and the fit is the latent-y likelihood with the
 star's value integrated out, so a star counts once however many catalogs saw it.
+Catalogs that run the same pipeline on the same spectra (APOGEE DR17 and SDSS-V
+ASPCAP) form a *group*: they share one correction and one systematic error, so a
+group of two is not counted as two independent measurements. `evaluation/shared.txt`
+holds that shared σ per group and parameter; the Kiel and uncertainty figures show
+the *total* error (`S + G`), which is what the merge has to use.
 `kiel/` holds one 4x4 page per catalog — a column per parameter, a row per
 [Fe/H] bin with [Fe/H] descending downwards, the median learned variance in
 (Teff, logg) bins — plus `kiel_cube.npz` for other cuts. `astrotune-delta-train`

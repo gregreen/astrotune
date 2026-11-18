@@ -81,8 +81,12 @@ class DeltaConfig:
     nu_prior_mean: float = 6.0  # in the unconstrained coordinate: nu = 2 + softplus(6) = 8
     nu_prior_sd: float = 2.0  # 95 % of the prior mass on nu in [4.1, 12.0]
     nu_prior_weight: float = 0.01
+    #: Prior that pulls each group's shared variance down to the floor
+    shared_prior_weight: float = 0.01
     #: One figure per catalog: quoted against calibrated uncertainties
     uncertainty_plots: bool = True
+    #: Fit one shared systematic per group of catalogs that run the same pipeline
+    groups: bool = True
 
 
 def _spec(tf):
@@ -91,6 +95,7 @@ def _spec(tf):
         "x": tf.TensorSpec([None, N_PARAMS], tf.float32),
         "ls": tf.TensorSpec([None, N_PARAMS], tf.float32),
         "c": tf.TensorSpec([None], tf.int32),
+        "g": tf.TensorSpec([None], tf.int32),
         "y": tf.TensorSpec([None, N_PARAMS], tf.float32),
         "C": tf.TensorSpec([None, N_PARAMS, N_PARAMS], tf.float32),
         "m": tf.TensorSpec([None, N_PARAMS], tf.bool),
@@ -107,13 +112,32 @@ def mean_star_nll(stars, delta_fn, batch_size: int = 131072, max_stars: Optional
 
     if max_stars is not None and len(stars["id"]) > max_stars:
         stars = _first_stars(stars, max_stars)
+    n_group, shared = _group_state(delta_fn)
     total, n = 0.0, 0
     nu = delta_fn.nu() if hasattr(delta_fn, "nu") else None
     for idx, seg, n_star in block_indices(stars, None, batch_size):
-        nll, _ = star_nll(make_batch(stars, idx, seg), delta_fn, nu=nu)
+        nll, _ = star_nll(make_batch(stars, idx, seg), delta_fn, nu=nu, n_group=n_group,
+                          shared=shared)
         total += float(tf.reduce_sum(nll))
         n += n_star
     return total / max(n, 1)
+
+
+def _group_state(model):
+    """``(n_group, shared)`` for the hierarchy, or ``(None, None)`` if ungrouped.
+
+    The shared term is only worth its extra level when some group actually has more
+    than one catalog; with every group a singleton the flat code path is both
+    sufficient and identical. The decision is made from the model's multiplicity, not
+    from the current value of tau: a shared variance that starts at zero floor still
+    has to be able to grow. Note that ``shared`` is a *snapshot* -- inside a
+    ``tf.function`` the caller has to rebuild it from ``model.shared`` (see
+    :func:`fit`), or the variable would be baked in as a constant.
+    """
+    shared_mod = getattr(model, "shared", None)
+    if shared_mod is None or not shared_mod.has_shared():
+        return None, None
+    return int(shared_mod.multi.shape[0]), shared_mod.variance()  # len == n_group
 
 
 def _first_stars(stars, n_star: int):
@@ -139,14 +163,17 @@ def fit(model, stars, cfg: DeltaConfig, epochs: int, lr: float, val=None,
     sched = keras.optimizers.schedules.CosineDecay(lr, steps * epochs, alpha=0.01)
     opt = keras.optimizers.Adam(learning_rate=sched)
     variables = list(model.trainable_variables)
+    # Static for the whole fit, so the traced step has one branch
+    n_group, shared = _group_state(model)
 
     @tf.function(input_signature=[_spec(tf)])
     def step(batch):
         with tf.GradientTape() as tape:
-            # nu must be read *inside* the tape, or its variable is a constant to the
-            # tape and the tail weight silently stays at its initial value.
+            # nu and the shared variance must be read *inside* the tape, or their
+            # variables are constants to it and never move off their initial value.
             nu = model.nu() if cfg.learn_nu and hasattr(model, "nu") else None
-            nll, params = star_nll(batch, model, nu=nu)
+            shared_t = model.shared.variance() if n_group is not None else None
+            nll, params = star_nll(batch, model, nu=nu, n_group=n_group, shared=shared_t)
             data = tf.reduce_mean(nll)
             prior = cfg.prior_weight * prior_penalty(batch, params)
             loss = data + tf.cast(prior, tf.float64) + tf.cast(cfg.l2_weights * l2_penalty(model), tf.float64)
@@ -154,6 +181,10 @@ def fit(model, stars, cfg: DeltaConfig, epochs: int, lr: float, val=None,
                 # One Gaussian prior per catalog on the unconstrained dof coordinate
                 loss += tf.cast(cfg.nu_prior_weight * model.tail.prior_penalty(
                     cfg.nu_prior_mean, cfg.nu_prior_sd), tf.float64)
+            if getattr(model, "shared", None) is not None:
+                # ... and one that pulls each group's shared variance down to the floor
+                loss += tf.cast(cfg.shared_prior_weight * model.shared.prior_penalty(),
+                                tf.float64)
             if control is not None and cfg.control_weight:
                 # Away from the data the model is pulled to scale 1, add 0: the same
                 # prior, evaluated on points the likelihood never sees.
@@ -194,12 +225,16 @@ def plot_learned_delta(model, stars, labels: Sequence[str], path: Path) -> Path:
     import matplotlib.pyplot as plt
 
     from ..training_plots import catalog_colors
-    from .model import numpy_delta_fn
+    from .model import model_shared, numpy_delta_fn
 
     fn = numpy_delta_fn(model)
-    x, ls, c, m = stars["x"], stars["ls"], stars["c"], stars["m"]
-    ln_scale, ln_add = fn(x, ls, c)
-    ratio = np.sqrt(np.exp(ln_scale.astype("f8")) + np.exp(ln_add.astype("f8")) / np.exp(2.0 * ls.astype("f8")))
+    x, ls, c, g, m = stars["x"], stars["ls"], stars["c"], stars["g"], stars["m"]
+    ln_scale, ln_add = fn(x, ls, g)
+    shared = model_shared(model)
+    total = np.exp(ln_scale.astype("f8")) + np.exp(ln_add.astype("f8"))
+    if shared is not None:
+        total = total + shared[g]
+    ratio = np.sqrt(total / np.exp(2.0 * ls.astype("f8")))
     colors = catalog_colors(len(labels))
     fig, axes = plt.subplots(2, 2, figsize=(12, 9), layout="constrained", sharex=True)
     edges = np.quantile(x[:, 0], np.linspace(0, 1, 13))
@@ -251,7 +286,7 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     import tensorflow as tf
 
     from .model import (ConstDelta, ConstScaleAdd, ScaleAddNetwork, control_points, fixed_delta,
-                        model_nu, numpy_delta_fn, save_delta_model)
+                        model_nu, model_shared, numpy_delta_fn, save_delta_model)
 
     cfg = cfg or DeltaConfig()
     run_dir = Path(run_dir)
@@ -263,11 +298,19 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     stars, keys = get_star_table(run_dir, out_dir, rebuild)
     labels = [registry.get_spec(k).label for k in keys]
     n_cat = len(keys)
+    # The model's category is the group: catalogs that run the same pipeline on the
+    # same spectra share their correction (and, through the hierarchy, their errors).
+    multiplicity = (registry.group_multiplicity(keys) if cfg.groups
+                    else tuple([1] * n_cat))
+    n_group = len(multiplicity)
+    group_labels = (registry.group_labels(keys) if cfg.groups else tuple(labels))
     train, val = split(stars)
     ctrl = control_points(stars, keys, cfg.n_control, cfg.seed) if cfg.n_control else None
     del stars
     log.info("%d training stars (%d entries), %d validation stars (%d entries)",
              len(train["id"]), int(train["off"][-1]), len(val["id"]), int(val["off"][-1]))
+    log.info("%d groups for %d catalogs: %s", n_group, n_cat,
+             [f"{g} ({m} catalogs)" for g, m in zip(group_labels, multiplicity) if m > 1] or "none")
     if ctrl is not None:
         log.info("%d control points (%d per catalog, weight %.3g)",
                  len(ctrl["c"]), cfg.n_control, cfg.control_weight)
@@ -278,33 +321,36 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         "none (propagated only)": fixed_delta(0.0),
         "floor 0.03 (as merge)": fixed_delta(0.03),
     }
-    const_add = ConstDelta(n_cat)
+    const_add = ConstDelta(n_group, multiplicity)
     hist_const = fit(const_add, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
                      desc="const add", control=ctrl)
     models["constant add"] = const_add
 
-    const = ConstScaleAdd(n_cat)
+    const = ConstScaleAdd(n_group, multiplicity)
     hist_const_sa = fit(const, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
                         desc="const scale+add", control=ctrl)
     models["constant scale+add"] = const
 
-    net = ScaleAddNetwork(n_cat, cfg.hidden_size, cfg.n_hidden)
+    net = ScaleAddNetwork(n_group, cfg.hidden_size, cfg.n_hidden, multiplicity)
     hist = fit(net, train, cfg, cfg.epochs, cfg.learning_rate, val, desc="network", control=ctrl)
     models["network scale+add"] = net
 
     save_delta_model(out_dir, net, dict(
-        n_cat=n_cat, hidden_size=cfg.hidden_size, n_hidden=cfg.n_hidden, keys=list(keys),
+        n_cat=n_group, hidden_size=cfg.hidden_size, n_hidden=cfg.n_hidden, keys=list(keys),
+        multiplicity=list(multiplicity), group_labels=list(group_labels),
         model_type="scale_add", config=dataclasses.asdict(cfg), val_history=hist,
     ))
 
-    nll, results, nus = {}, {}, {}
+    nll, results, nus, shareds = {}, {}, {}, {}
     for name, fn in models.items():
         nll[name] = mean_star_nll(val, fn, max_stars=cfg.val_max_stars)
         np_fn = numpy_delta_fn(fn) if hasattr(fn, "trainable_variables") else _fixed_np(fn)
         # With a learned tail weight the null of every chi2 diagnostic is an F
         # distribution, so the diagnostics need nu as well as the covariance.
         nus[name] = model_nu(fn) if hasattr(fn, "trainable_variables") else None
-        results[name] = diagnose(val, n_cat, np_fn, min_entries, nu=nus[name])
+        shareds[name] = model_shared(fn) if hasattr(fn, "trainable_variables") else None
+        results[name] = diagnose(val, n_cat, np_fn, min_entries, nu=nus[name],
+                                 group_cov=shareds[name], group_map=_group_map(keys))
         log.info("%s: validation NLL per star %.4f", name, nll[name])
     table = compare(results, nll)
     log.info("\n%s", table)
@@ -314,19 +360,27 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     sa_table = scale_add_table(models, val, labels)
     log.info("\n%s", sa_table)
     (ev_dir / "scale_add.txt").write_text(sa_table + "\n")
-    nu_table = format_nu(nus, labels)
+    nu_table = format_nu(nus, group_labels)
     if nu_table:
         log.info("\n%s", nu_table)
         (ev_dir / "nu.txt").write_text(nu_table + "\n")
+    shared_table = format_shared(shareds, group_labels)
+    if shared_table:
+        log.info("\n%s", shared_table)
+        (ev_dir / "shared.txt").write_text(shared_table + "\n")
     # The additive-only constant model is the maximum-likelihood three-cornered hat:
     # one excess variance per catalog and parameter that makes the entries agree.
     const_sigma = np.exp(0.5 * const_add.raw.numpy())
     np.savez(ev_dir / "const_delta.npz", sigma=const_sigma, keys=list(keys),
-             scale=const.scale_sigma(), add_sigma=const.add_sigma())
+             scale=const.scale_sigma(), add_sigma=const.add_sigma(),
+             shared=model_shared(net), multiplicity=np.asarray(multiplicity),
+             group_labels=np.asarray(group_labels, dtype=object))
     with open(ev_dir / "comparison.json", "w") as f:
         json.dump(to_json(dict(nll=nll, results={k: {kk: vv for kk, vv in v.items() if kk != "entries"}
                                                    for k, v in results.items()},
-                               nus=nus, keys=list(keys),
+                               nus=nus, shared=shareds, keys=list(keys),
+                               group_labels=list(group_labels),
+                               multiplicity=list(multiplicity),
                                const_sigma=const_sigma, const_scale=const.scale_sigma(),
                                const_add=const.add_sigma(), history=hist,
                                const_history=hist_const, const_scale_add_history=hist_const_sa)),
@@ -340,7 +394,8 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         from .diagnostics import pair_chi2, pair_chi2_text, plot_pair_chi2
 
         before = pair_chi2(val, None, max_pairs=cfg.pair_chi2_max)
-        after = pair_chi2(val, numpy_delta_fn(net), max_pairs=cfg.pair_chi2_max, nu=nus["network scale+add"])
+        after = pair_chi2(val, numpy_delta_fn(net), max_pairs=cfg.pair_chi2_max,
+                          nu=nus["network scale+add"], group_cov=shareds["network scale+add"])
         text = pair_chi2_text(before, after)
         log.info("\n%s", text)
         (ev_dir / "pair_chi2.txt").write_text(text + "\n")
@@ -353,6 +408,38 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         make_uncertainty_plots(run_dir, out_dir / "uncertainty_distribution", model=net,
                                sample="train", keys=keys)
     return dict(nll=nll, table=table, scale_add=sa_table)
+
+
+def _group_map(keys) -> np.ndarray:
+    """Group index of every catalog, for mapping ``stars["c"]`` to its group."""
+    return np.asarray(registry.group_index(keys), dtype="i4")
+
+
+def format_shared(shareds: Dict[str, Optional[np.ndarray]], labels: Sequence[str]) -> str:
+    """The fitted shared sigma per group and parameter, one column per trained arm.
+
+    This is the part of a group's error that its catalogs have *in common*: it does
+    not shrink when they are combined, and it has to be added to each catalog's own
+    covariance before the merge. Groups of one catalog have none and are omitted.
+    """
+    arms = [(name, s) for name, s in shareds.items() if s is not None]
+    if not arms:
+        return ""
+    # Groups with a shared term in any arm; the singletons are exactly zero.
+    multi = [i for i in range(len(arms[0][1]))
+             if any(np.any(s[i] > 0) for _, s in arms)]
+    if not multi:
+        return ""
+    width = max(len(labels[i]) for i in multi)
+    head = f"{'shared sigma':14s}{'group':{width + 2}s}" + "".join(
+        f"{n:>16s}" for n, _ in arms)
+    lines = [head, "-" * len(head)]
+    for i in multi:
+        for p, pname in enumerate(PARAM_NAMES):
+            lines.append(
+                f"{pname:14s}{(labels[i] if p == 0 else ''):{width + 2}s}"
+                + "".join(f"{np.sqrt(max(s[i, p], 0.0)):16.4f}" for _, s in arms))
+    return "\n".join(lines)
 
 
 def format_nu(nus: Dict[str, Optional[np.ndarray]], labels: Sequence[str]) -> str:
@@ -374,21 +461,26 @@ def scale_add_table(models: Dict[str, object], stars, labels: Sequence[str],
 
     Medians over the validation entries of each catalog, so the network is described
     by the same two numbers as the constant arms. ``sigma ratio`` is the combined
-    effect at that catalog's median quoted error, ``sqrt(scale + add/C)`` -- the
-    inflation of the error the merge actually applies.
+    effect at that catalog's median quoted error, ``sqrt(scale + (add + tau^2)/C)``
+    -- the inflation of the error the merge actually applies, so it includes the
+    group's shared variance ``tau^2`` and is the number to compare with 1. ``add sig``
+    likewise shows the total additive sigma, ``sqrt(add + tau^2)``; for the members of
+    a group both rows therefore carry the same shared part.
     """
-    from .model import numpy_delta_fn
+    from .model import model_shared, numpy_delta_fn
 
-    x, ls, c, m = stars["x"], stars["ls"], stars["c"], stars["m"]
+    x, ls, c, g, m = stars["x"], stars["ls"], stars["c"], stars["g"], stars["m"]
     if len(x) > max_entries:  # a stable subsample is enough for medians
         step = int(np.ceil(len(x) / max_entries))
-        x, ls, c, m = x[::step], ls[::step], c[::step], m[::step]
+        x, ls, c, g, m = x[::step], ls[::step], c[::step], g[::step], m[::step]
     rows = []
     for name, fn in models.items():
         if not hasattr(fn, "trainable_variables"):
             continue
-        scale, add = numpy_delta_fn(fn)(x, ls, c)
+        scale, add = numpy_delta_fn(fn)(x, ls, g)
         s2, a = np.exp(scale.astype("f8")), np.exp(add.astype("f8"))
+        shared = model_shared(fn) if hasattr(fn, "shared_variance") else None
+        a = a + (0.0 if shared is None else shared[g])  # total, as the merge sees it
         C = np.exp(2.0 * ls.astype("f8"))
         ratio = np.sqrt(s2 + a / C)
         for k, lab in enumerate(labels):

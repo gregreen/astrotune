@@ -40,7 +40,7 @@ import matplotlib.pyplot as plt
 from .. import registry
 from ..config import ERROR_FLOORS
 from .diagnostics import PARAM_NAMES
-from .model import load_delta_model, numpy_delta_fn
+from .model import load_delta_model, model_shared, numpy_delta_fn
 from .stars import N_PARAMS, get_star_table, split
 
 log = logging.getLogger(__name__)
@@ -93,18 +93,24 @@ def uncertainty_distributions(run_dir, model=None, sample: str = "train", keys=N
     """Quoted and calibrated uncertainties per catalog and parameter.
 
     Returns ``{catalog index: (raw, calibrated, measured)}`` with ``(n, 4)`` arrays.
+    The calibrated sigma includes the group's shared systematic, i.e. it is the error
+    the entry has when compared with the rest of the sky -- the one the merge uses.
     """
     run_dir = Path(run_dir)
     delta_dir = run_dir / "delta"
     keys = tuple(keys) if keys is not None else registry.run_keys(run_dir)
     model = model if model is not None else load_delta_model(delta_dir, keys=keys)
     delta_fn = numpy_delta_fn(model)
+    group_of = registry.group_index(keys)
+    shared = model_shared(model)
 
     out = {}
     for k, x, ls, c_diag, measured in _entries(run_dir, sample, keys, delta_dir):
-        ln_scale, ln_add = delta_fn(x, ls, np.full(len(x), k, dtype="i4"))
+        ln_scale, ln_add = delta_fn(x, ls, np.full(len(x), group_of[k], dtype="i4"))
+        shared_k = 0.0 if shared is None else shared[group_of[k]]
         raw = np.sqrt(np.maximum(c_diag, 0.0))
-        cal = np.sqrt(np.exp(ln_scale.astype("f8")) * c_diag + np.exp(ln_add.astype("f8")))
+        cal = np.sqrt(np.exp(ln_scale.astype("f8")) * c_diag
+                      + np.exp(ln_add.astype("f8")) + shared_k)
         out[k] = (raw, cal, measured)
     return out
 

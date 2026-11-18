@@ -88,21 +88,31 @@ def _segments(seg: np.ndarray) -> np.ndarray:
 
 
 def _entry_cov(stars: StarTable, idx: np.ndarray,
-               delta_fn: Optional[DeltaFn] = None) -> np.ndarray:
-    """``S = diag(s) C diag(s) + diag(add)`` for the entries ``idx``."""
+               delta_fn: Optional[DeltaFn] = None,
+               group_cov: Optional[np.ndarray] = None) -> np.ndarray:
+    """``S = diag(s) C diag(s) + diag(add)`` for the entries ``idx``.
+
+    With ``group_cov`` (one shared variance per group and parameter) the shared part
+    is added as well, which makes this the covariance an entry has when compared with
+    anything *outside* its group -- the one the merge uses.
+    """
     S = stars["C"][idx].astype("f8")
     if delta_fn is not None:
-        ln_scale, ln_add = delta_fn(stars["x"][idx], stars["ls"][idx], stars["c"][idx])
+        ln_scale, ln_add = delta_fn(stars["x"][idx], stars["ls"][idx], stars["g"][idx])
         s = np.exp(0.5 * ln_scale.astype("f8"))
         S = S * s[:, :, None] * s[:, None, :]
         ii = np.arange(N_PARAMS)
         S[:, ii, ii] += np.exp(ln_add.astype("f8"))
+    if group_cov is not None:
+        ii = np.arange(N_PARAMS)
+        S[:, ii, ii] += np.asarray(group_cov, dtype="f8")[stars["g"][idx]]
     return S
 
 
 def pair_chi2(stars: StarTable, delta_fn: Optional[DeltaFn] = None, chunk: int = 100_000,
               max_pairs: Optional[int] = None, seed: int = 0,
-              nu: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+              nu: Optional[np.ndarray] = None,
+              group_cov: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
     """``chi2`` of every pair of entries of the same star, one number per pair.
 
     For two entries of one star the difference ``y_a - y_b`` has covariance
@@ -113,9 +123,11 @@ def pair_chi2(stars: StarTable, delta_fn: Optional[DeltaFn] = None, chunk: int =
     makes this a direct test of the covariance model, independent of how the star's
     value was combined.
 
-    ``nu`` (one tail weight per catalog) is recorded per pair as ``tail``: under a
+    ``nu`` (one tail weight per group) is recorded per pair as ``tail``: under a
     Student's t the same quadratic form is ``d * F(d, tail)``, so the reference curve
-    changes shape even though the statistic does not.
+    changes shape even though the statistic does not. ``group_cov`` adds the shared
+    part to the difference for pairs from *different* groups, where it does not
+    cancel; pairs inside one group are unaffected by it, which is a useful check.
 
     Unlike the star-level chi2 this is *not* a set of independent statistics: the
     ``K (K - 1) / 2`` pairs of a star share entries. It is a distributional check
@@ -125,8 +137,11 @@ def pair_chi2(stars: StarTable, delta_fn: Optional[DeltaFn] = None, chunk: int =
     tail = _star_nu(stars, nu)
     chi2, nu_dim, nu_val = [], [], []
     for idx, seg, n in block_indices(stars, None, chunk):
-        S = _entry_cov(stars, idx, delta_fn)
+        S = _entry_cov(stars, idx, delta_fn)  # independent part only
         y, m = stars["y"][idx].astype("f8"), stars["m"][idx]
+        g_idx = stars["g"][idx]
+        shared = np.zeros((len(idx), N_PARAMS)) if group_cov is None else \
+            np.asarray(group_cov, dtype="f8")[g_idx]
         counts = np.bincount(seg, minlength=n)
         starts = np.r_[0, np.cumsum(counts)[:-1]]
         for k in np.unique(counts):
@@ -146,6 +161,12 @@ def pair_chi2(stars: StarTable, delta_fn: Optional[DeltaFn] = None, chunk: int =
                     continue
                 rows = key == kk
                 M = (S[a[rows]] + S[b[rows]])[:, sel][:, :, sel]
+                # the shared part cancels between two entries of the same group
+                same = g_idx[a[rows]] == g_idx[b[rows]]
+                if not same.all():
+                    extra = np.where(same[:, None], 0.0, shared[a[rows]] + shared[b[rows]])
+                    dg = np.arange(M.shape[1])
+                    M[:, dg, dg] += extra[:, sel]
                 d = (y[a[rows]] - y[b[rows]])[:, sel]
                 sol = np.linalg.solve(M, d[:, :, None])[:, :, 0]
                 chi2.append(np.einsum("ni,ni->n", d, sol))
@@ -243,7 +264,8 @@ def plot_pair_chi2(before: Dict[str, np.ndarray], after: Dict[str, np.ndarray],
 
 
 def entry_stats(stars: StarTable, delta_fn: Optional[DeltaFn] = None,
-                chunk: int = 200_000, nu: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+                chunk: int = 200_000, nu: Optional[np.ndarray] = None,
+                group_cov: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
     """Residuals of every entry against its star's combined value.
 
     Returns, per entry, ``d``, ``sd`` (the residual standard deviation), ``z`` (NaN
@@ -270,13 +292,7 @@ def entry_stats(stars: StarTable, delta_fn: Optional[DeltaFn] = None,
     for idx, seg, n in block_indices(stars, None, chunk):
         m = stars["m"][idx]
         mf = m.astype("f8")
-        S = stars["C"][idx].astype("f8")
-        if delta_fn is not None:
-            ln_scale, ln_add = delta_fn(stars["x"][idx], stars["ls"][idx], stars["c"][idx])
-            # S_ij = s_i C_ij s_j + delta_ij add_i, the congruence of the covariance
-            s = np.exp(0.5 * ln_scale.astype("f8"))
-            S = S * s[:, :, None] * s[:, None, :]
-            S[:, ii, ii] += np.exp(ln_add.astype("f8"))
+        S = _entry_cov(stars, idx, delta_fn, group_cov)
         Sinv = np.linalg.inv(S)
         starts = _segments(seg)
 
@@ -323,16 +339,16 @@ def entry_stats(stars: StarTable, delta_fn: Optional[DeltaFn] = None,
 
 
 def _star_nu(stars: StarTable, nu: Optional[np.ndarray]) -> np.ndarray:
-    """The star's tail weight: the mean over its entries of its catalogs' nu.
+    """The star's tail weight: the mean over its entries of its groups' nu.
 
     A star's entries share one scale variable in the likelihood (that is what makes
-    the t marginal analytic), so when its catalogs disagree the star gets their mean
+    the t marginal analytic), so when its groups disagree the star gets their mean
     -- the only choice that reduces to the global-nu model when they agree.
     """
     n_star = len(stars["id"])
     if nu is None:
         return np.full(n_star, np.inf)
-    nu_e = np.asarray(nu, dtype="f8")[stars["c"]]
+    nu_e = np.asarray(nu, dtype="f8")[stars["g"]]
     off = stars["off"][:-1]
     out = np.add.reduceat(nu_e, off) / stars["n_entry"] if n_star else np.zeros(0)
     return out
@@ -501,9 +517,15 @@ def to_json(obj):
 
 
 def diagnose(stars: StarTable, n_cat: int, delta_fn: Optional[DeltaFn] = None,
-             min_entries: int = 1000, nu: Optional[np.ndarray] = None) -> dict:
-    """Every calibration statistic, with the null of the model that produced ``nu``."""
-    return summarize(stars, entry_stats(stars, delta_fn, nu=nu), n_cat, min_entries)
+             min_entries: int = 1000, nu: Optional[np.ndarray] = None,
+             group_cov: Optional[np.ndarray] = None, group_map=None) -> dict:
+    """Every calibration statistic, with the null of the model that produced ``nu``.
+
+    ``group_cov`` (shared variance per group) is added to each entry's covariance so
+    that the residuals describe what the merge will use.
+    """
+    return summarize(stars, entry_stats(stars, delta_fn, nu=nu, group_cov=group_cov),
+                     n_cat, min_entries)
 
 
 def format_summary(res: dict, labels: Sequence[str], n_worst: int = 12) -> str:
@@ -628,16 +650,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write_diagnostics(res, labels, out_dir / "diagnostics")
     print(format_summary(res, labels))
     if args.model:
-        from .model import load_delta_model, model_nu, numpy_delta_fn
+        from .model import load_delta_model, model_nu, model_shared, numpy_delta_fn
 
         model = load_delta_model(out_dir, keys=keys)
         nu = model_nu(model)
+        shared = model_shared(model)
         if nu is not None:
-            log.info("tail weight per catalog: nu = %s", np.round(nu, 1).tolist())
+            log.info("tail weight per group: nu = %s", np.round(nu, 1).tolist())
+        if shared is not None:
+            log.info("shared sigma per group (max over parameters): %s",
+                     np.round(np.sqrt(np.maximum(shared.max(1), 0.0)), 4).tolist())
         log.info("pair chi2: quoted errors")
         before = pair_chi2(stars, None, max_pairs=args.max_pairs)
         log.info("pair chi2: with the saved delta model")
-        after = pair_chi2(stars, numpy_delta_fn(model), max_pairs=args.max_pairs, nu=nu)
+        after = pair_chi2(stars, numpy_delta_fn(model), max_pairs=args.max_pairs, nu=nu,
+                          group_cov=shared)
         text = pair_chi2_text(before, after)
         print(text)
         (out_dir / "diagnostics" / "pair_chi2.txt").write_text(text + "\n")

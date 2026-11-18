@@ -61,6 +61,7 @@ FIELDS = {
     "x": "the catalog's own parameters (0 where not measured)",
     "ls": "ln of the reported sigma_x (0 where not measured)",
     "c": "catalog index",
+    "g": "group index (catalogs that share a pipeline share a group)",
     "y": "harmonized parameters",
     "C": "harmonized covariance (4,4)",
     "m": "parameter measured by this entry",
@@ -70,7 +71,7 @@ FIELDS = {
     "n_entry": "entries of each star",
 }
 
-ENTRY_FIELDS = ("x", "ls", "c", "y", "C", "m", "seg")
+ENTRY_FIELDS = ("x", "ls", "c", "y", "C", "m", "seg", "g")
 STAR_FIELDS = ("id", "off", "n_entry")
 
 
@@ -189,7 +190,7 @@ def subset(stars: StarTable, keep_stars: np.ndarray) -> StarTable:
     out["off"] = np.r_[0, np.cumsum(out["n_entry"])].astype("i8")
     out["seg"] = np.repeat(np.arange(int(mask.sum()), dtype="i4"), out["n_entry"])
     for name in ENTRY_FIELDS:
-        if name == "seg":
+        if name == "seg" or name not in stars:
             continue
         out[name] = stars[name][entry]
     return out
@@ -238,7 +239,9 @@ def save_star_table(path: Path, stars: StarTable, keys: Sequence[str]) -> None:
 def load_star_table(path: Path) -> Tuple[StarTable, Sequence[str]]:
     with np.load(path) as f:
         keys = tuple(json.loads(str(f["_keys"])))
-        return {k: f[k] for k in FIELDS}, keys
+        # ``g`` is derived on load (``with_groups``), so a cache written before it
+        # existed is still valid.
+        return {k: f[k] for k in FIELDS if k in f}, keys
 
 
 def get_star_table(run_dir, out_dir: Optional[Path] = None, rebuild: bool = False):
@@ -250,8 +253,22 @@ def get_star_table(run_dir, out_dir: Optional[Path] = None, rebuild: bool = Fals
         stars, keys = load_star_table(path)
         if tuple(keys) == tuple(registry.run_keys(run_dir)):
             log.info("Loaded %s", path)
-            return stars, keys
+            return with_groups(stars, keys), keys
         log.warning("%s was made for other catalogs; rebuilding", path)
     stars, keys = build_star_table(run_dir)
     save_star_table(path, stars, keys)
-    return stars, keys
+    return with_groups(stars, keys), keys
+
+
+def with_groups(stars: StarTable, keys: Sequence[str]) -> StarTable:
+    """Add the group index ``g`` of every entry, derived from its catalog ``c``.
+
+    Catalogs that run the same pipeline on the same spectra share one model
+    category (see :data:`astrotune.registry.GROUPS`), so the delta model's
+    parameters -- and its shared systematic -- are indexed by ``g``, not by ``c``.
+    Deriving it on load keeps existing ``star_table.npz`` caches valid.
+    """
+    g_of_catalog = np.asarray(registry.group_index(keys), dtype="i4")
+    out = dict(stars)
+    out["g"] = g_of_catalog[np.asarray(stars["c"], dtype="i8")]
+    return out

@@ -43,6 +43,7 @@ def _stars(n_star=30000, scale=(4.0, 1.0, 0.25), seed=0, sigma_spread=0.7):
            for k, v in flat.items()}
     out["m"] = np.ones((n * K, 4), dtype=bool)
     out["c"] = out["c"].astype("i4")
+    out["g"] = out["c"].copy()
     out["id"] = np.arange(n, dtype="i8") + 1
     out["n_entry"] = np.full(n, K, dtype="i4")
     out["off"] = np.r_[0, np.cumsum(out["n_entry"])].astype("i8")

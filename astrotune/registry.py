@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, Tuple
 
 
 @dataclass(frozen=True)
@@ -77,6 +77,18 @@ def run_keys(run_dir) -> Tuple[str, ...]:
         return keys()[:16]
 
 
+#: Catalogs that are not independent measurements of a star, keyed by the name of
+#: the group they belong to. Two catalogs belong here when they run the *same*
+#: parameter-estimation pipeline on the *same* spectra, so their errors are shared
+#: rather than independent: `sdssv_aspcap` and `apogee_dr17` are both ASPCAP on
+#: APOGEE spectra (see notes/error_calibration_model.tex, section 4). A catalog not
+#: listed is its own group. DO NOT REORDER the group names: they become category
+#: indices in a trained model.
+GROUPS: Dict[str, Tuple[str, ...]] = {
+    "aspcap": ("apogee_dr17", "sdssv_aspcap"),
+}
+
+
 def keys() -> Tuple[str, ...]:
     return tuple(spec.key for spec in CATALOGS)
 
@@ -88,6 +100,46 @@ def labels() -> Tuple[str, ...]:
 def category_index(key: str) -> int:
     """Return the fixed category index ``c`` for a catalog key."""
     return INDEX[key]
+
+
+def group_of(key: str) -> str:
+    """Name of the group a catalog belongs to (its own key unless listed in GROUPS)."""
+    for name, members in GROUPS.items():
+        if key in members:
+            return name
+    return key
+
+
+def group_labels(keys_) -> Tuple[str, ...]:
+    """One label per group, in the order the groups first appear in ``keys_``.
+
+    A group of several catalogs is named after its members' common pipeline; a
+    catalog that is its own group keeps its own label.
+    """
+    out = []
+    for key in keys_:
+        name = group_of(key)
+        if name in [n for n, _ in out]:
+            continue
+        members = [k for k in keys_ if group_of(k) == name]
+        out.append((name, " + ".join(get_spec(k).label for k in members)))
+    return tuple(label for _, label in out)
+
+
+def group_index(keys_) -> Tuple[int, ...]:
+    """The group index ``g`` of every catalog in ``keys_`` (the model's category)."""
+    order: list = []
+    for key in keys_:
+        name = group_of(key)
+        if name not in order:
+            order.append(name)
+    return tuple(order.index(group_of(key)) for key in keys_)
+
+
+def group_multiplicity(keys_) -> Tuple[int, ...]:
+    """How many catalogs each group has (1 = a catalog on its own)."""
+    g = group_index(keys_)
+    return tuple(g.count(i) for i in range(max(g) + 1)) if g else ()
 
 
 def get_spec(key: str) -> CatalogSpec:

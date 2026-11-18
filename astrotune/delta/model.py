@@ -47,6 +47,7 @@ import sonnet as snt
 import tensorflow as tf
 
 from ..model.vector_network import VectorNetwork
+from ..registry import group_index
 from .stars import N_PARAMS
 
 log = logging.getLogger(__name__)
@@ -88,6 +89,46 @@ NU_PRIOR_MEAN = 6.0
 NU_PRIOR_SD = 2.0
 NU_INIT_RAW = 6.0
 
+# --- Shared systematic ---------------------------------------------------------
+#: Where each group's shared variance starts: at the floor, i.e. independent errors
+SHARED_INIT = -10.0
+
+#: Width of the prior that pulls a group's shared variance back to the floor
+SHARED_PRIOR_SD = 3.0
+
+
+class SharedSystematic(snt.Module):
+    """Variance shared by the catalogs of a group: ``G_g = diag(tau_g^2)``.
+
+    Two catalogs that ran the same pipeline on the same spectra make the same
+    mistake, so their errors have a common part. It cannot be represented by
+    enlarging either covariance -- that inflates their *difference* instead of
+    explaining it -- so it enters as a latent value between the star and its
+    entries (see ``star_nll``). A group of one catalog has no shared part at all:
+    the multiplicity mask makes ``tau^2`` exactly zero there.
+    """
+
+    def __init__(self, n_group: int, multiplicity: Sequence[int],
+                 init: float = SHARED_INIT, name=None):
+        super().__init__(name=name)
+        multi = np.asarray([1.0 if m > 1 else 0.0 for m in multiplicity], dtype="f4")
+        self.multi = tf.constant(multi[:, None])  # (n_group, 1)
+        self.raw = tf.Variable(tf.fill([n_group, N_PARAMS], float(init)), name="raw_tau")
+
+    def variance(self):
+        """``(n_group, 4)``: the shared variance, exactly 0 for singleton groups."""
+        return self.multi * (float(ADD_MIN_SIGMA) ** 2 + tf.nn.softplus(self.raw))
+
+    def has_shared(self) -> bool:
+        """Whether any group has more than one catalog (a static property)."""
+        return bool(float(tf.reduce_max(self.multi)) > 0.0)
+
+    def prior_penalty(self, sd: float = SHARED_PRIOR_SD):
+        """Pull the shared sigma towards the floor: no shared term unless needed."""
+        v = tf.maximum(self.variance(), 1e-30)
+        z2 = ((tf.math.log(v) - LN_MIN) / sd) ** 2
+        return 0.5 * tf.reduce_sum(z2 * self.multi) / tf.maximum(tf.reduce_sum(self.multi) * N_PARAMS, 1.0)
+
 
 class TailWeight(snt.Module):
     """One degrees-of-freedom parameter per catalog, ``nu_c = 2 + softplus(raw_c)``.
@@ -110,7 +151,7 @@ class TailWeight(snt.Module):
         return 0.5 * tf.reduce_mean(((self.raw - mean) / sd) ** 2)
 
 #: Per-entry batch arrays, plus the star each entry belongs to
-BATCH_KEYS = ("x", "ls", "c", "y", "C", "m")
+BATCH_KEYS = ("x", "ls", "c", "g", "y", "C", "m")
 
 #: ``fn(x, ln_sigma, catalog) -> (ln_scale, ln_add)``, each ``(n, 4)``
 DeltaFn = Callable[[tf.Tensor, tf.Tensor, tf.Tensor], Tuple[tf.Tensor, tf.Tensor]]
@@ -144,7 +185,8 @@ class DeltaNetwork(snt.Module):
     before the scale term existed still load and still compare.
     """
 
-    def __init__(self, n_cat: int, hidden_size: int = 64, n_hidden: int = 3, name=None):
+    def __init__(self, n_cat: int, hidden_size: int = 64, n_hidden: int = 3,
+                 multiplicity=None, name=None):
         super().__init__(name=name)
         self.n_cat = n_cat
         self.tail = TailWeight(n_cat)
@@ -175,10 +217,12 @@ class ScaleAddNetwork(snt.Module):
     ``[ln 1/16, ln 16]``; ``ln_add`` is floored at ``LN_MIN`` and starts there.
     """
 
-    def __init__(self, n_cat: int, hidden_size: int = 64, n_hidden: int = 3, name=None):
+    def __init__(self, n_cat: int, hidden_size: int = 64, n_hidden: int = 3,
+                 multiplicity=None, name=None):
         super().__init__(name=name)
         self.n_cat = n_cat
         self.tail = TailWeight(n_cat)
+        self.shared = SharedSystematic(n_cat, multiplicity or [1] * n_cat)
         kw = dict(use_residual=True, use_film=True, use_layer_norm=True)
         self.scale = VectorNetwork(n_cat, N_PARAMS, n_hidden, hidden_size,
                                    output_scale=1e-3, output_bias=0.0, **kw)
@@ -193,14 +237,18 @@ class ScaleAddNetwork(snt.Module):
     def nu(self):
         return self.tail()
 
+    def shared_variance(self):
+        return self.shared.variance()
+
 
 class ConstDelta(snt.Module):
-    """One ln_delta per catalog and parameter (the additive-only baseline)."""
+    """One ln_delta per group and parameter (the additive-only baseline)."""
 
-    def __init__(self, n_cat: int, name=None):
+    def __init__(self, n_cat: int, multiplicity=None, name=None):
         super().__init__(name=name)
         self.raw = tf.Variable(tf.fill([n_cat, N_PARAMS], PRIOR_MEAN), name="raw")
         self.tail = TailWeight(n_cat)
+        self.shared = SharedSystematic(n_cat, multiplicity or [1] * n_cat)
 
     def __call__(self, x, ln_sigma, c):
         return tf.zeros(tf.shape(x), tf.float32), floor_ln_delta(tf.gather(self.raw, c))
@@ -208,20 +256,24 @@ class ConstDelta(snt.Module):
     def nu(self):
         return self.tail()
 
+    def shared_variance(self):
+        return self.shared.variance()
+
 
 class ConstScaleAdd(snt.Module):
-    """One scale and one additive term per catalog and parameter.
+    """One scale and one additive term per group and parameter.
 
-    Eight parameters per catalog instead of four. This is the arm that says whether
+    Eight parameters per group instead of four. This is the arm that says whether
     the signal is multiplicative at all, and it is the reference the network has to
     beat; ``raw_scale`` starts at 0 (scale 1) and ``raw_add`` on the floor.
     """
 
-    def __init__(self, n_cat: int, name=None):
+    def __init__(self, n_cat: int, multiplicity=None, name=None):
         super().__init__(name=name)
         self.raw_scale = tf.Variable(tf.zeros([n_cat, N_PARAMS]), name="raw_scale")
         self.raw_add = tf.Variable(tf.fill([n_cat, N_PARAMS], ADD_INIT), name="raw_add")
         self.tail = TailWeight(n_cat)
+        self.shared = SharedSystematic(n_cat, multiplicity or [1] * n_cat)
 
     def __call__(self, x, ln_sigma, c):
         log_scale = soft_clamp(tf.gather(self.raw_scale, c), LOG_SCALE_MIN, LOG_SCALE_MAX)
@@ -230,8 +282,11 @@ class ConstScaleAdd(snt.Module):
     def nu(self):
         return self.tail()
 
+    def shared_variance(self):
+        return self.shared.variance()
+
     def scale_sigma(self) -> np.ndarray:
-        """The fitted sigma scale per catalog and parameter (``(n_cat, 4)``)."""
+        """The fitted sigma scale per group and parameter (``(n_group, 4)``)."""
         return np.exp(0.5 * soft_clamp(self.raw_scale, LOG_SCALE_MIN, LOG_SCALE_MAX).numpy())
 
     def add_sigma(self) -> np.ndarray:
@@ -257,8 +312,48 @@ def make_batch(stars, idx, seg) -> Dict[str, object]:
     }
 
 
+def _marginal(cov, y, m, seg, n_seg) -> dict:
+    """Pieces of the Gaussian marginal over one common value per segment.
+
+    For segments holding entries with covariance ``cov`` around a common value, this
+    returns the precision sum ``A`` and its inverse, the weighted mean ``z``, the
+    residual quadratic form ``quad``, the determinant terms and the dimension counts.
+    Used at both levels of the group hierarchy: segments are groups at the lower
+    level and stars at the upper one.
+    """
+    L = tf.linalg.cholesky(cov)
+    Sinv = tf.linalg.inv(cov)  # symmetric positive definite; the Cholesky is for ln det
+    A = tf.math.unsorted_segment_sum(Sinv, seg, n_seg)  # (S, 4, 4)
+    b = tf.math.unsorted_segment_sum(tf.linalg.matvec(Sinv, y), seg, n_seg)  # (S, 4)
+    LA = tf.linalg.cholesky(A)
+    z = tf.linalg.cholesky_solve(LA, b[..., None])[..., 0]  # (S, 4)
+    d = y - tf.gather(z, seg)  # (N, 4)
+    quad = tf.reduce_sum(d * tf.linalg.matvec(Sinv, d), axis=1)  # (N,)
+    # ln det cov over the parameters this member measures: the placeholder axes of an
+    # unmeasured parameter are 1e9 and must not contribute ln(1e9).
+    logdet = 2.0 * tf.reduce_sum(m * tf.math.log(tf.linalg.diag_part(L)), axis=1)
+    # ln det A over the parameters *some* member of the segment measures.
+    any_m = tf.cast(tf.math.unsorted_segment_max(m, seg, n_seg), tf.float64)  # (S, 4)
+    return dict(
+        A=A, Ainv=tf.linalg.inv(A), z=z, any_m=any_m,
+        quad=tf.math.unsorted_segment_sum(quad, seg, n_seg),
+        logdet=tf.math.unsorted_segment_sum(logdet, seg, n_seg),
+        logdet_A=2.0 * tf.reduce_sum(any_m * tf.math.log(tf.linalg.diag_part(LA)), axis=1),
+        n_meas=tf.math.unsorted_segment_sum(tf.reduce_sum(m, axis=1), seg, n_seg),
+        d_shared=tf.reduce_sum(any_m, axis=1),
+    )
+
+
+def _gaussian_neg2lnp(p: dict) -> tf.Tensor:
+    """``-2 ln p`` of the differences, before any tail weight is applied."""
+    n_res = p["n_meas"] - p["d_shared"]
+    return (p["quad"] + p["logdet_A"] + p["logdet"]
+            + n_res * tf.cast(np.log(2 * np.pi), tf.float64))
+
+
 def star_nll(batch: Dict[str, object], delta_fn: DeltaFn,
-             nu: Optional[tf.Tensor] = None) -> Tuple[tf.Tensor, tuple]:
+             nu: Optional[tf.Tensor] = None, n_group: Optional[int] = None,
+             shared: Optional[tf.Tensor] = None) -> Tuple[tf.Tensor, tuple]:
     """Per-star negative log likelihood, in float64; also returns the model's parameters.
 
     The sum over a star's entries is a segmented reduction, so a batch is a flat
@@ -272,9 +367,17 @@ def star_nll(batch: Dict[str, object], delta_fn: DeltaFn,
     of ``C``) plus a diagonal term. ``ln_scale = 0`` and ``ln_add -> -inf``
     reproduce the untransformed covariance exactly.
 
-    ``nu`` (one degree of freedom per catalog, or None for Gaussian errors) turns the
+    ``n_group``/``shared`` switch on the group hierarchy. With them, entries that
+    belong to the same group share a latent value (``t_g = z + u_g``,
+    ``u_g ~ N(0, diag(shared[g]))``), so the group's errors are partly common. The
+    likelihood then factorises into the same marginal applied twice: within each
+    group, whose ``A^-1 + diag(shared)`` becomes the covariance of one effective
+    observation of the star's value, and across those observations. With
+    ``shared = 0`` the two levels are algebraically identical to the flat one.
+
+    ``nu`` (one degree of freedom per group, or None for Gaussian errors) turns the
     marginal into a multivariate Student's t. The likelihood above is a Gaussian
-    density in the ``n_res`` differences with quadratic form ``quad_s``; giving the
+    density in the ``n_res`` differences with quadratic form ``quad``; giving the
     star's noise a Gamma-distributed precision ``u`` and integrating ``u`` out turns
     it into ``t_nu``, because
 
@@ -284,7 +387,7 @@ def star_nll(batch: Dict[str, object], delta_fn: DeltaFn,
     So the t costs no iteration, needs no augmentation, and keeps every other line of
     the model -- masks, determinants, priors -- unchanged. The star's ``u`` is shared
     by all its entries, because that is what "this star is a binary / a bad match"
-    means; for a star whose catalogs have different nu we use their mean, which is the
+    means; for a star whose groups have different nu we use their mean, which is the
     only choice that reduces to the global-nu model when all of them agree. Per-*entry*
     heavy tails are a different model: the product of t densities has no closed-form
     marginal over ``z`` and would need data augmentation.
@@ -292,47 +395,49 @@ def star_nll(batch: Dict[str, object], delta_fn: DeltaFn,
     seg = batch["seg"]
     n_star = tf.reduce_max(seg) + 1  # a dynamic segment count: no retracing per block
     m = tf.cast(batch["m"], tf.float64)  # (N, 4): measured by this entry
-    ln_scale, ln_add = delta_fn(batch["x"], batch["ls"], batch["c"])  # (N, 4) each
+    ln_scale, ln_add = delta_fn(batch["x"], batch["ls"], batch["g"])  # (N, 4) each
 
     y = tf.cast(batch["y"], tf.float64)
     s = tf.exp(0.5 * tf.cast(ln_scale, tf.float64))
     S = (tf.cast(batch["C"], tf.float64) * s[:, :, None] * s[:, None, :]
          + tf.linalg.diag(tf.exp(tf.cast(ln_add, tf.float64))))
-    L = tf.linalg.cholesky(S)
-    Sinv = tf.linalg.inv(S)  # symmetric positive definite; the Cholesky is for ln det
 
-    # Star-level quantities: the precision sum A and the precision-weighted mean z.
-    A = tf.math.unsorted_segment_sum(Sinv, seg, n_star)  # (S, 4, 4)
-    b = tf.math.unsorted_segment_sum(tf.linalg.matvec(Sinv, y), seg, n_star)  # (S, 4)
-    LA = tf.linalg.cholesky(A)
-    z = tf.linalg.cholesky_solve(LA, b[..., None])[..., 0]  # (S, 4)
+    if shared is None:
+        p = _marginal(S, y, m, seg, n_star)
+        quad_s = p["quad"]
+        det = p["logdet_A"] + p["logdet"]
+        n_res = p["n_meas"] - p["d_shared"]
+    else:
+        # Level 1: one effective observation per (star, group).
+        slot = seg * tf.constant(int(n_group), tf.int32) + tf.cast(batch["g"], tf.int32)
+        uniq, inv = tf.unique(tf.reshape(slot, [-1]))  # compact (star, group) ids
+        n_slot = tf.shape(uniq)[0]
+        p1 = _marginal(S, y, m, inv, n_slot)
+        V = p1["Ainv"] + tf.linalg.diag(
+            tf.gather(tf.cast(shared, tf.float64), uniq % int(n_group)))
+        # Level 2: those observations around the star's value.
+        star_of_slot = uniq // int(n_group)
+        p2 = _marginal(V, p1["z"], p1["any_m"], star_of_slot, n_star)
+        # The two levels together are one density in the space of all the star's
+        # differences: sum the quadratic forms and the determinant terms, and count
+        # the dimensions of both levels.
+        quad_s = p2["quad"] + tf.math.unsorted_segment_sum(p1["quad"], star_of_slot, n_star)
+        det = (p2["logdet_A"] + p2["logdet"] + tf.math.unsorted_segment_sum(
+            p1["logdet_A"] + p1["logdet"], star_of_slot, n_star))
+        n_res = (p2["n_meas"] - p2["d_shared"] + tf.math.unsorted_segment_sum(
+            p1["n_meas"] - p1["d_shared"], star_of_slot, n_star))
 
-    d = y - tf.gather(z, seg)  # (N, 4)
-    quad = tf.reduce_sum(d * tf.linalg.matvec(Sinv, d), axis=1)  # (N,)
-    # ln det S_k over the parameters this entry measures: the placeholder axes of an
-    # unmeasured parameter are 1e9 and must not contribute ln(1e9).
-    logdet_S = 2.0 * tf.reduce_sum(m * tf.math.log(tf.linalg.diag_part(L)), axis=1)
-    # ln det A over the parameters *some* entry of the star measures.
-    any_m = tf.cast(tf.math.unsorted_segment_max(m, seg, n_star), tf.float64)  # (S, 4)
-    logdet_A = 2.0 * tf.reduce_sum(any_m * tf.math.log(tf.linalg.diag_part(LA)), axis=1)
-
-    quad_s = tf.math.unsorted_segment_sum(quad, seg, n_star)
-    logdetS_s = tf.math.unsorted_segment_sum(logdet_S, seg, n_star)
-    n_meas_s = tf.math.unsorted_segment_sum(tf.reduce_sum(m, axis=1), seg, n_star)
-    # The density lives in the space of the differences, of dimension (measured
-    # parameters over the entries) - (parameters the star has at all). With K = 2
-    # this constant is what makes the expression identical to the pair likelihood,
-    # normalisation included; with K = 1 it is 0, i.e. no information.
-    n_res = n_meas_s - tf.reduce_sum(any_m, axis=1)
     if nu is None:
-        neg2lnp = (quad_s + logdet_A + logdetS_s
+        neg2lnp = (quad_s + det
                    + n_res * tf.cast(np.log(2 * np.pi), tf.float64))
     else:
-        # nu is per catalog; the star's tail weight is the mean over its entries
+        # nu is per group; the star's tail weight is the mean over its entries. The
+        # scale mixture multiplies every covariance by 1/u, so it scales the whole
+        # difference-space quadratic form and leaves the determinant terms alone.
         nu_s = tf.math.unsorted_segment_mean(
-            tf.gather(tf.cast(nu, tf.float64), batch["c"]), seg, n_star)
+            tf.gather(tf.cast(nu, tf.float64), batch["g"]), seg, n_star)
         k = tf.cast(n_res, tf.float64)
-        neg2lnp = (logdet_A + logdetS_s
+        neg2lnp = (det
                    + (nu_s + k) * tf.math.log1p(quad_s / nu_s)
                    + 2.0 * tf.math.lgamma(0.5 * nu_s) - 2.0 * tf.math.lgamma(0.5 * (nu_s + k))
                    + k * tf.math.log(nu_s * tf.cast(np.pi, tf.float64)))
@@ -388,15 +493,18 @@ def control_points(stars, keys: Sequence[str], n_per_catalog: int = 1024,
         measures[k] = m[in_cat].any(0) if in_cat.any() else True
 
     unit = _dispersed_unit(n_per_catalog * len(keys), N_PARAMS, seed)
-    xs, cs, ms = [], [], []
+    group_of = group_index(keys)
+    xs, cs, gs, ms = [], [], [], []
     for k in range(len(keys)):
         u = unit[k * n_per_catalog:(k + 1) * n_per_catalog]
         pts = lo[None, :] + (hi - lo)[None, :] * u
         pts[:, ~measures[k]] = 0.0
         xs.append(pts.astype("f4"))
         cs.append(np.full(n_per_catalog, k, dtype="i4"))
+        gs.append(np.full(n_per_catalog, group_of[k], dtype="i4"))
         ms.append(np.tile(measures[k], (n_per_catalog, 1)))
-    return dict(x=np.concatenate(xs), c=np.concatenate(cs), m=np.concatenate(ms))
+    return dict(x=np.concatenate(xs), c=np.concatenate(cs), g=np.concatenate(gs),
+                m=np.concatenate(ms))
 
 
 def _dispersed_unit(n: int, dim: int, seed: int) -> np.ndarray:
@@ -412,9 +520,10 @@ def _dispersed_unit(n: int, dim: int, seed: int) -> np.ndarray:
 
 def control_penalty(ctrl: Dict[str, np.ndarray], model) -> tf.Tensor:
     """The same prior as :func:`prior_penalty`, evaluated away from the data."""
+    cat = ctrl["g"] if "g" in ctrl else ctrl["c"]  # the model's category is the group
     ln_scale, ln_add = model(tf.constant(ctrl["x"], tf.float32),
                              tf.zeros_like(tf.constant(ctrl["x"], tf.float32)),
-                             tf.constant(ctrl["c"], tf.int32))
+                             tf.constant(cat, tf.int32))
     m = tf.constant(ctrl["m"].astype("f4"))
     z2_scale = (ln_scale / PRIOR_SCALE_SD) ** 2
     ln_add = tf.maximum(ln_add, LN_MIN)
@@ -449,8 +558,20 @@ def numpy_delta_fn(model, batch_size: int = 65536):
 
 
 def model_nu(model) -> Optional[np.ndarray]:
-    """The fitted ``nu`` per catalog, or None if the model is Gaussian."""
+    """The fitted ``nu`` per group, or None if the model is Gaussian."""
     return model.nu().numpy().astype("f8") if hasattr(model, "nu") else None
+
+
+def model_shared(model) -> Optional[np.ndarray]:
+    """The fitted shared variance per group and parameter, or None if there is none.
+
+    ``(n_group, 4)``; a group of one catalog has exactly zero. This is what has to be
+    added to an entry's own covariance when the entry is compared with anything
+    outside its group, so it is the piece the merge needs.
+    """
+    if not hasattr(model, "shared_variance"):
+        return None
+    return model.shared_variance().numpy().astype("f8")
 
 
 #: Which module a saved ``delta_model_config.json`` was written for
@@ -485,6 +606,7 @@ def load_delta_model(out_dir: Path, keys=None):
             f"{out_dir}/delta_model was trained on {list(cfg.get('keys', ()))}, "
             f"not {list(keys)}; retrain it."
         )
-    model = MODEL_TYPES[model_type](cfg["n_cat"], cfg["hidden_size"], cfg["n_hidden"])
+    model = MODEL_TYPES[model_type](cfg["n_cat"], cfg["hidden_size"], cfg["n_hidden"],
+                                    multiplicity=cfg.get("multiplicity"))
     tf.train.Checkpoint(model=model).read(str(out_dir / "delta_model")).assert_existing_objects_matched()
     return model

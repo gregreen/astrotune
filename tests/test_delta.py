@@ -37,6 +37,7 @@ def _synthetic_stars(n_star=4000, sigma_true=(0.02, 0.05, 0.1), c_reported=0.03,
            for k, v in flat.items() if k != "m"}
     out["m"] = np.ascontiguousarray(flat["m"].reshape(n * K, 4))
     out["c"] = out["c"].astype("i4")
+    out["g"] = out["c"].copy()  # one group per catalog unless a test says otherwise
     out["id"] = np.arange(n, dtype="i8") * 7 + 1
     out["n_entry"] = np.full(n, K, dtype="i4")
     out["off"] = np.r_[0, np.cumsum(out["n_entry"])].astype("i8")

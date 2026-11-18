@@ -1484,6 +1484,67 @@ metal-poor edge; Pristine asks for the most (median 5.4e-2); nobody asks for
 anything in APOGEE [α/Fe]. SDSS-V (MDw Cannon) cannot be drawn: it measures no logg
 at all.
 
+#### Groups and a shared systematic (2026-11-18)
+
+Some catalogs are not independent: APOGEE DR17 and the SDSS-V ASPCAP release run the
+*same* parameter pipeline (ASPCAP) on the *same* spectra, so their estimates share
+their mistakes. The evidence is in the pair χ² of the 20-catalog run: APOGEE×SDSS-V
+(ASPCAP) sits at χ²/ν = 0.36 overall but **0.04 in [α/Fe]** (they agree far too well)
+while the same pair is 1.18 in [Fe/H]; APOGEE×SDSS-V (APOGEENet) — same spectra,
+different pipeline — is a healthy 0.91. No per-catalog rescaling can represent that:
+inflating either covariance inflates their *difference* too, and the difference is
+the thing that is too small.
+
+So the model now has a **group hierarchy**. `registry.GROUPS` maps a pipeline to its
+member keys (currently only `{"aspcap": ("apogee_dr17", "sdssv_aspcap")}`), and
+`registry.group_of` / `group_index` / `group_labels` / `group_multiplicity` translate
+catalogs to groups. Two consequences:
+
+1. The model's category is the **group**, not the catalog: one `ln_scale`, one
+   `ln_add` and one ν per group, and a group's catalogs share their correction. This
+   is not cosmetic — it is what makes the model identifiable. For a pair, the fit has
+   two observables (the within-group difference, which measures `S_1 + S_2`, and the
+   comparison with other groups, which measures `(S_1⁻¹ + S_2⁻¹)⁻¹ + G`), and with the
+   two covariances and G all free there is a flat direction trading a larger shared
+   term against a more unequal split. Sharing the correction fixes the split by
+   construction.
+2. Each group also gets a **shared covariance** `G_g` (diagonal, per parameter), as a
+   latent value between the star and its entries: `t_g = z + u_g`,
+   `u_g ~ N(0, G_g)`, `y_a = t_g + ε_a`. Entries of one group then agree more than
+   their quoted errors say, and disagree with other groups more. `star_nll` implements
+   it as the same marginal applied twice (within group, then across groups; Woodbury
+   gives `V_g = A_g⁻¹ + G_g`), so `shared = 0` reduces it to the flat likelihood
+   exactly — that identity is a unit test. A group of one catalog has `G_g ≡ 0` by
+   construction (a mask, not a small number), so the 19 singleton groups are
+   unaffected.
+
+Bookkeeping: `delta/stars.py` derives `g` from `c` on load (`with_groups`), so an
+existing `star_table.npz` stays valid; `delta/train.py` saves `n_cat` = the number of
+**groups** plus `multiplicity` and `group_labels` in `delta_model_config.json` and
+writes `evaluation/shared.txt` next to `nu.txt`; `delta/kiel.py` and
+`delta/uncertainties.py` plot the **total** σ (`S_a + G_g`), because that is the error
+the merge must use. Two covariances have to be kept apart everywhere:
+`S_a` (independent, what the within-group difference measures) and
+`S_a + G_{g(a)}` (what to use when comparing with anything outside the group).
+`notes/error_calibration_model.tex` derives all of it.
+
+**Results on `models/latent_adam_lr2e4_20cat` (20 catalogs -> 19 groups).** Validation
+NLL per star: none −2.186, floor 0.03 −3.765, constant add −5.449, constant
+scale+add −5.820, **network −6.489** (was −6.430 ungrouped: the hierarchy buys 0.06
+per star, i.e. the APOGEE×ASPCAP rows were being fitted as if independent). The
+pooled scale ratios move to 1.02 / 1.06 / 1.17 / 1.00 for
+Teff / [Fe/H] / logg / [α/Fe] (ungrouped: 1.07 / 1.10 / 1.15 / 1.13) and the median
+PIT to 0.492 (0.507). The [α/Fe] column is the point: the fit used to inflate every
+APOGEE and ASPCAP [α/Fe] error by 13 % to cover a disagreement that does not exist,
+and now it does not. The fitted shared systematic of the group
+(`evaluation/shared.txt`) is σ = 0.016 (Teff, harmonized units), 0.010 ([Fe/H]),
+0.005 (logg), 0.014 dex ([α/Fe]); every other group is exactly 0. In absolute terms
+the ASPCAP [α/Fe] error goes from a quoted median 0.0248 to 0.0146 — of which 0.0139
+is the shared part, i.e. two ASPCAP catalogs essentially cannot be combined. Pair
+χ² over 2 M validation pairs: median χ²/ν 1.04 -> 0.88 and
+`P(null sf < 1e-3)` 11.8 % -> 0.28 % (nominal 0.1 %), with the shared term included in
+the cross-group pairs.
+
 ### 9.11 Catalog connectivity figure (`astrotune-catalog-graph`)
 
 For the paper (owner's idea): nodes = catalogs (radius ~ log10 rows), edges = pairs
