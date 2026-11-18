@@ -1534,16 +1534,22 @@ scale+add −5.820, **network −6.489** (was −6.430 ungrouped: the hierarchy 
 per star, i.e. the APOGEE×ASPCAP rows were being fitted as if independent). The
 pooled scale ratios move to 1.02 / 1.06 / 1.17 / 1.00 for
 Teff / [Fe/H] / logg / [α/Fe] (ungrouped: 1.07 / 1.10 / 1.15 / 1.13) and the median
-PIT to 0.492 (0.507). The [α/Fe] column is the point: the fit used to inflate every
-APOGEE and ASPCAP [α/Fe] error by 13 % to cover a disagreement that does not exist,
-and now it does not. The fitted shared systematic of the group
+PIT to 0.492 (0.507). The [α/Fe] column is the point: with the group in place the
+pooled [α/Fe] ratio returns to 1.00, and the ASPCAP [α/Fe] error is reported as
+σ = 0.014 dex of which 0.0139 *is the shared part* -- two ASPCAP catalogs essentially
+cannot be combined on that axis. The fitted shared systematic of the group
 (`evaluation/shared.txt`) is σ = 0.016 (Teff, harmonized units), 0.010 ([Fe/H]),
 0.005 (logg), 0.014 dex ([α/Fe]); every other group is exactly 0. In absolute terms
-the ASPCAP [α/Fe] error goes from a quoted median 0.0248 to 0.0146 — of which 0.0139
-is the shared part, i.e. two ASPCAP catalogs essentially cannot be combined. Pair
-χ² over 2 M validation pairs: median χ²/ν 1.04 -> 0.88 and
-`P(null sf < 1e-3)` 11.8 % -> 0.28 % (nominal 0.1 %), with the shared term included in
-the cross-group pairs.
+the ASPCAP [α/Fe] error goes from a quoted median 0.0248 to 0.0146 (the quoted-vs-
+calibrated figure in `uncertainty_distribution/`). Pair χ² over 2 M validation
+pairs: median χ²/ν 1.04 -> 0.88 and `P(null sf < 1e-3)` 11.8 % -> 0.28 % (nominal
+0.1 %), with the shared term included in the cross-group pairs.
+
+One diagnostic caveat: `entry_stats` adds `G` to the entry covariance, but `G`
+cancels from a star's *own* combined value when all its entries are in one group, so
+the **per-catalog** rows of a grouped catalog read too low (APOGEE [α/Fe] 0.45). The
+pooled numbers are dominated by multi-group stars and are fine; `pair_chi2` treats
+the distinction exactly.
 
 ### 9.11 Catalog connectivity figure (`astrotune-catalog-graph`)
 

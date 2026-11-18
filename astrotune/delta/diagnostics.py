@@ -522,7 +522,13 @@ def diagnose(stars: StarTable, n_cat: int, delta_fn: Optional[DeltaFn] = None,
     """Every calibration statistic, with the null of the model that produced ``nu``.
 
     ``group_cov`` (shared variance per group) is added to each entry's covariance so
-    that the residuals describe what the merge will use.
+    that the residuals describe what the merge will use. One caveat: the shared part
+    cancels from a star's *own* combined value when all its entries are in one group,
+    so for the members of a group the predicted residual is somewhat too wide and
+    their per-catalog scale ratio comes out below 1 (APOGEE [a/Fe] reads 0.45 with a
+    shared sigma of 0.014 dex). The pooled numbers are fine -- they are dominated by
+    stars that span several groups -- and ``pair_chi2`` handles the distinction
+    exactly (it adds the shared part only across groups).
     """
     return summarize(stars, entry_stats(stars, delta_fn, nu=nu, group_cov=group_cov),
                      n_cat, min_entries)
