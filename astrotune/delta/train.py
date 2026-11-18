@@ -16,7 +16,8 @@ needs the cache written by ``astrotune-apply --run-dir models/my_run``. It
     diagnostics/                 calibration of the quoted errors (no delta)
     delta_model.*, delta_model_config.json   the trained network
     evaluation/                  baselines, calibration after the fit, figures
-    kiel/                        per-catalog Kiel maps of the learned variance
+    kiel/                        per-catalog Kiel maps of the learned correction
+    uncertainty_distribution/    quoted vs calibrated uncertainties, per catalog
 
 Every number in the loss and in the validation metric is **per star**, not per
 pair, so a star in nine catalogs counts once.
@@ -40,6 +41,7 @@ from .. import registry
 from .diagnostics import PARAM_NAMES, SF_THRESHOLDS, diagnose, plot_diagnostics, to_json
 from .kiel import make_kiel_figures
 from .stars import N_PARAMS, get_star_table, split
+from .uncertainties import make_uncertainty_plots
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +81,8 @@ class DeltaConfig:
     nu_prior_mean: float = 6.0  # in the unconstrained coordinate: nu = 2 + softplus(6) = 8
     nu_prior_sd: float = 2.0  # 95 % of the prior mass on nu in [4.1, 12.0]
     nu_prior_weight: float = 0.01
+    #: One figure per catalog: quoted against calibrated uncertainties
+    uncertainty_plots: bool = True
 
 
 def _spec(tf):
@@ -344,6 +348,10 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     if cfg.kiel_sample != "none":
         # Where in the Kiel diagram the correction sits, one page pair per catalog.
         make_kiel_figures(run_dir, out_dir / "kiel", model=net, sample=cfg.kiel_sample, keys=keys)
+    if cfg.uncertainty_plots:
+        # Quoted against calibrated uncertainties: is the corrected error plausible?
+        make_uncertainty_plots(run_dir, out_dir / "uncertainty_distribution", model=net,
+                               sample="train", keys=keys)
     return dict(nll=nll, table=table, scale_add=sa_table)
 
 
