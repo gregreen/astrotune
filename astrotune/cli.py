@@ -45,6 +45,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-download raw files and rebuild cached crossmatches",
     )
     parser.add_argument(
+        "--allow-crossmatch-regression",
+        action="store_true",
+        help=(
+            "accept a rebuilt Gaia crossmatch that matches fewer stars than the "
+            "previous one (normally treated as an incomplete result from the archive)"
+        ),
+    )
+    parser.add_argument(
         "--no-save",
         action="store_true",
         help="build the table but do not write it to data/training/",
@@ -98,6 +106,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 make_plots=not args.no_plots,
                 force=args.force,
                 save=not args.no_save,
+                allow_crossmatch_regression=args.allow_crossmatch_regression,
             )
         except Exception as exc:  # noqa: BLE001 - report and continue
             log.exception("[%s] failed", key)

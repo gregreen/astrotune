@@ -20,7 +20,7 @@ import numpy as np
 from astropy.table import Table
 
 from ..prep.download import download as download_file
-from ..prep.gaia import apply_crossmatch, gaia_crossmatch_batched
+from ..prep.gaia import crossmatch_catalog
 from ..prep.transforms import unmask
 
 KEY = "lamost_csn_dr10"
@@ -49,26 +49,25 @@ def download(ctx) -> None:
 
 
 def load(ctx) -> Table:
-    cache = ctx.interim_dir / CROSSMATCH_FILE
-    if cache.exists() and not ctx.force:
-        return Table.read(cache)
+    def read_catalog() -> Table:
+        return Table.read(ctx.raw_dir / FILENAME)
 
-    catalog = Table.read(ctx.raw_dir / FILENAME)
-    crossmatch = gaia_crossmatch_batched(
-        catalog["RA"],
-        catalog["Dec"],
-        max_batch_size=1024 * 64,
-        max_separation=SEARCH_SEPARATION,
+    return crossmatch_catalog(
+        read_catalog,
+        ra_col="RA",
+        dec_col="Dec",
+        cache_path=ctx.interim_dir / CROSSMATCH_FILE,
+        search_separation=SEARCH_SEPARATION,
+        max_separation=MAX_SEPARATION,
+        force=ctx.force,
+        allow_regression=ctx.allow_crossmatch_regression,
+        key=KEY,
         verbose=True,
+        serialize_metadata=True,
+        compression="gzip",
+        compression_opts=3,
+        chunks=True,
     )
-    matched = apply_crossmatch(catalog, crossmatch, max_separation=MAX_SEPARATION)
-
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    matched.write(
-        cache, serialize_metadata=True, overwrite=True,
-        compression="gzip", compression_opts=3, chunks=True,
-    )
-    return matched
 
 
 def cuts(t: Table, ctx) -> dict:

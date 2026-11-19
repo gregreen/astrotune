@@ -23,7 +23,7 @@ from astropy.table import Table
 
 from ..prep import plots
 from ..prep.download import download as download_file
-from ..prep.gaia import apply_crossmatch, gaia_crossmatch_batched
+from ..prep.gaia import crossmatch_catalog
 from ..prep.transforms import unmask
 
 KEY = "vmp_stars_li2022"
@@ -57,21 +57,21 @@ def download(ctx) -> None:
 
 
 def load(ctx) -> Table:
-    cache = ctx.interim_dir / CROSSMATCH_FILE
-    if cache.exists() and not ctx.force:
-        return Table.read(cache)
+    def read_catalog() -> Table:
+        return Table.read(
+            ctx.raw_dir / TABLE_FILE, format="cds", readme=str(ctx.raw_dir / README_FILE)
+        )
 
-    catalog = Table.read(
-        ctx.raw_dir / TABLE_FILE, format="cds", readme=str(ctx.raw_dir / README_FILE)
+    return crossmatch_catalog(
+        read_catalog,
+        ra_col="RAdeg",
+        dec_col="DEdeg",
+        cache_path=ctx.interim_dir / CROSSMATCH_FILE,
+        max_separation=MAX_SEPARATION,
+        force=ctx.force,
+        allow_regression=ctx.allow_crossmatch_regression,
+        key=KEY,
     )
-    crossmatch = gaia_crossmatch_batched(
-        catalog["RAdeg"], catalog["DEdeg"], max_separation=MAX_SEPARATION
-    )
-    matched = apply_crossmatch(catalog, crossmatch)
-
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    matched.write(cache, overwrite=True)
-    return matched
 
 
 def cuts(t: Table, ctx) -> dict:
