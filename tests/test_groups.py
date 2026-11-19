@@ -40,7 +40,10 @@ def _groups_stars(n_star=2000, groups=(0, 0, 1), sigma=SIGMA, shared=None, seed=
     x = rng.normal(size=(n_star, K, 4))
     C = np.broadcast_to(np.eye(4), (n_star, K, 4, 4)) * (rep**2)[..., None, None]
     flat = dict(x=x, y=y, C=C, ls=np.broadcast_to(np.log(rep)[..., None],
-                                                  (n_star, K, 4)))
+                                                  (n_star, K, 4)),
+                sig=np.broadcast_to(rep[..., None], (n_star, K, 4)),
+                sig0=np.broadcast_to(rep[..., None], (n_star, K, 4)),
+                J=np.broadcast_to(np.eye(4), (n_star, K, 4, 4)).copy())
     out = {k: np.ascontiguousarray(v.reshape(n_star * K, *v.shape[2:]).astype("f4"))
            for k, v in flat.items()}
     out["c"] = np.tile(np.arange(K, dtype="i4"), n_star)

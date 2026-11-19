@@ -89,6 +89,9 @@ def build_table(t: Table, mask: np.ndarray, module, ctx: Context) -> Table:
         getattr(module, "EXTRA_COLS", ()),
         param_transf=transforms.PARAM_TRANSF[:d],
         param_unc_transf=transforms.apply_err_floors(unc_funcs, floors[:d]),
+        # ... and the same without the rescale and the floors, which is what the delta
+        # model sees: it learns both of those itself.
+        param_unc_transf_raw=transforms.PARAM_UNC_TRANSF[:d],
         param_errs=param_errs,
         mask=mask,
     )

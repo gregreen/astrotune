@@ -20,8 +20,11 @@ def _table(n_star=400, n_cat=3, seed=0):
     ls = np.full((n, K, 4), np.log(0.1), dtype="f4")
     m = np.ones((n, K, 4), dtype=bool)
     m[..., 3] = False  # nobody measures [alpha/Fe]
+    sig = np.where(m, 0.1, 0.0)
     out = {k: np.ascontiguousarray(v.reshape(n * K, *v.shape[2:])) for k, v in
-           dict(x=x, ls=ls, m=m).items()}
+           dict(x=x, ls=ls, sig=sig, sig0=sig, m=m).items()}
+    out["J"] = np.ascontiguousarray(
+        np.broadcast_to(np.eye(4, dtype="f4"), (n * K, 4, 4)).copy())
     out["c"] = np.tile(np.arange(K, dtype="i4"), n)
     out["g"] = out["c"].copy()
     out["id"] = np.arange(n, dtype="i8") + 1
@@ -140,9 +143,33 @@ def test_all_sample_reads_the_prepared_catalogs(monkeypatch):
         sigma = np.full((n, 4), 0.1, "f4")
         sigma[:, 3] = 1e9  # [alpha/Fe] not measured
         seen[key] = sigma
-        return Table({"id": np.arange(n, dtype="i8") + 1, "x": x, "sigma_x": sigma})
+        return Table({"id": np.arange(n, dtype="i8") + 1, "x": x, "sigma_x": sigma,
+                      "sigma_x_raw": sigma})
 
     monkeypatch.setattr("astrotune.training_data.load_catalog", fake_catalog)
+
+    # `--all` reads the transform cache and needs the bijector's Jacobian; both are
+    # stubbed here (the Jacobian is the identity, so the ratio is the plain one).
+    from astrotune.merge import Estimates
+
+    def fake_cached(cache_dir, index, ids, table=None):
+        n = len(ids)
+        y = np.zeros((n, 4), "f4")
+        cov = np.broadcast_to(np.eye(4, dtype="f4"), (n, 4, 4)).copy()
+        measured = np.asarray(table["sigma_x"]) < 1e6
+        return Estimates(index, ids, y, cov, measured)
+
+    def fake_jac(bij):
+        def f(xx, cc):
+            n = int(len(xx))
+            return (np.zeros((n, 4), "f4"),
+                    np.broadcast_to(np.eye(4, dtype="f4"), (n, 4, 4)).copy())
+
+        return f
+
+    monkeypatch.setattr("astrotune.apply.load_cached", fake_cached)
+    monkeypatch.setattr("astrotune.apply.make_forward_and_jacobian", fake_jac)
+    monkeypatch.setattr("astrotune.model.load_bijector", lambda *a, **k: None)
     scales = [4.0, 1.0, 0.25]
     c = kiel.build_kiel_cube("run", model=_stub(scales), sample="all",
                              keys=keys, n_bins=(10, 10))

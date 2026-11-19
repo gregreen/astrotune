@@ -29,6 +29,9 @@ def _stars(n_star=200, n_cat=3, sigma=(0.02, 0.05, 0.1), c_reported=0.03, seed=0
     flat = dict(
         x=rng.normal(size=(n, K, 4)),
         ls=np.full((n, K, 4), np.log(c_reported)),
+        sig=np.full((n, K, 4), c_reported),
+        sig0=np.full((n, K, 4), c_reported),
+        J=np.broadcast_to(np.eye(4), (n, K, 4, 4)).copy(),
         c=cats[:, None],
         y=y,
         C=np.broadcast_to(np.eye(4) * c_reported**2, (n, K, 4, 4)),
@@ -71,6 +74,8 @@ def test_the_two_catalog_marginal_is_a_multivariate_t():
     rng = np.random.default_rng(5)  # correlated covariances, so nothing is diagonal
     A = rng.normal(size=(len(s["c"]), 4, 4)) * 0.01
     s["C"] = (np.einsum("nij,nkj->nik", A, A) + np.eye(4) * 0.0025).astype("f4")
+    # the model builds J diag(sig^2) J^T with sig = 0.03, so J is the Cholesky factor
+    s["J"] = (np.linalg.cholesky(s["C"].astype("f8")) / 0.03).astype("f4")
     nll, _ = star_nll(_batch(s), fixed_delta(0.0), nu=tf.fill([2], nu))
     for i in range(12):
         W = s["C"][2 * i].astype("f8") + s["C"][2 * i + 1].astype("f8")

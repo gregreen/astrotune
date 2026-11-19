@@ -35,6 +35,9 @@ def _stars(n_star=30000, scale=(4.0, 1.0, 0.25), seed=0, sigma_spread=0.7):
     flat = dict(
         x=x,
         ls=np.broadcast_to(np.log(rep)[:, :, None], (n, K, 4)),
+        sig=np.broadcast_to(rep[:, :, None], (n, K, 4)),
+        sig0=np.broadcast_to(rep[:, :, None], (n, K, 4)),
+        J=np.broadcast_to(np.eye(4), (n, K, 4, 4)).copy(),
         c=cats[:, None],
         y=y,
         C=C,
@@ -65,13 +68,14 @@ def test_soft_clamp_is_the_identity_inside_and_saturates_outside():
 
 
 def test_the_covariance_stays_positive_definite_at_the_clamps():
-    """Any s > 0 keeps diag(s) C diag(s) PD, and the additive term only helps."""
+    """Any s > 0 keeps J diag(s^2 sig^2) J^T PD, and the additive term only helps."""
     from astrotune.delta.model import LOG_SCALE_MAX, LOG_SCALE_MIN, fixed_delta, make_batch, star_nll
 
     s = _stars(n_star=32)
-    rng = np.random.default_rng(3)  # correlated, non-diagonal C
+    rng = np.random.default_rng(3)  # correlated, non-diagonal covariance
     A = rng.normal(size=(len(s["c"]), 4, 4)) * 0.5
-    s["C"] = (np.einsum("nij,nkj->nik", A, A) + np.eye(4) * 1e-4).astype("f4")
+    # J carries the correlations, sig the size (see delta/covariance.py)
+    s["J"] = (np.einsum("nij,nkj->nik", A, A) + np.eye(4) * 1e-4).astype("f4")
     for extreme in (LOG_SCALE_MIN, LOG_SCALE_MAX, 0.0):
         def fn(x, ln_sigma, c, extreme=extreme):
             return tf.fill(tf.shape(x), tf.constant(extreme, tf.float32)), tf.fill(

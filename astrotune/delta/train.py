@@ -40,7 +40,7 @@ from tqdm.auto import tqdm
 from .. import registry
 from .diagnostics import PARAM_NAMES, SF_THRESHOLDS, diagnose, plot_diagnostics, to_json
 from .kiel import make_kiel_figures
-from .stars import N_PARAMS, get_star_table, split
+from .stars import N_PARAMS, as_prepared, get_star_table, split
 from .uncertainties import make_uncertainty_plots
 
 log = logging.getLogger(__name__)
@@ -94,10 +94,11 @@ def _spec(tf):
     return {
         "x": tf.TensorSpec([None, N_PARAMS], tf.float32),
         "ls": tf.TensorSpec([None, N_PARAMS], tf.float32),
+        "sig": tf.TensorSpec([None, N_PARAMS], tf.float32),
+        "J": tf.TensorSpec([None, N_PARAMS, N_PARAMS], tf.float32),
         "c": tf.TensorSpec([None], tf.int32),
         "g": tf.TensorSpec([None], tf.int32),
         "y": tf.TensorSpec([None, N_PARAMS], tf.float32),
-        "C": tf.TensorSpec([None, N_PARAMS, N_PARAMS], tf.float32),
         "m": tf.TensorSpec([None, N_PARAMS], tf.bool),
         "seg": tf.TensorSpec([None], tf.int32),
     }
@@ -225,16 +226,19 @@ def plot_learned_delta(model, stars, labels: Sequence[str], path: Path) -> Path:
     import matplotlib.pyplot as plt
 
     from ..training_plots import catalog_colors
+    from .covariance import entry_cov_np, sigma_out_np
     from .model import model_shared, numpy_delta_fn
 
     fn = numpy_delta_fn(model)
     x, ls, c, g, m = stars["x"], stars["ls"], stars["c"], stars["g"], stars["m"]
     ln_scale, ln_add = fn(x, ls, g)
     shared = model_shared(model)
-    total = np.exp(ln_scale.astype("f8")) + np.exp(ln_add.astype("f8"))
+    total = entry_cov_np(stars["sig"], stars["J"], ln_scale, ln_add, measured=m)
     if shared is not None:
-        total = total + shared[g]
-    ratio = np.sqrt(total / np.exp(2.0 * ls.astype("f8")))
+        ii = np.arange(N_PARAMS)
+        total[:, ii, ii] += shared[g]
+    ratio = sigma_out_np(total) / sigma_out_np(
+        entry_cov_np(stars["sig0"], stars["J"], measured=m))
     colors = catalog_colors(len(labels))
     fig, axes = plt.subplots(2, 2, figsize=(12, 9), layout="constrained", sharex=True)
     edges = np.quantile(x[:, 0], np.linspace(0, 1, 13))
@@ -315,12 +319,12 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         log.info("%d control points (%d per catalog, weight %.3g)",
                  len(ctrl["c"]), cfg.n_control, cfg.control_weight)
 
-    # Baselines on the validation stars. The three constant arms separate the two
-    # corrections: additive only, scale only, and both.
-    models = {
-        "none (propagated only)": fixed_delta(0.0),
-        "floor 0.03 (as merge)": fixed_delta(0.03),
-    }
+    # The reference arm is the covariance the pipeline propagates *today* -- quoted,
+    # scaled by the catalog's UNC_SCALES and floored by ERROR_FLOORS -- while the model
+    # is fitted on the raw quoted sigma, so the two live on different tables.
+    ref = as_prepared(val)
+    models = {"quoted (as prepared)": fixed_delta(0.0)}
+    tables_for = {"quoted (as prepared)": ref}
     const_add = ConstDelta(n_group, multiplicity)
     hist_const = fit(const_add, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
                      desc="const add", control=ctrl)
@@ -343,13 +347,14 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
 
     nll, results, nus, shareds = {}, {}, {}, {}
     for name, fn in models.items():
-        nll[name] = mean_star_nll(val, fn, max_stars=cfg.val_max_stars)
+        t = tables_for.get(name, val)
+        nll[name] = mean_star_nll(t, fn, max_stars=cfg.val_max_stars)
         np_fn = numpy_delta_fn(fn) if hasattr(fn, "trainable_variables") else _fixed_np(fn)
         # With a learned tail weight the null of every chi2 diagnostic is an F
         # distribution, so the diagnostics need nu as well as the covariance.
         nus[name] = model_nu(fn) if hasattr(fn, "trainable_variables") else None
         shareds[name] = model_shared(fn) if hasattr(fn, "trainable_variables") else None
-        results[name] = diagnose(val, n_cat, np_fn, min_entries, nu=nus[name],
+        results[name] = diagnose(t, n_cat, np_fn, min_entries, nu=nus[name],
                                  group_cov=shareds[name], group_map=_group_map(keys))
         log.info("%s: validation NLL per star %.4f", name, nll[name])
     table = compare(results, nll)
@@ -391,14 +396,14 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
                                const_history=hist_const, const_scale_add_history=hist_const_sa)),
                   f, indent=1)
     plot_diagnostics(results["network scale+add"], labels, ev_dir, "_network")
-    plot_diagnostics(results["none (propagated only)"], labels, ev_dir, "_none")
+    plot_diagnostics(results["quoted (as prepared)"], labels, ev_dir, "_none")
     plot_learned_delta(net, val, labels, ev_dir / "learned_delta.png")
     if cfg.pair_chi2:
         # Two observations of one star: the difference's covariance is S_a + S_b with
         # nothing estimated in between, so the chi2 distribution is a direct test.
         from .diagnostics import pair_chi2, pair_chi2_text, plot_pair_chi2
 
-        before = pair_chi2(val, None, max_pairs=cfg.pair_chi2_max)
+        before = pair_chi2(ref, None, max_pairs=cfg.pair_chi2_max)
         after = pair_chi2(val, numpy_delta_fn(net), max_pairs=cfg.pair_chi2_max,
                           nu=nus["network scale+add"], group_cov=shareds["network scale+add"])
         text = pair_chi2_text(before, after)
@@ -477,6 +482,7 @@ def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) ->
     -8.4``). The starred columns are the covariance the merge will use; the scale is
     the part that is independent between the catalogs of a group.
     """
+    from .covariance import entry_cov_np
     from .model import model_nu, model_shared, numpy_delta_fn
 
     fn = numpy_delta_fn(model)
@@ -489,26 +495,29 @@ def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) ->
     dlndet = np.full(n_ent, np.nan)
     for lo in range(0, n_ent, chunk):
         sl = slice(lo, min(lo + chunk, n_ent))
+        m = stars["m"][sl]
         ln_scale, ln_add = fn(stars["x"][sl], stars["ls"][sl], stars["g"][sl])
         s = np.exp(0.5 * ln_scale.astype("f8"))
-        a = np.exp(0.5 * ln_add.astype("f8"))
+        add = np.exp(ln_add.astype("f8"))
         if shared is not None:
-            a = np.sqrt(a**2 + np.asarray(shared, dtype="f8")[stars["g"][sl]])
-        s_val[sl], a_val[sl] = s, a
+            add = add + np.asarray(shared, dtype="f8")[stars["g"][sl]]
+        a_val[sl] = np.sqrt(add)
+        s_val[sl] = s
         # The determinant over the parameters the entry measures (a placeholder axis of
         # 1e9 would otherwise dominate it), grouped by mask so the subset is exact.
-        C = stars["C"][sl].astype("f8")
-        masks, which = np.unique(stars["m"][sl], axis=0, return_inverse=True)
+        new = entry_cov_np(stars["sig"][sl], stars["J"][sl], ln_scale, ln_add, measured=m)
+        old = entry_cov_np(stars["sig0"][sl], stars["J"][sl], measured=m)
+        ii = np.arange(N_PARAMS)
+        if shared is not None:
+            new[:, ii, ii] += np.asarray(shared, dtype="f8")[stars["g"][sl]]
+        masks, which = np.unique(m, axis=0, return_inverse=True)
         for j, mask in enumerate(masks):
             rows = which == j
             if not mask.any() or not rows.any():
                 continue
-            sm, am, Cm = s[rows][:, mask], a[rows][:, mask], C[rows][:, mask][:, :, mask]
-            i = np.arange(int(mask.sum()))
-            Sm = sm[:, :, None] * Cm * sm[:, None, :]
-            Sm[:, i, i] += am**2
-            dlndet[lo + np.flatnonzero(rows)] = (np.linalg.slogdet(Sm)[1]
-                                                 - np.linalg.slogdet(Cm)[1])
+            dlndet[lo + np.flatnonzero(rows)] = (
+                np.linalg.slogdet(new[rows][:, mask][:, :, mask])[1]
+                - np.linalg.slogdet(old[rows][:, mask][:, :, mask])[1])
 
     lines = [f"{'catalog':24s}{'n':>9s}{'median scale':>14s}{'median add*':>13s}"
              f"{'nu':>7s}{'median dln det*':>17s}",
@@ -551,29 +560,38 @@ def scale_add_table(models: Dict[str, object], stars, labels: Sequence[str],
     likewise shows the total additive sigma, ``sqrt(add + tau^2)``; for the members of
     a group both rows therefore carry the same shared part.
     """
+    from .covariance import entry_cov_np, sigma_out_np
     from .model import model_shared, numpy_delta_fn
 
-    x, ls, c, g, m = stars["x"], stars["ls"], stars["c"], stars["g"], stars["m"]
-    if len(x) > max_entries:  # a stable subsample is enough for medians
-        step = int(np.ceil(len(x) / max_entries))
-        x, ls, c, g, m = x[::step], ls[::step], c[::step], g[::step], m[::step]
+    names = ("x", "ls", "sig", "sig0", "J", "c", "g", "m")
+    pick = {name: stars[name] for name in names}
+    if len(pick["x"]) > max_entries:  # a stable subsample is enough for medians
+        step = int(np.ceil(len(pick["x"]) / max_entries))
+        pick = {name: v[::step] for name, v in pick.items()}
+    x, ls, c, g, m = pick["x"], pick["ls"], pick["c"], pick["g"], pick["m"]
+    ref_sig = sigma_out_np(entry_cov_np(pick["sig0"], pick["J"], measured=m))
     rows = []
     for name, fn in models.items():
         if not hasattr(fn, "trainable_variables"):
             continue
         scale, add = numpy_delta_fn(fn)(x, ls, g)
-        s2, a = np.exp(scale.astype("f8")), np.exp(add.astype("f8"))
+        s2 = np.exp(scale.astype("f8"))
         shared = model_shared(fn) if hasattr(fn, "shared_variance") else None
-        a = a + (0.0 if shared is None else shared[g])  # total, as the merge sees it
-        C = np.exp(2.0 * ls.astype("f8"))
-        ratio = np.sqrt(s2 + a / C)
+        total = entry_cov_np(pick["sig"], pick["J"], scale, add, measured=m)
+        ii = np.arange(N_PARAMS)
+        if shared is not None:
+            total[:, ii, ii] += shared[g]
+            add = add + np.log(shared[g] + 1e-30)  # additive variance, shared included
+        a = np.exp(0.5 * add.astype("f8"))
+        ratio = sigma_out_np(total) / ref_sig
         for k, lab in enumerate(labels):
             for p, pname in enumerate(PARAM_NAMES):
                 sel = (c == k) & m[:, p]
                 if sel.sum() < 100:
                     continue
                 rows.append((name, lab, pname, float(np.sqrt(s2[sel, p].mean())),
-                             float(np.sqrt(a[sel, p].mean())), float(np.median(ratio[sel, p]))))
+                             float(np.sqrt((a[sel, p] ** 2).mean())),
+                             float(np.median(ratio[sel, p]))))
     head = f"{'model':22s}{'catalog':24s}{'param':7s}{'scale(sig)':>11s}{'add sig':>9s}{'sig ratio':>10s}"
     lines = [head, "-" * len(head)]
     for name, lab, pname, s, a, r in rows:

@@ -39,31 +39,40 @@ import matplotlib.pyplot as plt
 
 from .. import registry
 from ..config import ERROR_FLOORS
+from .covariance import entry_cov_np, sigma_out_np
 from .diagnostics import PARAM_NAMES
 from .model import load_delta_model, model_shared, numpy_delta_fn
 from .stars import N_PARAMS, get_star_table, split
 
 log = logging.getLogger(__name__)
 
+#: The entry arrays these figures need
+_FIELDS = ("x", "ls", "sig", "sig0", "J", "m")
+
 
 def _entries(run_dir: Path, sample: str, keys: Sequence[str],
-             out_dir: Optional[Path] = None) -> Iterator[Tuple[int, np.ndarray, np.ndarray,
-                                                                np.ndarray, np.ndarray]]:
-    """Yield ``(catalog, x, ln sigma_x, diag(C), measured)`` one catalog at a time."""
+             out_dir: Optional[Path] = None) -> Iterator[Tuple[int, dict]]:
+    """Yield ``(catalog, arrays)`` one catalog at a time.
+
+    ``arrays`` holds the entry's own parameters, its quoted sigma (``sig``), the
+    prepared sigma the current pipeline uses (``sig0``), the bijector's Jacobian and
+    the measured mask.
+    """
     if sample == "train":
         stars, star_keys = get_star_table(run_dir, out_dir)
         keys = tuple(keys) if keys is not None else star_keys
         train, _ = split(stars)
         for k in range(len(keys)):
             sel = train["c"] == k
-            yield (k, train["x"][sel], train["ls"][sel],
-                   np.diagonal(train["C"][sel], axis1=1, axis2=2).astype("f8"), train["m"][sel])
+            yield k, {name: train[name][sel] for name in _FIELDS}
         return
     if sample != "all":
         raise ValueError(f"unknown sample {sample!r}: use 'train' or 'all'")
 
-    from ..apply import load_cached, padded_inputs
+    from ..apply import load_cached, make_forward_and_jacobian
+    from ..model import load_bijector
     from ..training_data import load_tables
+    from .stars import _catalog_entries
 
     run_dir = Path(run_dir)
     cache_dir = run_dir / "harmonized" / "transform_cache_none"
@@ -71,20 +80,13 @@ def _entries(run_dir: Path, sample: str, keys: Sequence[str],
         raise FileNotFoundError(
             f"{cache_dir} does not exist; run `astrotune-apply --run-dir {run_dir}` first.")
     tables = load_tables(keys, dedupe="none")
+    fwd_jac = make_forward_and_jacobian(load_bijector(run_dir))
     for k, (key, t) in enumerate(tqdm(list(zip(keys, tables)), desc="uncertainties (all)")):
         est = load_cached(cache_dir, registry.category_index(key), np.asarray(t["id"]), t)
         if est is None:
             raise FileNotFoundError(f"No usable cached transformation for {key} in {cache_dir}.")
-        # The same row selection as the star table (first valid row per star), so the
-        # entries here are the ones the model would see.
-        ids = np.asarray(t["id"])
-        x, sigma, measured = padded_inputs(t)
-        ok = np.flatnonzero(np.isfinite(est.y).all(1) & np.isfinite(est.cov).all((1, 2)))
-        _, first = np.unique(ids[ok], return_index=True)
-        rows = ok[first]
-        ln_s = np.log(np.where(measured, sigma, 1.0)).astype("f4")
-        yield (k, x[rows], ln_s[rows],
-               np.diagonal(est.cov[rows], axis1=1, axis2=2).astype("f8"), est.measured[rows])
+        c = _catalog_entries(est, t, key, fwd_jac, k)
+        yield k, {name: c[name] for name in _FIELDS}
 
 
 def uncertainty_distributions(run_dir, model=None, sample: str = "train", keys=None,
@@ -105,13 +107,15 @@ def uncertainty_distributions(run_dir, model=None, sample: str = "train", keys=N
     shared = model_shared(model)
 
     out = {}
-    for k, x, ls, c_diag, measured in _entries(run_dir, sample, keys, delta_dir):
-        ln_scale, ln_add = delta_fn(x, ls, np.full(len(x), group_of[k], dtype="i4"))
-        shared_k = 0.0 if shared is None else shared[group_of[k]]
-        raw = np.sqrt(np.maximum(c_diag, 0.0))
-        cal = np.sqrt(np.exp(ln_scale.astype("f8")) * c_diag
-                      + np.exp(ln_add.astype("f8")) + shared_k)
-        out[k] = (raw, cal, measured)
+    for k, a in _entries(run_dir, sample, keys, delta_dir):
+        ln_scale, ln_add = delta_fn(a["x"], a["ls"],
+                                    np.full(len(a["x"]), group_of[k], dtype="i4"))
+        cal = entry_cov_np(a["sig"], a["J"], ln_scale, ln_add, measured=a["m"])
+        if shared is not None:
+            ii = np.arange(N_PARAMS)
+            cal[:, ii, ii] += shared[group_of[k]]
+        raw = entry_cov_np(a["sig0"], a["J"], measured=a["m"])
+        out[k] = (sigma_out_np(raw), sigma_out_np(cal), a["m"])
     return out
 
 

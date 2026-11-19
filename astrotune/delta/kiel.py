@@ -62,9 +62,10 @@ from matplotlib.colors import LogNorm, TwoSlopeNorm
 from matplotlib.ticker import FuncFormatter
 
 from .. import registry
+from .covariance import entry_cov_np
 from .diagnostics import PARAM_NAMES
 from .model import LN_MIN, load_delta_model, model_shared, numpy_delta_fn
-from .stars import N_PARAMS, get_star_table
+from .stars import N_PARAMS, _catalog_entries, get_star_table
 
 log = logging.getLogger(__name__)
 
@@ -114,25 +115,36 @@ class KielCube:
 
 
 def _entries(run_dir: Path, sample: str, keys: Sequence[str], out_dir: Optional[Path]):
-    """Yield ``(catalog index, x, ln sigma_x, measured)`` for one catalog at a time."""
-    from ..apply import padded_inputs
+    """Yield ``(catalog index, arrays)`` for one catalog at a time.
+
+    ``arrays`` holds the entry's own parameters, its quoted sigma, the prepared sigma,
+    the bijector's Jacobian and the measured mask (see ``delta/covariance.py``).
+    """
     from ..training_data import load_catalog
 
     if sample not in ("model", "all"):
         raise ValueError(f"unknown sample {sample!r}: use 'model' or 'all'")
+    fields = ("x", "ls", "sig", "sig0", "J", "m")
     if sample == "model":
         stars, _ = get_star_table(run_dir, out_dir)
         c = stars["c"]
         for k in range(len(keys)):
             sel = np.flatnonzero(c == k)
-            yield k, stars["x"][sel], stars["ls"][sel], stars["m"][sel]
+            yield k, {name: stars[name][sel] for name in fields}
         return
+    from ..apply import load_cached, make_forward_and_jacobian
+    from ..model import load_bijector
+
+    cache_dir = Path(run_dir) / "harmonized" / "transform_cache_none"
+    fwd_jac = make_forward_and_jacobian(load_bijector(run_dir))
     for k, key in enumerate(keys):
         t = load_catalog(key)
-        x, sigma, measured = padded_inputs(t)
-        # The encoding the model was trained with: 0 (ln 1) on unmeasured axes, not
-        # ln(1e9), which is a value it has never seen.
-        yield k, x, np.log(np.where(measured, sigma, 1.0)).astype("f4"), measured
+        index = registry.category_index(key) if key in registry.keys() else k
+        est = load_cached(cache_dir, index, np.asarray(t["id"]), t)
+        if est is None:
+            raise FileNotFoundError(f"No usable cached transformation for {key} in {cache_dir}.")
+        c = _catalog_entries(est, t, key, fwd_jac, index)
+        yield k, {name: c[name] for name in fields}
 
 
 def _frame(stars_teff: np.ndarray, stars_logg: np.ndarray, n_bins: Tuple[int, int]):
@@ -176,25 +188,31 @@ def build_kiel_cube(run_dir, model=None, sample: str = "model", keys=None,
     count = np.zeros((n_cat,) + shape, dtype="i4")
     measures = np.zeros((n_cat, N_PARAMS), dtype=bool)
 
-    for k, x, ls, measured in tqdm(_entries(run_dir, sample, keys, out_dir),
-                                   total=n_cat, desc=f"delta cube ({sample})"):
+    for k, a in tqdm(_entries(run_dir, sample, keys, out_dir),
+                     total=n_cat, desc=f"delta cube ({sample})"):
+        x, measured = a["x"], a["m"]
         # A panel needs Teff, logg and [Fe/H]: they are the axes and the rows.
         base = measured[:, 0] & measured[:, 2] & measured[:, 1]
         if not base.any():
             log.warning("%s: no entry measures Teff, logg and [Fe/H]; skipped",
                         registry.get_spec(keys[k]).label)
             continue
-        ln_scale, ln_add = delta_fn(x, ls, np.full(len(x), group_of[k], dtype="i4"))
-        shared_k = 0.0 if shared is None else shared[group_of[k]]
+        ln_scale, ln_add = delta_fn(x, a["ls"], np.full(len(x), group_of[k], dtype="i4"))
         # sigma_out / sigma_in, per parameter: 1 means the quoted error is left alone.
-        # The group's shared variance is in absolute units, so it is divided by the
-        # entry's own variance to become part of the ratio; the additive page below
-        # keeps the model's own additive term, since the shared part is a constant of
-        # the group and would only shift every panel's colour scale.
-        c_in = np.exp(2.0 * ls.astype("f8"))
-        var = ((np.exp(ln_scale.astype("f8")) * c_in + np.exp(ln_add.astype("f8"))
-                + shared_k) / c_in)
-        lr = 0.5 * np.log(np.maximum(var, 1e-300))
+        # Both sides are the *harmonized* diagonal (the sandwich J diag(v) J^T), so a
+        # catalog that reports one number per parameter still ends up with a correlated
+        # covariance here; the ratio is what the merge would see.
+        out = entry_cov_np(a["sig"], a["J"], ln_scale, ln_add, measured=measured)
+        if shared is not None:
+            ii = np.arange(N_PARAMS)
+            out[:, ii, ii] += shared[group_of[k]]
+        ref = entry_cov_np(a["sig0"], a["J"], measured=measured)
+        ii = np.arange(N_PARAMS)
+        var = np.maximum(np.diagonal(out, axis1=1, axis2=2), 1e-300) / \
+            np.maximum(np.diagonal(ref, axis1=1, axis2=2), 1e-300)
+        lr = 0.5 * np.log(var)
+        # The additive page keeps the model's own additive sigma (shared excluded: it is
+        # a constant of the group and would only shift every panel's colour scale).
         sa = np.exp(0.5 * ln_add.astype("f8"))
         for p in range(N_PARAMS):
             sel = base & measured[:, p]

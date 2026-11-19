@@ -48,6 +48,7 @@ import tensorflow as tf
 
 from ..model.vector_network import VectorNetwork
 from ..registry import group_index
+from .covariance import entry_cov_tf
 from .stars import N_PARAMS
 
 log = logging.getLogger(__name__)
@@ -151,7 +152,7 @@ class TailWeight(snt.Module):
         return 0.5 * tf.reduce_mean(((self.raw - mean) / sd) ** 2)
 
 #: Per-entry batch arrays, plus the star each entry belongs to
-BATCH_KEYS = ("x", "ls", "c", "g", "y", "C", "m")
+BATCH_KEYS = ("x", "ls", "sig", "J", "c", "g", "y", "m")
 
 #: ``fn(x, ln_sigma, catalog) -> (ln_scale, ln_add)``, each ``(n, 4)``
 DeltaFn = Callable[[tf.Tensor, tf.Tensor, tf.Tensor], Tuple[tf.Tensor, tf.Tensor]]
@@ -398,9 +399,10 @@ def star_nll(batch: Dict[str, object], delta_fn: DeltaFn,
     ln_scale, ln_add = delta_fn(batch["x"], batch["ls"], batch["g"])  # (N, 4) each
 
     y = tf.cast(batch["y"], tf.float64)
-    s = tf.exp(0.5 * tf.cast(ln_scale, tf.float64))
-    S = (tf.cast(batch["C"], tf.float64) * s[:, :, None] * s[:, None, :]
-         + tf.linalg.diag(tf.exp(tf.cast(ln_add, tf.float64))))
+    # The correction acts on the catalog's *own* quoted sigma, and the result is
+    # propagated to the harmonized space with the bijector's Jacobian.
+    S = entry_cov_tf(batch["sig"], batch["J"], ln_scale, ln_add, measured=batch["m"])
+    S.set_shape([None, N_PARAMS, N_PARAMS])
 
     if shared is None:
         p = _marginal(S, y, m, seg, n_star)

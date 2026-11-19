@@ -58,10 +58,14 @@ LEGACY_DISPERSED_XE = 0.2
 #: How the ``x_err`` of the dispersed control points is chosen
 DISPERSED_XERR_MODES = ("per-catalog", "uniform")
 
+#: Where the ``sigma_x`` used by the bijector comes from: the prepared table's own
+#: (scaled and floored) column, or a trained delta model's calibrated sigma.
+SIGMA_SOURCES = ("floored", "delta")
+
 #: Seed used for the published run
 DEFAULT_SEED = 3
 
-_COLUMNS = ("id", "x", "x_err", "sigma_x")
+_COLUMNS = ("id", "x", "x_err", "sigma_x", "sigma_x_raw")
 
 
 def dedupe_by_id(table: astropy.table.Table) -> astropy.table.Table:
@@ -71,26 +75,65 @@ def dedupe_by_id(table: astropy.table.Table) -> astropy.table.Table:
 
 
 def load_tables(
-    keys: Optional[Sequence[str]] = None, *, dedupe: str = "none"
+    keys: Optional[Sequence[str]] = None, *, dedupe: str = "none",
+    sigma_source: str = "floored", delta_dir: Optional[Path] = None,
 ) -> List[astropy.table.Table]:
     """Load the prepared catalog tables, in registry order.
 
     ``dedupe="none"`` keeps duplicate Gaia ids exactly as the legacy notebook
     did, so a star can have several observations from the same catalog.
     ``dedupe="first"`` keeps one row per id in every catalog.
+
+    ``sigma_source`` decides what goes into the ``sigma_x`` column, i.e. what the
+    bijector's likelihood and ``apply`` use:
+
+    ``floored``
+        the prepared table's own ``sigma_x`` (catalog rescale + error floors);
+    ``delta``
+        the calibrated sigma from a trained delta model,
+        ``sqrt(exp(ln_scale) * sigma_x_raw**2 + exp(ln_add))``, read from
+        ``<delta-dir>/calibrated_sigma/<key>.npz``
+        (:func:`astrotune.delta.feed.calibrated_sigma`). The prepared file is not
+        modified; only the in-memory column is replaced, so ``sigma_x_raw`` stays
+        available.
     """
     if dedupe not in ("none", "first"):
         raise ValueError(f"dedupe must be 'none' or 'first', not {dedupe!r}")
+    if sigma_source not in SIGMA_SOURCES:
+        raise ValueError(f"sigma_source must be one of {SIGMA_SOURCES}, not {sigma_source!r}")
     keys = registry.keys() if keys is None else tuple(keys)
+    calibrated = None
+    if sigma_source == "delta":
+        from .delta.feed import calibrated_sigma
+
+        calibrated = calibrated_sigma(delta_dir or config.MODELS_DIR, keys=keys)
     tables = []
     for key in keys:
-        t = load_catalog(key)[list(_COLUMNS)]
+        t = load_catalog(key)
+        t = t[[c for c in _COLUMNS if c in t.colnames]]
+        if calibrated is not None:
+            # Before dedupe: the calibrated array is aligned with the prepared rows.
+            t = replace_sigma(t, calibrated[key], key)
         if dedupe == "first":
             n = len(t)
             t = dedupe_by_id(t)
             log.info("%s: dropped %d duplicate-id rows", key, n - len(t))
         tables.append(t)
     return tables
+
+
+def replace_sigma(table: astropy.table.Table, sigma: np.ndarray, key: str = "") -> astropy.table.Table:
+    """A copy of ``table`` whose ``sigma_x`` is ``sigma`` (rows must line up)."""
+    sigma = np.asarray(sigma, dtype="f8")
+    if sigma.shape[0] != len(table):
+        raise ValueError(
+            f"{key}: calibrated sigma has {sigma.shape[0]} rows, the table {len(table)}; "
+            "it was made for a different preparation"
+        )
+    out = table.copy()
+    d = np.asarray(table["sigma_x"]).shape[1]
+    out["sigma_x"] = sigma[:, :d].astype("f4")
+    return out
 
 
 def ids_in_several_catalogs(tables) -> np.ndarray:
@@ -300,6 +343,8 @@ def build_training_data(
     seed: int = DEFAULT_SEED,
     dedupe: str = "none",
     dispersed_xerr: str = "per-catalog",
+    sigma_source: str = "floored",
+    delta_dir: Optional[Path] = None,
 ) -> Tuple[dict, dict]:
     """Build ``(obs_dict, ctrl_dict)`` from the catalogs.
 
@@ -307,11 +352,17 @@ def build_training_data(
     only, so ``seed`` sets which control points are drawn (and, through
     ``X_ERR_DISPERSED``, not their errors). ``dispersed_xerr="uniform"`` gives
     the legacy uniform 0.2 instead of the per-catalog values.
+
+    ``sigma_source="delta"`` (with ``delta_dir``) replaces each catalog's
+    ``sigma_x`` by the calibrated sigma of a trained delta model before the
+    observations are built: that is one half of the iteration described in
+    ``porting_project.md`` (bijector -> delta -> bijector).
     """
     keys = None
     if tables is None:
         keys = registry.keys()
-        tables = load_tables(keys, dedupe=dedupe)
+        tables = load_tables(keys, dedupe=dedupe, sigma_source=sigma_source,
+                             delta_dir=delta_dir)
     rng = np.random.default_rng(seed)
     obs_dict = build_observations(tables)
     ctrl_dict = build_control_points(
@@ -436,11 +487,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "catalog's median x_err per parameter (or X_ERR_DISPERSED), with parameters a "
         "catalog does not measure pinned; 'uniform' is the legacy 0.2 for all",
     )
+    parser.add_argument(
+        "--sigma-source",
+        choices=SIGMA_SOURCES,
+        default="floored",
+        help="sigma_x for the bijector: 'floored' (default) is the prepared table's "
+        "scaled and floored column, 'delta' the calibrated sigma of a trained delta "
+        "model (needs --delta-dir)",
+    )
+    parser.add_argument(
+        "--delta-dir", type=Path, default=None,
+        help="run directory of the delta model for --sigma-source delta "
+        "(it holds delta/delta_model.*)",
+    )
     args = parser.parse_args(argv)
 
+    if args.sigma_source == "delta" and args.delta_dir is None:
+        parser.error("--sigma-source delta needs --delta-dir")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     obs_dict, ctrl_dict = build_training_data(
-        seed=args.seed, dedupe=args.dedupe, dispersed_xerr=args.dispersed_xerr
+        seed=args.seed, dedupe=args.dedupe, dispersed_xerr=args.dispersed_xerr,
+        sigma_source=args.sigma_source, delta_dir=args.delta_dir,
     )
     n_stars = len(np.unique(obs_dict["id"]))
     log.info(
@@ -453,6 +520,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         obs_dict, ctrl_dict, args.output,
         attrs=dict(
             seed=args.seed, dedupe=args.dedupe, dispersed_xerr=args.dispersed_xerr,
+            sigma_source=args.sigma_source,
+            delta_dir=str(args.delta_dir) if args.delta_dir else "",
             catalogs=",".join(registry.keys()),
             error_floors=",".join(f"{v:g}" for v in config.ERROR_FLOORS),
             n_stars=n_stars,

@@ -28,6 +28,9 @@ def _synthetic_stars(n_star=4000, sigma_true=(0.02, 0.05, 0.1), c_reported=0.03,
     flat = {
         "x": rng.normal(size=(n, K, 4)),
         "ls": np.full((n, K, 4), np.log(c_reported)),
+        "sig": np.full((n, K, 4), c_reported),
+        "sig0": np.full((n, K, 4), c_reported),
+        "J": np.broadcast_to(np.eye(4), (n, K, 4, 4)).copy(),
         "c": cats[:, None],
         "y": y,
         "C": np.broadcast_to(np.eye(4) * c_reported**2, (n, K, 4, 4)),
@@ -112,9 +115,8 @@ def test_diagnostics_handle_unmeasured_parameters():
     entry = np.arange(2, 3 * 2000, 3)  # the third entry of every star: no [a/Fe]
     s["m"][entry, 3] = False
     s["y"][entry, 3] = 0.0
-    s["C"][entry, 3, :] = 0.0
-    s["C"][entry, :, 3] = 0.0
-    s["C"][entry, 3, 3] = 1e9
+    s["sig"][entry, 3] = 0.0
+    s["sig0"][entry, 3] = 0.0
     res = dg.entry_stats(s)
     assert np.all(np.isnan(res["z"][entry, 3]))
     assert np.all(res["dof"][entry] == 3)
@@ -156,9 +158,8 @@ def test_pair_chi2_rejects_a_quoted_error_that_is_half_the_truth():
 def test_pair_chi2_counts_only_the_parameters_both_entries_share():
     s = _synthetic_stars(sigma_true=(0, 0, 0), n_star=200, n_cat=2)
     s["m"][1::2, 3] = False  # every second entry has no [alpha/Fe]
-    s["C"][1::2, 3, :] = 0.0
-    s["C"][1::2, :, 3] = 0.0
-    s["C"][1::2, 3, 3] = 1e9
+    s["sig"][1::2, 3] = 0.0
+    s["sig0"][1::2, 3] = 0.0
     r = dg.pair_chi2(s, None)
     assert np.all(r["nu"] == 3)
     assert np.median(r["chi2"]) == pytest.approx(stats.chi2.median(3), rel=0.12)
@@ -213,7 +214,9 @@ def test_star_nll_matches_the_difference_space_density():
     s = _synthetic_stars(n_star=6, sigma_true=(0.02, 0.05, 0.1, 0.07), c_reported=0.05, n_cat=K)
     rng = np.random.default_rng(7)  # correlated covariances, so the test is not diagonal
     A = rng.normal(size=(len(s["c"]), 4, 4)) * 0.01
+    # J diag(sig^2) J^T is the covariance: J carries the correlations, sig the size
     s["C"] = (np.einsum("nij,nkj->nik", A, A) + np.eye(4) * 0.0025).astype("f4")
+    s["J"] = (np.linalg.cholesky(s["C"].astype("f8")) / 0.05).astype("f4")
     nll, _ = star_nll(_batch(s), fixed_delta(0.0))
     for i in range(6):
         S = [s["C"][K * i + k].astype("f8") for k in range(K)]
@@ -224,7 +227,7 @@ def test_star_nll_matches_the_difference_space_density():
             for b in range(K - 1):
                 W[a * 4:(a + 1) * 4, b * 4:(b + 1) * 4] = S[-1] + (S[a] if a == b else 0)
         ref = -stats.multivariate_normal(np.zeros(len(u)), W).logpdf(u)
-        assert float(nll[i].numpy()) == pytest.approx(ref, rel=1e-9, abs=1e-9)
+        assert float(nll[i].numpy()) == pytest.approx(ref, rel=1e-6, abs=1e-6)
 
 
 def test_three_catalog_star_nll_is_not_the_product_of_its_pairs():
@@ -309,14 +312,23 @@ def test_build_star_table_groups_entries_by_star(tmp_path, monkeypatch):
     # star 1 is in all three catalogs, star 2 in catalogs 0 and 2, stars 3 and 9 in one
     per_catalog = {0: np.array([1, 2, 9]), 1: np.array([1, 3]), 2: np.array([1, 2])}
 
-    def fake_tables(keys_arg=None, dedupe="none"):
+    def fake_tables(keys_arg=None, dedupe="none", **kwargs):
         from astropy.table import Table
 
         return [
             Table({"id": per_catalog[i], "x": np.zeros((len(per_catalog[i]), 4), "f4"),
-                   "sigma_x": np.ones((len(per_catalog[i]), 4), "f4")})
+                   "sigma_x": np.ones((len(per_catalog[i]), 4), "f4"),
+                   "sigma_x_raw": np.ones((len(per_catalog[i]), 4), "f4")})
             for i in range(len(keys))
         ]
+
+    def fake_jac(bij):
+        def f(xx, cc):
+            n = int(len(xx))
+            return np.zeros((n, 4), "f4"), np.broadcast_to(
+                np.eye(4, dtype="f4"), (n, 4, 4)).copy()
+
+        return f
 
     def fake_cached(cache_dir, index, ids, table=None):
         n = len(ids)
@@ -326,6 +338,9 @@ def test_build_star_table_groups_entries_by_star(tmp_path, monkeypatch):
 
     monkeypatch.setattr(td, "load_tables", fake_tables)
     monkeypatch.setattr(ap, "load_cached", fake_cached)
+    monkeypatch.setattr(ap, "make_forward_and_jacobian", fake_jac)
+    # the real bijector loader needs a trained model; the fake ignores it
+    monkeypatch.setattr("astrotune.model.load_bijector", lambda *a, **k: None)
 
     stars, out_keys = st.build_star_table(tmp_path / "run", cache)
     assert tuple(out_keys) == tuple(keys)

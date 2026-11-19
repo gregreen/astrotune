@@ -18,8 +18,11 @@ def _table(n_star=400, n_cat=2, sigma=0.03, alpha=True):
     if not alpha:
         m[..., 3] = False  # nobody measures [alpha/Fe]
     C = np.broadcast_to(np.eye(4) * sigma**2, (n, K, 4, 4))
+    sig = np.where(m, sigma, 0.0)
     out = {k: np.ascontiguousarray(v.reshape(n * K, *v.shape[2:]).astype("f4"))
-           for k, v in dict(x=x, ls=ls, y=n / 2 + 0 * x, C=C).items()}
+           for k, v in dict(x=x, ls=ls, sig=sig, sig0=sig, y=n / 2 + 0 * x, C=C).items()}
+    out["J"] = np.ascontiguousarray(
+        np.broadcast_to(np.eye(4, dtype="f4"), (n * K, 4, 4)).copy())
     out["m"] = np.ascontiguousarray(m.reshape(n * K, 4))
     out["c"] = np.tile(np.arange(K, dtype="i4"), n)
     out["g"] = out["c"].copy()

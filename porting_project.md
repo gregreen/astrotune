@@ -1551,6 +1551,66 @@ the **per-catalog** rows of a grouped catalog read too low (APOGEE [α/Fe] 0.45)
 pooled numbers are dominated by multi-group stars and are fine; `pair_chi2` treats
 the distinction exactly.
 
+#### Two sigmas, and the correction in the catalogs' own units (2026-11-19)
+
+The floors and the per-catalog rescalings (`ERROR_FLOORS`, `UNC_SCALES`) are part of
+the *bijector's* likelihood -- `train_latent.py` weights every observation by
+`1/sigma_x^2` -- so they cannot be removed from `prep`. The delta model, by
+contrast, must not see our own floor: it should learn the calibration from what the
+catalog actually reported. Prepared tables therefore carry **two** uncertainties:
+
+| column | contents | reader |
+|---|---|---|
+| `sigma_x` | `hypot(UNC_SCALES * quoted, ERROR_FLOORS)` | the bijector (`train_latent`), and `apply` |
+| `sigma_x_raw` | the quoted sigma in our units, no rescale, no floor | the delta model |
+
+`prep.transforms.extract_table(..., param_unc_transf_raw=...)` builds the second
+column in the same pass as the first. `delta.stars.raw_sigma` reads it, and falls
+back to `prep.error_scale.quoted_sigma`, which inverts the rescale and the floor
+exactly (verified to 1e-6) -- so tables written before the column existed still work.
+
+With `sigma_raw` in hand the correction acts where the error was quoted. The delta
+model's two learned numbers are now in the **catalog's own units**:
+
+    S = J diag(v) J^T,   v_p = exp(ln_scale_p) * sigma_raw_p^2 + exp(ln_add_p)
+
+(`delta/covariance.py`), so `s = exp(ln_scale/2)` is "this catalog's quoted error is
+wrong by this factor" and `a = exp(ln_add/2)` is "this much is missing", both
+comparable across catalogs and parameters. `J` is the bijector's Jacobian at the
+entry's own parameters, now stored in the star table (16 floats per entry, in place
+of the harmonized `C`, which is reconstructed from it, so the file size is
+unchanged). It is recomputed when the star table is built (`apply.make_forward_and_jacobian`),
+so the transform cache is exactly what `apply` needs and nothing more. The group's
+shared systematic stays a *harmonized* diagonal added at the second level of the
+hierarchy (`V_g = A_g^-1 + G_g`); keeping it out of `S` is what makes that
+factorization exact.
+
+#### The iteration, and feeding sigma back
+
+Because the delta model's output depends only on the entry's own parameters and its
+catalog -- not on the bijector -- one fitted model yields a table of calibrated
+sigmas that any number of bijector retrainings can read:
+
+```
+bijector (sigma_x = scaled + floored) -> delta model (needs J)
+    -> sigma_cal = sqrt(exp(ln_scale) sigma_raw^2 + exp(ln_add))
+    -> astrotune-observations --sigma-source delta --delta-dir models/X
+    -> new bijector -> rebuild the star table (J changed) -> new delta model -> ...
+```
+
+`delta/feed.py:calibrated_sigma` writes `delta/calibrated_sigma/<key>.npz`, keyed by
+a checksum of the model's weights; `training_data.load_tables(sigma_source="delta")`
+substitutes it into the in-memory `sigma_x` *before* deduplication, leaving the
+prepared files untouched; `astrotune-apply --sigma-source delta` does the same and
+keeps its transform cache in a separate directory (`transform_cache_none_delta`).
+The star table does not depend on the sigma source (it always carries `sigma_raw`,
+the prepared `sig0` and `J`) but it *does* depend on the bijector, so it must be
+rebuilt after a bijector retrain.
+
+Remaining work is the driver, plus the two related decisions recorded in `TODO.md`:
+correlated entries in the merge (the `y`-solve still treats a catalog group as
+independent) and Student-t tails in the bijector training.
+
 ### 9.11 Catalog connectivity figure (`astrotune-catalog-graph`)
 
 For the paper (owner's idea): nodes = catalogs (radius ~ log10 rows), edges = pairs

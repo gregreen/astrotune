@@ -59,11 +59,13 @@ StarTable = Dict[str, np.ndarray]
 #: entry (``N`` rows, in star order), the second by star.
 FIELDS = {
     "x": "the catalog's own parameters (0 where not measured)",
-    "ls": "ln of the reported sigma_x (0 where not measured)",
+    "ls": "ln of the quoted (raw) sigma (0 where not measured)",
+    "sig": "the catalog's quoted sigma, in its own units (0 where not measured)",
+    "sig0": "the prepared sigma_x (scaled and floored), for comparison",
+    "J": "Jacobian dy/dx of the bijector at this entry (4,4)",
     "c": "catalog index",
     "g": "group index (catalogs that share a pipeline share a group)",
     "y": "harmonized parameters",
-    "C": "harmonized covariance (4,4)",
     "m": "parameter measured by this entry",
     "seg": "star index of the entry",
     "id": "Gaia DR3 source id, per star",
@@ -71,7 +73,7 @@ FIELDS = {
     "n_entry": "entries of each star",
 }
 
-ENTRY_FIELDS = ("x", "ls", "c", "y", "C", "m", "seg", "g")
+ENTRY_FIELDS = ("x", "ls", "sig", "sig0", "J", "c", "y", "m", "seg", "g")
 STAR_FIELDS = ("id", "off", "n_entry")
 
 
@@ -81,8 +83,29 @@ def val_mask(ids: np.ndarray, frac: float = VAL_FRAC) -> np.ndarray:
     return (h % np.uint64(1 << 16)) < np.uint64(frac * (1 << 16))
 
 
-def _catalog_entries(est, table):
-    """First valid row per star, sorted by id: the arrays one catalog contributes."""
+def raw_sigma(table, key: str) -> np.ndarray:
+    """The catalog's *quoted* sigma, in our parameter units, ``(n, d)``.
+
+    From the prepared table's own ``sigma_x_raw`` when it has one, else recovered from
+    ``sigma_x`` with :func:`astrotune.prep.error_scale.quoted_sigma`, which inverts the
+    catalog's rescale and the error floor exactly -- so tables written before that
+    column existed still work. This is what the delta model is fitted on: it learns the
+    rescale and the floor itself.
+    """
+    if "sigma_x_raw" in table.colnames:
+        return np.asarray(table["sigma_x_raw"], dtype="f4")
+    from ..prep.error_scale import quoted_sigma
+
+    return quoted_sigma(key, np.asarray(table["sigma_x"])).astype("f4")
+
+
+def _catalog_entries(est, table, key: str, fwd_jac=None, index: Optional[int] = None):
+    """First valid row per star, sorted by id: the arrays one catalog contributes.
+
+    ``sig`` is the quoted sigma (:func:`raw_sigma`), ``sig0`` the prepared one the
+    current pipeline propagates, and ``J`` the bijector's Jacobian at those rows (from
+    ``fwd_jac(x, c)``), which is what lets the delta model work in the catalogs' units.
+    """
     from ..apply import padded_inputs
 
     ids = np.asarray(table["id"])
@@ -90,13 +113,33 @@ def _catalog_entries(est, table):
     ok = np.flatnonzero(np.isfinite(est.y).all(1) & np.isfinite(est.cov).all((1, 2)))
     _, first = np.unique(ids[ok], return_index=True)
     rows = ok[first]
-    ln_s = np.log(np.where(measured, sigma, 1.0)).astype("f4")
+
+    quoted = raw_sigma(table, key)
+    sig = np.zeros_like(x)
+    sig[:, : quoted.shape[1]] = quoted
+    sig = np.where(measured, sig, 0.0)
+    jac = None
+    if fwd_jac is not None:
+        c = index if index is not None else registry.category_index(key)
+        # Chunked: a catalog can contribute millions of rows and the Jacobian is dense.
+        chunk = 65_536
+        out = np.empty((len(rows), x.shape[1], x.shape[1]), dtype="f4")
+        for lo in range(0, len(rows), chunk):
+            sl = slice(lo, min(lo + chunk, len(rows)))
+            _, j = fwd_jac(x[rows[sl]], np.full(len(rows[sl]), c, dtype="i4"))
+            out[sl] = np.asarray(j, dtype="f4")
+        jac = out
     return dict(
         id=ids[rows],
         x=x[rows],
-        ls=ln_s[rows],
+        # a catalog may quote sigma = 0 on a parameter it does measure; ln(sigma) is
+        # then -inf, which the model tolerates (it does not feed it to the heads) but
+        # which has no meaning, so clip it.
+        ls=np.log(np.where(measured, np.maximum(sig, 1e-30), 1.0)).astype("f4"),
+        sig=sig[rows].astype("f4"),
+        sig0=np.where(measured, sigma, 0.0)[rows].astype("f4"),
+        J=None if jac is None else jac.astype("f4"),  # already the selected rows
         y=est.y[rows].astype("f4"),
-        C=est.cov[rows].astype("f4"),
         m=est.measured[rows],
     )
 
@@ -125,6 +168,17 @@ def build_star_table(run_dir, cache_dir: Optional[Path] = None) -> Tuple[StarTab
         )
     tables = load_tables(keys, dedupe="none")
 
+    # The Jacobian at each entry's own parameters: 16 floats per entry, which is what
+    # lets the delta model work in the catalogs' units (see delta/covariance.py). It is
+    # recomputed here rather than stored in the transform cache, so that cache stays
+    # exactly what `apply` needs.
+    from ..apply import make_forward_and_jacobian
+    from ..model import load_bijector
+    from ..model.io import enable_memory_growth
+
+    enable_memory_growth()
+    fwd_jac = make_forward_and_jacobian(load_bijector(run_dir))
+
     cats = []
     for key, t in zip(keys, tables):
         est = load_cached(cache_dir, registry.category_index(key), np.asarray(t["id"]), t)
@@ -133,14 +187,15 @@ def build_star_table(run_dir, cache_dir: Optional[Path] = None) -> Tuple[StarTab
                 f"No usable cached transformation for {key} in {cache_dir} (missing, or made from a "
                 f"different x or sigma_x): run `astrotune-apply --run-dir {run_dir}` (again)."
             )
-        cats.append(_catalog_entries(est, t))
+        cats.append(_catalog_entries(est, t, key, fwd_jac, registry.category_index(key)))
         log.info("%s: %d stars (first row per id)", key, len(cats[-1]["id"]))
     del tables
 
     # Concatenate the catalogs, then sort by star so that a star's entries are contiguous.
     ids_raw = np.concatenate([c["id"] for c in cats])
     cat_raw = np.concatenate([np.full(len(c["id"]), j, dtype="i4") for j, c in enumerate(cats)])
-    raw = {name: np.concatenate([c[name] for c in cats]) for name in ("x", "ls", "y", "C", "m")}
+    names = ("x", "ls", "sig", "sig0", "J", "y", "m")
+    raw = {name: np.concatenate([c[name] for c in cats]) for name in names}
     del cats
     order = np.lexsort((cat_raw, ids_raw))  # by star, then by catalog index
     ids = ids_raw[order]
@@ -163,13 +218,26 @@ def build_star_table(run_dir, cache_dir: Optional[Path] = None) -> Tuple[StarTab
         "seg": np.repeat(np.arange(len(star_id), dtype="i4"), count),
         "c": cat_raw[final].astype("i4"),
     }
-    for name in ("x", "ls", "y", "C", "m"):
+    for name in names:
         stars[name] = raw[name][final]
     log.info(
         "%d entries of %d stars (%d catalogs, at most %d entries per star)",
         n_ent, len(star_id), len(keys), int(count.max()) if len(count) else 0,
     )
     return stars, tuple(keys)
+
+
+def as_prepared(stars: StarTable) -> StarTable:
+    """A view of ``stars`` whose ``sig`` is the prepared ``sig0``.
+
+    ``sig`` is the *quoted* sigma the delta model corrects; ``sig0`` is what the
+    pipeline propagates today (quoted, scaled, floored). Swapping them gives the
+    reference arm of every comparison: the covariance the merge uses without any
+    delta model.
+    """
+    out = dict(stars)
+    out["sig"] = stars["sig0"]
+    return out
 
 
 def subset(stars: StarTable, keep_stars: np.ndarray) -> StarTable:
@@ -251,10 +319,14 @@ def get_star_table(run_dir, out_dir: Optional[Path] = None, rebuild: bool = Fals
     path = out_dir / "star_table.npz"
     if path.exists() and not rebuild:
         stars, keys = load_star_table(path)
-        if tuple(keys) == tuple(registry.run_keys(run_dir)):
+        if tuple(keys) != tuple(registry.run_keys(run_dir)):
+            log.warning("%s was made for other catalogs; rebuilding", path)
+        elif "J" not in stars or "sig" not in stars:
+            # Written before the delta model moved to the catalogs' own units.
+            log.warning("%s has no Jacobian; rebuilding", path)
+        else:
             log.info("Loaded %s", path)
             return with_groups(stars, keys), keys
-        log.warning("%s was made for other catalogs; rebuilding", path)
     stars, keys = build_star_table(run_dir)
     save_star_table(path, stars, keys)
     return with_groups(stars, keys), keys

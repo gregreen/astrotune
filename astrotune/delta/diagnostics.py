@@ -63,6 +63,7 @@ if not os.environ.get("DISPLAY"):  # headless by default
 
 import matplotlib.pyplot as plt
 
+from .covariance import entry_cov_np
 from .stars import N_PARAMS, StarTable, block_indices, get_star_table
 
 log = logging.getLogger(__name__)
@@ -90,19 +91,18 @@ def _segments(seg: np.ndarray) -> np.ndarray:
 def _entry_cov(stars: StarTable, idx: np.ndarray,
                delta_fn: Optional[DeltaFn] = None,
                group_cov: Optional[np.ndarray] = None) -> np.ndarray:
-    """``S = diag(s) C diag(s) + diag(add)`` for the entries ``idx``.
+    """``S = J diag(exp(ln_scale) sig^2 + exp(ln_add)) J^T`` for the entries ``idx``.
 
     With ``group_cov`` (one shared variance per group and parameter) the shared part
     is added as well, which makes this the covariance an entry has when compared with
-    anything *outside* its group -- the one the merge uses.
+    anything *outside* its group -- the one the merge uses. The shared part lives in
+    the harmonized space, the scale and the additive term in the catalog's own.
     """
-    S = stars["C"][idx].astype("f8")
+    ln_scale = ln_add = None
     if delta_fn is not None:
         ln_scale, ln_add = delta_fn(stars["x"][idx], stars["ls"][idx], stars["g"][idx])
-        s = np.exp(0.5 * ln_scale.astype("f8"))
-        S = S * s[:, :, None] * s[:, None, :]
-        ii = np.arange(N_PARAMS)
-        S[:, ii, ii] += np.exp(ln_add.astype("f8"))
+    S = entry_cov_np(stars["sig"][idx], stars["J"][idx], ln_scale, ln_add,
+                     measured=stars["m"][idx])
     if group_cov is not None:
         ii = np.arange(N_PARAMS)
         S[:, ii, ii] += np.asarray(group_cov, dtype="f8")[stars["g"][idx]]
@@ -390,6 +390,8 @@ def three_cornered_hat(stars: StarTable, n_cat: int, min_pairs: int = 200) -> np
     variance). Those stars are what the likelihood is for.
     """
     out = np.full((n_cat, N_PARAMS), np.nan)
+    # What the current pipeline propagates for every entry (the comparison baseline).
+    quoted_cov = entry_cov_np(stars["sig0"], stars["J"], measured=stars["m"])
     off = stars["off"][:-1][stars["n_entry"] == 2]
     if len(off) == 0:
         return out
@@ -407,7 +409,7 @@ def three_cornered_hat(stars: StarTable, n_cat: int, min_pairs: int = 200) -> np
                 continue
             i = idx[ok]
             d = (stars["y"][i, p].astype("f8") - stars["y"][i + 1, p].astype("f8"))
-            Spp = (stars["C"][i, p, p].astype("f8") + stars["C"][i + 1, p, p].astype("f8"))
+            Spp = (quoted_cov[i, p, p] + quoted_cov[i + 1, p, p])
             rows.append((int(k // n_cat), int(k % n_cat),
                          robust_scale(d) ** 2 - float(np.median(Spp)), int(ok.sum())))
         if not rows:
