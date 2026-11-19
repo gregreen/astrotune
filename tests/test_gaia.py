@@ -299,6 +299,23 @@ def test_check_regression_tolerates_rounding():
     g.check_regression(previous, crossmatch, key="demo")  # 0.1 % < 1 %
 
 
+def test_check_regression_rebaselines_when_the_search_radius_changes():
+    previous = {"n_matched": 334, "max_separation_arcsec": 1.5}
+    crossmatch = Table({"match_idx": np.arange(298)})
+    crossmatch.meta.update({"n_matched": 298, "n_uploaded": 385, "max_separation_arcsec": 1.0})
+
+    g.check_regression(previous, crossmatch, key="demo")  # deliberate: 1.5 -> 1.0 arcsec
+
+
+def test_check_regression_still_fires_at_the_same_radius():
+    previous = {"n_matched": 334, "max_separation_arcsec": 1.0}
+    crossmatch = Table({"match_idx": np.arange(298)})
+    crossmatch.meta.update({"n_matched": 298, "n_uploaded": 385, "max_separation_arcsec": 1.0})
+
+    with pytest.raises(g.CrossmatchError, match="incomplete"):
+        g.check_regression(previous, crossmatch, key="demo")
+
+
 def test_crossmatch_catalog_keeps_the_old_cache_when_the_result_shrinks(monkeypatch, tmp_path):
     catalog = Table({"RAdeg": np.linspace(10, 20, 10), "DEdeg": np.linspace(-5, 5, 10)})
     full = install(monkeypatch, FakeArchive([matched_pairs]))
