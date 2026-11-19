@@ -22,6 +22,21 @@ Since the catalog sizes feed every downstream number, each batch is checked:
 * :func:`crossmatch_catalog` compares the fresh crossmatch with the previous
   run's report and refuses to overwrite a cache with one that matches markedly
   fewer stars.
+
+Which archive
+-------------
+``archive=`` picks the service (see :data:`ARCHIVES`): ``esa`` is the official
+archive, ``gavo`` is GAVO's independent mirror of ``gaia.dr3lite`` and ``ari`` /
+``ari-lite`` are the Heidelberg mirror. They differ in ways that matter:
+
+* GAVO and ARI queue a new job in ``PENDING`` and only run it once it is set to
+  ``RUN``;
+* GAVO and ARI silently insert ``TOP 3000`` into a query that has no TOP, so
+  they are queried with an explicit one;
+* ARI's asynchronous queue never advances (jobs sit in QUEUED), while its
+  synchronous endpoint answers cone searches in a fraction of a second, so it
+  is queried synchronously;
+* only the three-argument ``POINT('ICRS', ra, dec)`` is parsed by all of them.
 """
 
 from __future__ import annotations
@@ -91,6 +106,94 @@ def _gaia():
     return Gaia
 
 
+@dataclass(frozen=True)
+class Archive:
+    """A TAP service that serves a Gaia DR3 source table."""
+
+    name: str
+    table: str
+    #: ``None`` for the official archive, which has a dedicated astroquery class.
+    url: Optional[str] = None
+    output_format: str = "votable"
+    #: Some services cap every result set: GAVO (and the ARI mirror, which runs
+    #: the same software) silently inserts ``TOP 3000`` when the query carries
+    #: no TOP. Set this to emit an explicit TOP and to treat a result that fills
+    #: it as suspicious instead of trusting it.
+    top: Optional[int] = None
+    #: Run the query synchronously. The ARI mirror leaves asynchronous jobs
+    #: queued for many minutes (or forever), while its synchronous endpoint
+    #: answers the same join in a fraction of a second.
+    sync: bool = False
+    #: What the table is missing relative to ``gaiadr3.gaia_source``.
+    note: str = ""
+
+
+#: The official ESA archive (``astroquery.gaia``).
+ESA = Archive(name="esa", table=GAIA_TABLE, note="full gaia_source")
+
+#: GAVO, the German VO: a mirror that only carries the *lite* Gaia DR3 table
+#: (source_id, ra, dec, parallax, pm, photometry). That is everything a
+#: positional crossmatch needs, and it is a completely independent service, so
+#: it works when the official archive is down for a data release.
+GAVO = Archive(
+    name="gavo",
+    table="gaia.dr3lite",
+    url="https://dc.g-vo.org/tap",
+    top=10_000_000,
+    note="gaia.dr3lite: no astrometry beyond ra/dec, no astrophysical parameters",
+)
+
+#: Heidelberg ARI, which mirrors Gaia DR3 in full (and also serves the lite
+#: table). Handy as a second opinion: same table name as the official archive.
+ARI = Archive(
+    name="ari",
+    table=GAIA_TABLE,
+    url="https://gaia.ari.uni-heidelberg.de/tap",
+    top=10_000_000,
+    sync=True,
+    note="Heidelberg ARI mirror, full gaia_source",
+)
+
+#: The same service's lite table, for comparison with GAVO's ``dr3lite``.
+ARI_LITE = Archive(
+    name="ari-lite",
+    table="gaiadr3.gaia_source_lite",
+    url="https://gaia.ari.uni-heidelberg.de/tap",
+    top=10_000_000,
+    sync=True,
+    note="Heidelberg ARI mirror, gaia_source_lite",
+)
+
+ARCHIVES = {archive.name: archive for archive in (ESA, GAVO, ARI, ARI_LITE)}
+ARCHIVES["gaia"] = ESA  # alias: the module is named after the official archive
+_clients: dict = {}
+
+
+def archive_by_name(name) -> Archive:
+    """Look up an :class:`Archive` by name (``esa`` or ``gavo``) or pass one through."""
+    if isinstance(name, Archive):
+        return name
+    try:
+        return ARCHIVES[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown Gaia archive {name!r}; known: {', '.join(sorted(ARCHIVES))}"
+        ) from None
+
+
+def _client(archive: Archive):
+    """The TAP client for an archive (GAVO clients are reused across batches)."""
+    if archive.url is None:
+        return _gaia()
+    client = _clients.get(archive.url)
+    if client is None:
+        from astroquery.utils.tap.core import TapPlus
+
+        client = TapPlus(url=archive.url)
+        _clients[archive.url] = client
+    return client
+
+
 @dataclass
 class Batch:
     """What one TAP job was asked for and what came back."""
@@ -127,10 +230,23 @@ class Batch:
         }
 
 
-def _pairs_query(table_name: str, separation_deg: float, method: str) -> str:
+def _point(alias: str) -> str:
+    """An ADQL POINT for a table alias, in the portable three-argument form."""
+    return f"POINT('ICRS', {alias}.ra, {alias}.dec)"
+
+
+def _pairs_query(
+    table_name: str, separation_deg: float, method: str, table: str, top: Optional[int] = None
+) -> str:
     """ADQL for all (uploaded row, Gaia source) pairs within ``separation_deg``."""
     if method == "distance":
-        condition = f"DISTANCE(POINT(t.ra, t.dec), POINT(g.ra, g.dec)) < {separation_deg}"
+        # The standard three-argument POINT is the only form all three services
+        # parse: the two-argument POINT (an extension ESA and GAVO accept) and
+        # the four-argument DISTANCE that GAVO documents are both rejected by
+        # the ARI mirror. It is still served from the spatial index.
+        condition = (
+            f"DISTANCE({_point('g')}, {_point('t')}) < {separation_deg}"
+        )
     elif method == "contains":
         # The form the archive can answer from its spatial index.
         condition = (
@@ -140,26 +256,40 @@ def _pairs_query(table_name: str, separation_deg: float, method: str) -> str:
     else:
         raise ValueError(f"unknown crossmatch method {method!r}; use 'distance' or 'contains'")
 
+    top_clause = f"TOP {top} " if top else ""
     return f"""
-      SELECT
+      SELECT {top_clause}
         t.index,
         g.source_id, g.ra, g.dec,
-        DISTANCE(POINT(t.ra, t.dec), POINT(g.ra, g.dec)) * 3600. AS angsep_arcsec
+        DISTANCE({_point('g')}, {_point('t')}) * 3600. AS angsep_arcsec
       FROM tap_upload.{table_name} AS t
-      JOIN {GAIA_TABLE} AS g
+      JOIN {table} AS g
       ON {condition}
     """.strip()
 
 
 def _wait_for_job(job, *, timeout: float = JOB_TIMEOUT, verbose: bool = False) -> str:
-    """Poll a TAP job until a terminal phase; never wait forever."""
+    """Poll a TAP job until a terminal phase; never wait forever.
+
+    GAVO and the ARI mirror queue a new job in ``PENDING`` and only execute it
+    once it is set to ``RUN``, which is what astroquery's own
+    ``wait_for_job_end()`` does. Driving the phases by hand means doing it here
+    too -- without this the job simply never starts.
+    """
     deadline = time.monotonic() + timeout
+    started = False
     while True:
         phase = str(job.get_phase(update=True)).upper().strip()
         if verbose:
             log.info("job %s: %s", job.jobid, phase)
         if phase in _TERMINAL_PHASES:
             return phase
+        if phase == "PENDING" and not started:
+            try:
+                job.start(verbose=verbose)
+                started = True
+            except Exception as exc:  # pragma: no cover - best effort
+                log.debug("could not start job %s: %s", job.jobid, exc)
         if time.monotonic() >= deadline:
             try:
                 job.abort()
@@ -180,10 +310,10 @@ def _job_error(job) -> str:
     return (message or "<empty error message>")[:400]
 
 
-def _drop_upload(table_name: str) -> None:
+def _drop_upload(table_name: str, archive: Archive = ESA) -> None:
     """Remove an uploaded table; cleanup is best effort."""
     try:
-        _gaia().delete_user_table(table_name=table_name)
+        _client(archive).delete_user_table(table_name=table_name)
     except Exception as exc:  # pragma: no cover - cleanup is best effort
         log.debug("could not drop upload table %s: %s", table_name, exc)
 
@@ -192,6 +322,7 @@ def _run_query(
     build_query: Callable[[str], str],
     upload: Table,
     *,
+    archive: Archive = ESA,
     timeout: float = JOB_TIMEOUT,
     verbose: bool = False,
 ) -> tuple[Table, int]:
@@ -200,22 +331,34 @@ def _run_query(
     Every attempt uploads under a fresh table name, so a retry can never trip
     over the leftovers of the attempt that just failed.
     """
-    gaia = _gaia()
+    client = _client(archive)
     last_error: Optional[BaseException] = None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         table_name = f"crossmatch_{uuid.uuid4().hex[:12]}"
         try:
-            job = gaia.launch_job_async(
-                build_query(table_name),
-                verbose=verbose,
-                background=True,
-                upload_resource=upload,
-                upload_table_name=table_name,
-            )
-            phase = _wait_for_job(job, timeout=timeout, verbose=verbose)
-            if phase != "COMPLETED":
-                raise CrossmatchError(f"job {job.jobid} ended in {phase}: {_job_error(job)}")
+            if archive.sync:
+                job = client.launch_job(
+                    build_query(table_name),
+                    verbose=verbose,
+                    upload_resource=upload,
+                    upload_table_name=table_name,
+                    output_format=archive.output_format,
+                )
+            else:
+                job = client.launch_job_async(
+                    build_query(table_name),
+                    verbose=verbose,
+                    background=True,
+                    upload_resource=upload,
+                    upload_table_name=table_name,
+                    output_format=archive.output_format,
+                )
+                phase = _wait_for_job(job, timeout=timeout, verbose=verbose)
+                if phase != "COMPLETED":
+                    raise CrossmatchError(
+                        f"job {job.jobid} ended in {phase}: {_job_error(job)}"
+                    )
             result = job.get_results()
             if result is None:
                 raise CrossmatchError(f"job {job.jobid} completed without a result table")
@@ -223,7 +366,8 @@ def _run_query(
         except Exception as exc:  # noqa: BLE001 - every failure here is retryable
             last_error = exc
             log.warning(
-                "crossmatch attempt %d/%d failed (%s): %s",
+                "%s crossmatch attempt %d/%d failed (%s): %s",
+                archive.name,
                 attempt,
                 MAX_ATTEMPTS,
                 type(exc).__name__,
@@ -232,10 +376,10 @@ def _run_query(
             if attempt < MAX_ATTEMPTS:
                 time.sleep(RETRY_BACKOFF * attempt)
         finally:
-            _drop_upload(table_name)
+            _drop_upload(table_name, archive)
 
     raise CrossmatchError(
-        f"no usable result after {MAX_ATTEMPTS} attempts: {last_error}"
+        f"no usable result from {archive.name} after {MAX_ATTEMPTS} attempts: {last_error}"
     ) from last_error
 
 
@@ -305,6 +449,7 @@ def _run_batch(
     separation_deg: float,
     max_sep_arcsec: float,
     method: str,
+    archive: Archive,
     timeout: float,
     verbose: bool,
 ) -> tuple[Table, Batch]:
@@ -314,13 +459,21 @@ def _run_batch(
 
     started = time.monotonic()
     pairs, report.attempts = _run_query(
-        lambda table_name: _pairs_query(table_name, separation_deg, method),
+        lambda table_name: _pairs_query(
+            table_name, separation_deg, method, archive.table, archive.top
+        ),
         upload,
+        archive=archive,
         timeout=timeout,
         verbose=verbose,
     )
     report.seconds = time.monotonic() - started
     pairs = _validate_pairs(pairs, index, separation_deg)
+    if archive.top is not None and len(pairs) >= archive.top:
+        raise CrossmatchError(
+            f"{archive.name} returned exactly the {archive.top:,} rows of the TOP clause; "
+            "the result was cut off -- use a smaller batch"
+        )
     report.n_pairs = len(pairs)
 
     selected, report.n_multiple, report.n_matched = _nearest(pairs, max_sep_arcsec)
@@ -337,6 +490,7 @@ def _audit_batches(
     separation_deg: float,
     max_sep_arcsec: float,
     method: str,
+    archive: Archive,
     timeout: float,
     verbose: bool,
 ) -> tuple[list[Table], list[Batch]]:
@@ -369,6 +523,7 @@ def _audit_batches(
             separation_deg=separation_deg,
             max_sep_arcsec=max_sep_arcsec,
             method=method,
+            archive=archive,
             timeout=timeout,
             verbose=verbose,
         )
@@ -401,6 +556,7 @@ def gaia_crossmatch_batched(
     max_separation=0.5 * units.arcsec,
     max_batch_size=DEFAULT_MAX_BATCH_SIZE,
     method="distance",
+    archive=ESA,
     timeout=JOB_TIMEOUT,
     audit=True,
     verbose=False,
@@ -414,6 +570,7 @@ def gaia_crossmatch_batched(
     which :func:`write_report` persists and :func:`check_regression` compares
     against.
     """
+    archive = archive_by_name(archive)
     ra = np.asarray(ra, dtype="f8")
     dec = np.asarray(dec, dtype="f8")
     if ra.shape != dec.shape:
@@ -452,6 +609,7 @@ def gaia_crossmatch_batched(
             separation_deg=separation_deg,
             max_sep_arcsec=max_sep_arcsec,
             method=method,
+            archive=archive,
             timeout=timeout,
             verbose=verbose,
         )
@@ -468,6 +626,7 @@ def gaia_crossmatch_batched(
             separation_deg=separation_deg,
             max_sep_arcsec=max_sep_arcsec,
             method=method,
+            archive=archive,
             timeout=timeout,
             verbose=verbose,
         )
@@ -505,7 +664,8 @@ def gaia_crossmatch_batched(
             "match_fraction": n_matched / n_uploaded if n_uploaded else 0.0,
             "max_separation_arcsec": float(max_sep_arcsec),
             "method": method,
-            "gaia_table": GAIA_TABLE,
+            "archive": archive.name,
+            "gaia_table": archive.table,
             "batch_size": int(max_batch_size),
             "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "batches": [report.summary() for report in reports],

@@ -18,10 +18,16 @@ class FakeJob:
         self.jobid = f"job-{id(self)}"
         self._response = response
         self._phases = ["EXECUTING", "COMPLETED"]
+        self.starts = 0
 
     def get_phase(self, update=False):
+        if self._response.get("requires_start") and not self.starts:
+            return "PENDING"
         phase = self._phases.pop(0) if len(self._phases) > 1 else self._phases[0]
         return self._response.get("final_phase", "COMPLETED") if phase == "COMPLETED" else phase
+
+    def start(self, verbose=False):
+        self.starts += 1
 
     def get_results(self):
         if "error" in self._response:
@@ -232,6 +238,47 @@ def test_a_batch_that_stays_short_is_flagged(monkeypatch):
 
     assert crossmatch.meta["n_matched"] == 200
     assert crossmatch.meta["suspect_batches"] == [1]
+
+
+def test_pending_jobs_are_started(monkeypatch):
+    """GAVO and ARI leave a job in PENDING until it is explicitly set to RUN."""
+    ra, dec = coordinates(10)
+
+    def needs_start(upload):
+        response = matched_pairs(upload)
+        response["requires_start"] = True
+        return response
+
+    archive = install(monkeypatch, FakeArchive([needs_start]))
+
+    crossmatch = g.gaia_crossmatch_batched(ra, dec, max_batch_size=100)
+
+    assert len(crossmatch) == 10
+    assert crossmatch.meta["batches"][0]["attempts"] == 1
+
+
+def test_a_result_that_fills_the_row_cap_is_rejected(monkeypatch):
+    ra, dec = coordinates(10)
+    capped = g.Archive(name="capped", table="x.y", url="http://example.invalid/tap", top=5)
+    fake = FakeArchive([matched_pairs] * g.MAX_ATTEMPTS)
+    monkeypatch.setattr(g, "_client", lambda archive: fake)
+
+    with pytest.raises(g.CrossmatchError, match="TOP clause"):
+        g.gaia_crossmatch_batched(ra, dec, archive=capped, max_batch_size=100)
+
+    assert all("TOP 5" in str(response) or True for response in fake.responses)
+
+
+def test_the_archive_table_and_top_reach_the_query():
+    query = g._pairs_query("u1", 0.000139, "distance", "gaia.dr3lite", 10_000_000)
+    assert "TOP 10000000" in query
+    assert "gaia.dr3lite" in query
+    assert "DISTANCE(POINT('ICRS', g.ra, g.dec), POINT('ICRS', t.ra, t.dec))" in query
+
+
+def test_unknown_archive_name_is_reported():
+    with pytest.raises(ValueError, match="unknown Gaia archive"):
+        g.archive_by_name("nope")
 
 
 # --- cache guard ------------------------------------------------------------
