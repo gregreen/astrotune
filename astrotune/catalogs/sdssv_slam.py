@@ -14,7 +14,8 @@ the previous version came from the password-protected ``data.sdss5.org`` DR19
 area (ASTRA 0.6.0).
 
 The SLAM Teff uncertainties are systematically too large, so they are scaled
-by :data:`TEFF_ERR_SCALE` before the error floors are added.
+by :data:`UNC_SCALES` before the error floors are added. Because that quoted
+error is not trusted, :data:`TEFF_ERR_MAX` is deliberately loose.
 """
 
 from __future__ import annotations
@@ -48,11 +49,17 @@ X_ERR = (0.2, 0.2, 0.2, 0.4)
 PARITY_SKIP = "reads DR20 (astra 0.8.1); the legacy table reproduces DR19 (0.6.0)"
 
 #: Per-parameter multiplier applied to the statistical uncertainties.
-UNC_SCALES = (0.2, 1.0, 1.0, 1.0)
+UNC_SCALES = (0.05, 1.0, 1.0, 1.0)
 
 TEFF_RANGE = (3150.0, 3750.0)
 FEH_RANGE = (-0.6, 0.3)
 ALPHA_RANGE = (-0.2, 0.2)
+
+#: Upper limit on the quoted Teff uncertainty, in K. SLAM's Teff errors are
+#: over-estimated by a large factor (see :data:`UNC_SCALES`) and the delta model
+#: recalibrates them anyway, so this cut is only a guard against nonsense values
+#: and is deliberately loose: 6000 K, ten times the original 600 K.
+TEFF_ERR_MAX = 6000.0
 
 
 def download(ctx) -> None:
@@ -80,7 +87,7 @@ def cuts(t: Table, ctx) -> dict:
 
     return {
         "Teff in range": (teff > TEFF_RANGE[0]) & (teff < TEFF_RANGE[1]),
-        "Teff error < 600 K": unmask(t["e_teff"]) < 600.0,
+        f"Teff error < {TEFF_ERR_MAX:.0f} K": unmask(t["e_teff"]) < TEFF_ERR_MAX,
         "[Fe/H] in range": (fe_h > FEH_RANGE[0]) & (fe_h < FEH_RANGE[1]),
         "[alpha/Fe] in range": (alpha_fe > ALPHA_RANGE[0]) & (alpha_fe < ALPHA_RANGE[1]),
         "SNR > 15": unmask(t["snr"]) > 15.0,
