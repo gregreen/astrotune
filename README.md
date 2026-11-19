@@ -192,7 +192,11 @@ Draws the catalogs as circles (radius ~ log rows, color = family of spectra, str
 by edges (width and opacity ~ log shared stars; pairs with at least `--min-shared`
 shared stars, plus every catalog's `--top-k` strongest links), plus a matrix of every pair, to
 `diagnostic_plots/catalog_graph/` (PNG and PDF; the counts are in
-`catalog_overlaps.json`). No trained model is needed.
+`catalog_overlaps.json`). The PageRank of the whole network (every pair sharing at least one
+star, edge weight = shared stars) is written to `catalog_pagerank.ecsv`: one row per catalog,
+named by its key and ordered by its score in the full network, with its score and rank for
+all catalogs, for the catalogs that measure [alpha/Fe] and for those that measure logg
+(blank where a subset excludes a catalog). No trained model is needed.
 
 ### Learned extra uncertainties (post hoc; experimental)
 

@@ -45,6 +45,28 @@ def test_every_registered_catalog_has_a_family():
     assert all(cg.family_of(k) != "other" for k in registry.keys())
 
 
+def test_pagerank_table_ranks_by_score_and_masks_missing_parameters():
+    # a triangle with unequal weights, plus an isolated catalog
+    S = np.array([[0, 100, 10, 0], [100, 0, 50, 0], [10, 50, 0, 0], [0, 0, 0, 0]])
+    data = dict(
+        keys=["a", "b", "c", "d"], labels=["A", "B", "C", "D"], rows=[1, 1, 1, 1],
+        unique=[1, 1, 1, 1], shared=S.tolist(),
+        n_measured=[[1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 0], [1, 1, 0, 1]],  # c: no alpha, d: no logg
+    )
+    ranks = cg.compute_pagerank(data)
+    assert ranks["alpha"]["keys"] == ["a", "b", "d"] and ranks["alpha"]["n_edges"] == 1
+    assert ranks["logg"]["keys"] == ["a", "b", "c"]
+
+    t = cg.pagerank_table(data)
+    scores = np.asarray(t["pagerank_all"])
+    assert np.all(np.diff(scores) <= 0) and np.isclose(scores.sum(), 1.0)
+    assert t["rank_all"].tolist() == [1, 2, 3, 4]
+    row = {k: i for i, k in enumerate(t["catalog"])}
+    assert t["pagerank_alpha"].mask[row["c"]] and t["rank_alpha"].mask[row["c"]]
+    assert t["pagerank_logg"].mask[row["d"]] and t["rank_logg"].mask[row["d"]]
+    assert not t["pagerank_alpha"].mask[row["d"]]
+
+
 def test_circle_layout_puts_strongly_linked_nodes_next_to_each_other():
     n = 8
     S = np.zeros((n, n), dtype="i8")
