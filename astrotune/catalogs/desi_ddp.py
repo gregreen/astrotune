@@ -73,6 +73,13 @@ def load(ctx) -> Table:
 
 
 def prepare_columns(t: Table, ctx) -> Table:
+    # The notebook's cache carried the coordinates as ``ra``/``dec``; our own
+    # crossmatch keeps the release's names (RAdeg/DEdeg), and EXTRA_COLS asks for
+    # the former, so provide them here rather than depending on the cache.
+    if "ra" not in t.colnames:
+        t["ra"] = t["RAdeg"]
+        t["dec"] = t["DEdeg"]
+
     alpha_fe, alpha_fe_err, abundances = calc_alpha_Fe_from_abundances(
         t, "[{x}/Fe]", "e_[{x}/Fe]"
     )

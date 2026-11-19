@@ -6,7 +6,7 @@ from the upload, or return a table that is empty or about a different batch.
 
 import numpy as np
 import pytest
-from astropy.table import Table
+from astropy.table import Table, vstack as astropy_table_vstack
 import astropy.units as units
 
 from astrotune.prep import gaia as g
@@ -257,16 +257,34 @@ def test_pending_jobs_are_started(monkeypatch):
     assert crossmatch.meta["batches"][0]["attempts"] == 1
 
 
-def test_a_result_that_fills_the_row_cap_is_rejected(monkeypatch):
+def test_a_capped_batch_is_split_instead_of_truncated(monkeypatch):
+    """A result that fills the row limit is not a result: GAVO answers with 20,001."""
     ra, dec = coordinates(10)
-    capped = g.Archive(name="capped", table="x.y", url="http://example.invalid/tap", top=5)
-    fake = FakeArchive([matched_pairs] * g.MAX_ATTEMPTS)
+    capped = g.Archive(name="capped", table="x.y", url="http://example.invalid/tap", top=5, maxrec=5)
+    fake = FakeArchive([matched_pairs] * 30)  # one pair per uploaded row
     monkeypatch.setattr(g, "_client", lambda archive: fake)
 
-    with pytest.raises(g.CrossmatchError, match="TOP clause"):
-        g.gaia_crossmatch_batched(ra, dec, archive=capped, max_batch_size=100)
+    crossmatch = g.gaia_crossmatch_batched(ra, dec, archive=capped, max_batch_size=100)
 
-    assert all("TOP 5" in str(response) or True for response in fake.responses)
+    assert crossmatch.meta["n_matched"] == 10  # nothing lost
+    assert len(fake.calls) == 7  # 10 -> 5+5 -> (2,3)+(2,3)
+    assert crossmatch.meta["batches"][0]["n_matched"] == 10
+
+
+def test_a_capped_single_row_raises(monkeypatch):
+    ra, dec = coordinates(1)
+
+    def too_many(upload):
+        pairs = matched_pairs(upload)
+        pairs["table"] = astropy_table_vstack([pairs["table"]] * 5)
+        return pairs
+
+    capped = g.Archive(name="capped", table="x.y", url="http://example.invalid/tap", top=5, maxrec=5)
+    fake = FakeArchive([too_many] * 30)
+    monkeypatch.setattr(g, "_client", lambda archive: fake)
+
+    with pytest.raises(g.CrossmatchError, match="cut off"):
+        g.gaia_crossmatch_batched(ra, dec, archive=capped, max_batch_size=100)
 
 
 def test_the_archive_table_and_top_reach_the_query():

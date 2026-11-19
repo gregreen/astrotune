@@ -89,6 +89,8 @@ RETRY_BACKOFF = 5.0
 
 #: A batch matching less than this fraction of the median batch rate is re-run.
 SUSPICIOUS_FRACTION = 0.5
+#: How often a batch that hits the service's row limit is halved before giving up.
+MAX_SPLIT_DEPTH = 8
 #: Relative drop in the number of matches that aborts a cached-crossmatch rebuild.
 REGRESSION_TOLERANCE = 0.01
 #: Below this match fraction the result is suspicious, whatever the batches say.
@@ -132,6 +134,11 @@ class Archive:
     #: no TOP. Set this to emit an explicit TOP and to treat a result that fills
     #: it as suspicious instead of trusting it.
     top: Optional[int] = None
+    #: TAP ``MAXREC`` to request. GAVO answers at most 20,000 rows by default
+    #: whatever the ADQL TOP says -- an upload join over a full batch comes back
+    #: with exactly 20,001 pairs, which looks like a result and is not -- so the
+    #: parameter has to be raised explicitly.
+    maxrec: Optional[int] = None
     #: Run the query synchronously. The ARI mirror leaves asynchronous jobs
     #: queued for many minutes (or forever), while its synchronous endpoint
     #: answers the same join in a fraction of a second.
@@ -152,6 +159,7 @@ GAVO = Archive(
     table="gaia.dr3lite",
     url="https://dc.g-vo.org/tap",
     top=10_000_000,
+    maxrec=10_000_000,
     note="gaia.dr3lite: no astrometry beyond ra/dec, no astrophysical parameters",
 )
 
@@ -162,6 +170,7 @@ ARI = Archive(
     table=GAIA_TABLE,
     url="https://gaia.ari.uni-heidelberg.de/tap",
     top=10_000_000,
+    maxrec=10_000_000,
     sync=True,
     note="Heidelberg ARI mirror, full gaia_source",
 )
@@ -172,6 +181,7 @@ ARI_LITE = Archive(
     table="gaiadr3.gaia_source_lite",
     url="https://gaia.ari.uni-heidelberg.de/tap",
     top=10_000_000,
+    maxrec=10_000_000,
     sync=True,
     note="Heidelberg ARI mirror, gaia_source_lite",
 )
@@ -350,6 +360,11 @@ def _run_query(
     for attempt in range(1, MAX_ATTEMPTS + 1):
         table_name = f"crossmatch_{uuid.uuid4().hex[:12]}"
         try:
+            limit = {}
+            if archive.url is not None and archive.maxrec is not None:
+                # astroquery's Gaia class does not pass MAXREC through, the
+                # plain TAP client does.
+                limit["maxrec"] = archive.maxrec
             if archive.sync:
                 job = client.launch_job(
                     build_query(table_name),
@@ -357,6 +372,7 @@ def _run_query(
                     upload_resource=upload,
                     upload_table_name=table_name,
                     output_format=archive.output_format,
+                    **limit,
                 )
             else:
                 job = client.launch_job_async(
@@ -366,6 +382,7 @@ def _run_query(
                     upload_resource=upload,
                     upload_table_name=table_name,
                     output_format=archive.output_format,
+                    **limit,
                 )
                 phase = _wait_for_job(job, timeout=timeout, verbose=verbose)
                 if phase != "COMPLETED":
@@ -465,8 +482,16 @@ def _run_batch(
     archive: Archive,
     timeout: float,
     verbose: bool,
+    depth: int = 0,
 ) -> tuple[Table, Batch]:
-    """Crossmatch one batch and return its selected pairs plus the accounting."""
+    """Crossmatch one batch and return its selected pairs plus the accounting.
+
+    A result that fills the service's row limit is not a result: GAVO answers an
+    upload join with exactly 20,001 pairs when its default MAXREC of 20,000 is
+    reached, which looks like a successful batch and silently drops two thirds
+    of the matches. Such a batch is split in half and each half run separately,
+    down to :data:`MAX_SPLIT_DEPTH` levels.
+    """
     report = Batch(number=number, offset=offset, n_uploaded=len(index))
     upload = Table({"ra": ra, "dec": dec, "index": index})
 
@@ -482,13 +507,66 @@ def _run_batch(
     )
     report.seconds = time.monotonic() - started
     pairs = _validate_pairs(pairs, index, separation_deg)
-    if archive.top is not None and len(pairs) >= archive.top:
-        raise CrossmatchError(
-            f"{archive.name} returned exactly the {archive.top:,} rows of the TOP clause; "
-            "the result was cut off -- use a smaller batch"
-        )
-    report.n_pairs = len(pairs)
 
+    limit = archive.maxrec if archive.maxrec is not None else archive.top
+    if limit is not None and len(pairs) >= limit:
+        if depth >= MAX_SPLIT_DEPTH or len(index) < 2:
+            raise CrossmatchError(
+                f"{archive.name} returned {len(pairs):,} pairs, which fills its row "
+                f"limit of {limit:,}; the result is cut off even after "
+                f"{depth} split(s)"
+            )
+        middle = len(index) // 2
+        log.warning(
+            "%s batch %d returned %s pairs (the %s row limit): splitting it in two",
+            archive.name,
+            number,
+            f"{len(pairs):,}",
+            f"{limit:,}",
+        )
+        left, left_report = _run_batch(
+            ra[:middle],
+            dec[:middle],
+            index[:middle],
+            number=number,
+            offset=offset,
+            separation_deg=separation_deg,
+            max_sep_arcsec=max_sep_arcsec,
+            method=method,
+            archive=archive,
+            timeout=timeout,
+            verbose=verbose,
+            depth=depth + 1,
+        )
+        right, right_report = _run_batch(
+            ra[middle:],
+            dec[middle:],
+            index[middle:],
+            number=number,
+            offset=offset,
+            separation_deg=separation_deg,
+            max_sep_arcsec=max_sep_arcsec,
+            method=method,
+            archive=archive,
+            timeout=timeout,
+            verbose=verbose,
+            depth=depth + 1,
+        )
+        merged = Batch(
+            number=number,
+            offset=offset,
+            n_uploaded=len(index),
+            n_pairs=left_report.n_pairs + right_report.n_pairs,
+            n_matched=left_report.n_matched + right_report.n_matched,
+            n_multiple=left_report.n_multiple + right_report.n_multiple,
+            attempts=max(left_report.attempts, right_report.attempts),
+            seconds=left_report.seconds + right_report.seconds,
+            rerun=left_report.rerun or right_report.rerun,
+            suspect=left_report.suspect or right_report.suspect,
+        )
+        return astropy.table.vstack([left, right]), merged
+
+    report.n_pairs = len(pairs)
     selected, report.n_multiple, report.n_matched = _nearest(pairs, max_sep_arcsec)
     return selected, report
 
