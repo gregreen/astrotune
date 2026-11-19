@@ -86,6 +86,7 @@ def load(ctx) -> Table:
         dec_col="DEC",
         cache_path=ctx.interim_dir / CACHE_FILE,
         max_separation=MAX_SEPARATION,
+        archive=ctx.gaia_archive,
         force=ctx.force,
         allow_regression=ctx.allow_crossmatch_regression,
         key=KEY,

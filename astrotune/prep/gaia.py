@@ -69,6 +69,16 @@ GAIA_TABLE = "gaiadr3.gaia_source"
 #: 197 thousand matches.
 DEFAULT_MAX_BATCH_SIZE = 1024 * 64
 
+#: Radius the archive is actually searched with. The TAP query is the expensive
+#: part -- minutes per batch, and it needs a working archive -- while narrowing
+#: the match afterwards costs a numpy comparison. So the search is run once,
+#: wide, and the result is cached together with ``angsep_arcsec``; every catalog
+#: then applies its own, narrower limit when it reads the cache. Raising a
+#: catalog's limit up to this radius therefore needs no new query at all, which
+#: is why it is wider than any catalog currently asks for (the widest is 1.0
+#: arcsec).
+DEFAULT_SEARCH_SEPARATION = 1.5 * units.arcsec
+
 #: A batch may stay queued or executing for this long before the job is aborted.
 JOB_TIMEOUT = 2700.0
 POLL_INTERVAL = 2.0
@@ -165,7 +175,8 @@ ARI_LITE = Archive(
 )
 
 ARCHIVES = {archive.name: archive for archive in (ESA, GAVO, ARI, ARI_LITE)}
-ARCHIVES["gaia"] = ESA  # alias: the module is named after the official archive
+#: Accepted spellings, so ``--gaia-archive gaia`` works as people expect.
+ALIASES = {"gaia": "esa"}
 _clients: dict = {}
 
 
@@ -174,7 +185,7 @@ def archive_by_name(name) -> Archive:
     if isinstance(name, Archive):
         return name
     try:
-        return ARCHIVES[name]
+        return ARCHIVES[ALIASES.get(name, name)]
     except KeyError:
         raise ValueError(
             f"unknown Gaia archive {name!r}; known: {', '.join(sorted(ARCHIVES))}"
@@ -690,13 +701,18 @@ def gaia_crossmatch_batched(
 
 
 def apply_crossmatch(catalog: Table, crossmatch: Table, *, max_separation=None) -> Table:
-    """Subselect ``catalog`` to matched rows and attach the Gaia identifiers."""
+    """Subselect ``catalog`` to matched rows and attach the Gaia identifiers.
+
+    ``angsep_arcsec`` is carried over as well, so that the cached table can be
+    narrowed again later without going back to the archive.
+    """
     if max_separation is None:
         keep = np.ones(len(crossmatch), dtype=bool)
     else:
-        keep = np.asarray(crossmatch["angsep_arcsec"], dtype="f8") < max_separation.to(
-            "arcsec"
-        ).value
+        keep = (
+            np.asarray(crossmatch["angsep_arcsec"], dtype="f8")
+            < max_separation.to("arcsec").value
+        )
 
     n_orig = len(catalog)
     match_idx = np.asarray(crossmatch["match_idx"])[keep]
@@ -715,6 +731,7 @@ def apply_crossmatch(catalog: Table, crossmatch: Table, *, max_separation=None) 
     out["gdr3_source_id"] = np.asarray(crossmatch["gdr3_source_id"])[keep]
     out["ra_gdr3"] = np.asarray(crossmatch["ra"])[keep]
     out["dec_gdr3"] = np.asarray(crossmatch["dec"])[keep]
+    out["angsep_arcsec"] = np.asarray(crossmatch["angsep_arcsec"], dtype="f8")[keep]
 
     fraction = len(out) / n_orig if n_orig else 0.0
     if fraction < LOW_MATCH_FRACTION:
@@ -799,6 +816,32 @@ def check_regression(
     )
 
 
+def narrow(table: Table, max_separation=None, *, key: Optional[str] = None) -> Table:
+    """Cut a cached crossmatch down to ``max_separation``.
+
+    This is the cheap half of the two-level radius: the archive is asked for
+    everything within :data:`DEFAULT_SEARCH_SEPARATION` and cached, and each
+    catalog narrows that to its own limit here -- on a cache hit as well as
+    after a fresh query -- so changing the limit never costs a TAP query.
+    """
+    if max_separation is None or "angsep_arcsec" not in table.colnames:
+        return table
+    keep = np.asarray(table["angsep_arcsec"], dtype="f8") < max_separation.to(
+        "arcsec"
+    ).value
+    if keep.all():
+        return table
+    narrowed = table[keep]
+    log.info(
+        "[%s] %s of %s crossmatched rows are within %.2f arcsec",
+        key or "crossmatch",
+        f"{len(narrowed):,}",
+        f"{len(table):,}",
+        max_separation.to("arcsec").value,
+    )
+    return narrowed
+
+
 def crossmatch_catalog(
     make_catalog: Callable[[], Table],
     *,
@@ -811,31 +854,57 @@ def crossmatch_catalog(
     allow_regression: bool = False,
     key: Optional[str] = None,
     report_dir=None,
+    archive=ESA,
     postprocess: Optional[Callable[[Table], Table]] = None,
     verbose: bool = False,
     **write_kwargs,
 ) -> Table:
     """Crossmatch a catalog, guard the result, then cache it and report on it.
 
-    This is the entry point the catalog modules use. ``make_catalog`` is only
-    called when the cache is missing, so a cache hit stays cheap. The cache is
-    written *after* the comparison with the previous run, so a bad crossmatch
-    leaves the good one in place.
+    Two radii, deliberately: ``max_separation`` is what the catalog wants, while
+    the archive is searched with ``search_separation`` (by default
+    :data:`DEFAULT_SEARCH_SEPARATION`, which is wider than any catalog needs)
+    and the cache keeps everything found that way, along with the separations.
+    The catalog's own limit is then applied on every load, cached or not, so a
+    wider match radius later is a one-line change with no TAP query.
+
+    ``make_catalog`` is only called when the cache is missing, so a cache hit
+    stays cheap. The cache is written *after* the comparison with the previous
+    run, so a bad crossmatch leaves the good one in place.
     """
     cache_path = Path(cache_path) if cache_path is not None else None
     if cache_path is not None and cache_path.exists() and not force:
         log.info("using cached crossmatch %s", cache_path)
-        return Table.read(cache_path)
+        cached = Table.read(cache_path)
+        if "angsep_arcsec" not in cached.colnames and max_separation is not None:
+            log.warning(
+                "[%s] %s predates the wide search radius: it was cut when it was "
+                "written, so its %.2f arcsec limit cannot be changed without "
+                "--force",
+                key or "crossmatch",
+                cache_path.name,
+                max_separation.to("arcsec").value,
+            )
+        return narrow(cached, max_separation, key=key)
+
+    search = search_separation if search_separation is not None else DEFAULT_SEARCH_SEPARATION
+    if max_separation is not None and max_separation > search:
+        raise ValueError(
+            f"the catalog wants {max_separation.to('arcsec').value:.2f} arcsec but the "
+            f"archive is only searched to {search.to('arcsec').value:.2f}; raise "
+            "search_separation or lower max_separation"
+        )
 
     catalog = make_catalog()
-    search = search_separation if search_separation is not None else max_separation
     crossmatch = gaia_crossmatch_batched(
         catalog[ra_col],
         catalog[dec_col],
-        max_separation=search if search is not None else 0.5 * units.arcsec,
+        max_separation=search,
+        archive=archive,
         verbose=verbose,
     )
-    matched = apply_crossmatch(catalog, crossmatch, max_separation=max_separation)
+    # Cache the wide selection, not the narrow one.
+    matched = apply_crossmatch(catalog, crossmatch, max_separation=search)
     if postprocess is not None:
         matched = postprocess(matched)
 
@@ -852,7 +921,7 @@ def crossmatch_catalog(
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         matched.write(cache_path, overwrite=True, **write_kwargs)
         log.info("wrote %s (%s rows)", cache_path, f"{len(matched):,}")
-    return matched
+    return narrow(matched, max_separation, key=key)
 
 
 def cached_crossmatch(

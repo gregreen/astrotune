@@ -8,6 +8,7 @@ import sys
 from typing import Optional, Sequence
 
 from . import registry
+from .prep.gaia import ARCHIVES
 from .prep.pipeline import prepare
 
 log = logging.getLogger(__name__)
@@ -50,6 +51,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "accept a rebuilt Gaia crossmatch that matches fewer stars than the "
             "previous one (normally treated as an incomplete result from the archive)"
+        ),
+    )
+    parser.add_argument(
+        "--gaia-archive",
+        choices=sorted(ARCHIVES),
+        default="esa",
+        help=(
+            "TAP service to crossmatch against: esa (official), gavo, ari, ari-lite "
+            "(see astrotune.prep.gaia.ARCHIVES)"
         ),
     )
     parser.add_argument(
@@ -107,6 +117,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 force=args.force,
                 save=not args.no_save,
                 allow_crossmatch_regression=args.allow_crossmatch_regression,
+                gaia_archive=args.gaia_archive,
             )
         except Exception as exc:  # noqa: BLE001 - report and continue
             log.exception("[%s] failed", key)

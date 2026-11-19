@@ -44,7 +44,6 @@ CROSSMATCH_FILE = "crossmatched.h5"
 JOIN_KEY = "rave_obs_id"
 
 #: Wide search radius, then a tighter cut on the nearest neighbor.
-SEARCH_SEPARATION = 1.0 * units.arcsec
 MAX_SEPARATION = 0.3 * units.arcsec
 
 ID_COL = "gdr3_source_id"
@@ -85,8 +84,8 @@ def load(ctx) -> Table:
         ra_col="ra",
         dec_col="dec",
         cache_path=ctx.interim_dir / CROSSMATCH_FILE,
-        search_separation=SEARCH_SEPARATION,
         max_separation=MAX_SEPARATION,
+        archive=ctx.gaia_archive,
         force=ctx.force,
         allow_regression=ctx.allow_crossmatch_regression,
         key=KEY,

@@ -32,6 +32,8 @@ class Context:
     #: Accept a crossmatch that matches fewer stars than the previous one instead
     #: of treating it as an incomplete result from the archive.
     allow_crossmatch_regression: bool = False
+    #: Which TAP service serves the Gaia DR3 table (see ``prep.gaia.ARCHIVES``).
+    gaia_archive: str = "esa"
     extra: dict = field(default_factory=dict)
 
     @property
@@ -45,6 +47,7 @@ def make_context(
     make_plots: bool = True,
     force: bool = False,
     allow_crossmatch_regression: bool = False,
+    gaia_archive: str = "esa",
 ) -> Context:
     spec = registry.get_spec(key)
     return Context(
@@ -57,6 +60,7 @@ def make_context(
         make_plots=make_plots,
         force=force,
         allow_crossmatch_regression=allow_crossmatch_regression,
+        gaia_archive=gaia_archive,
     )
 
 
@@ -114,6 +118,7 @@ def prepare(
     force: bool = False,
     save: bool = True,
     allow_crossmatch_regression: bool = False,
+    gaia_archive: str = "esa",
 ) -> Table:
     """Run the full preparation chain for one catalog.
 
@@ -125,6 +130,7 @@ def prepare(
         make_plots=make_plots,
         force=force,
         allow_crossmatch_regression=allow_crossmatch_regression,
+        gaia_archive=gaia_archive,
     )
     module = registry.get_module(key)
     t0 = time.monotonic()

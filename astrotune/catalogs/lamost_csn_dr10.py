@@ -31,7 +31,6 @@ FILENAME = "DR10_Cycle-SN_M_dwarfs.csv"
 SOURCES = (f"https://zenodo.org/records/14030249/files/{FILENAME}?download=1",)
 
 CROSSMATCH_FILE = "crossmatched.h5"
-SEARCH_SEPARATION = 1.0 * units.arcsec
 MAX_SEPARATION = 0.5 * units.arcsec
 
 ID_COL = "gdr3_source_id"
@@ -57,8 +56,8 @@ def load(ctx) -> Table:
         ra_col="RA",
         dec_col="Dec",
         cache_path=ctx.interim_dir / CROSSMATCH_FILE,
-        search_separation=SEARCH_SEPARATION,
         max_separation=MAX_SEPARATION,
+        archive=ctx.gaia_archive,
         force=ctx.force,
         allow_regression=ctx.allow_crossmatch_regression,
         key=KEY,

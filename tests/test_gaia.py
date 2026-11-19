@@ -349,6 +349,71 @@ def test_crossmatch_catalog_keeps_the_old_cache_when_the_result_shrinks(monkeypa
     assert g.read_report(tmp_path)["n_matched"] == 5
 
 
+def test_a_wider_match_radius_needs_no_new_query(monkeypatch, tmp_path):
+    """The archive is searched once, wide; the catalog limit is applied afterwards."""
+    catalog = Table({"RAdeg": np.linspace(10, 20, 4), "DEdeg": np.linspace(-5, 5, 4)})
+    cache = tmp_path / "crossmatched.fits"
+
+    def pairs_at(upload, separations):
+        idx = np.asarray(upload["index"])
+        return {
+            "table": Table(
+                {
+                    "index": idx,
+                    "source_id": idx + 100,
+                    "ra": np.zeros(len(idx)),
+                    "dec": np.zeros(len(idx)),
+                    "angsep_arcsec": np.asarray(separations, dtype="f8")[: len(idx)],
+                }
+            )
+        }
+
+    archive = install(
+        monkeypatch, FakeArchive([lambda upload: pairs_at(upload, [0.3, 0.4, 0.9, 1.2])])
+    )
+    narrow = g.crossmatch_catalog(
+        lambda: catalog,
+        ra_col="RAdeg",
+        dec_col="DEdeg",
+        cache_path=cache,
+        search_separation=1.5 * units.arcsec,
+        max_separation=0.5 * units.arcsec,
+        key="demo",
+    )
+    assert len(narrow) == 2  # only the 0.3 and 0.4 arcsec matches
+    assert "angsep_arcsec" in Table.read(cache).colnames
+    assert len(Table.read(cache)) == 4  # every pair inside the 1.5 arcsec search
+    assert len(archive.calls) == 1
+
+    # widen the catalog's limit: the cache answers, the archive is not touched
+    wider = g.crossmatch_catalog(
+        lambda: (_ for _ in ()).throw(AssertionError("no new query")),
+        ra_col="RAdeg",
+        dec_col="DEdeg",
+        cache_path=cache,
+        search_separation=1.5 * units.arcsec,
+        max_separation=1.0 * units.arcsec,
+        key="demo",
+    )
+    assert len(wider) == 3
+    assert len(archive.calls) == 1
+
+
+def test_a_limit_wider_than_the_search_is_refused(monkeypatch, tmp_path):
+    catalog = Table({"RAdeg": [10.0], "DEdeg": [0.0]})
+    install(monkeypatch, FakeArchive([]))
+
+    with pytest.raises(ValueError, match="only searched to"):
+        g.crossmatch_catalog(
+            lambda: catalog,
+            ra_col="RAdeg",
+            dec_col="DEdeg",
+            cache_path=tmp_path / "c.fits",
+            search_separation=0.5 * units.arcsec,
+            max_separation=1.0 * units.arcsec,
+        )
+
+
 def test_crossmatch_catalog_does_not_touch_the_archive_on_a_cache_hit(monkeypatch, tmp_path):
     cache = tmp_path / "crossmatched.fits"
     Table({"gdr3_source_id": [1, 2], "x": [0.0, 1.0]}).write(cache)
