@@ -38,8 +38,11 @@ TABLE_FILE = "table2.dat"
 README_FILE = "readme.txt"
 CROSSMATCH_FILE = "crossmatched.fits"
 
-#: Maximum separation for the Gaia DR3 match.
-MAX_SEPARATION = 0.5 * units.arcsec
+#: Maximum separation for the Gaia DR3 match. The notebook used 1.0 arcsec for
+#: this catalog (``apply_crossmatch(..., max_separation=1.*units.arcsec)``), and
+#: with 0.5 a fifth of the sample disappears, so 1.0 is what the legacy table
+#: reproduces. It is also the widest match we trust at all.
+MAX_SEPARATION = 1.0 * units.arcsec
 
 ID_COL = "gdr3_source_id"
 PARAM_COLS = ("Teff", "FeH", "logg")

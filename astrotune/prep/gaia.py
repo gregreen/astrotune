@@ -74,10 +74,12 @@ DEFAULT_MAX_BATCH_SIZE = 1024 * 64
 #: the match afterwards costs a numpy comparison. So the search is run once,
 #: wide, and the result is cached together with ``angsep_arcsec``; every catalog
 #: then applies its own, narrower limit when it reads the cache. Raising a
-#: catalog's limit up to this radius therefore needs no new query at all, which
-#: is why it is wider than any catalog currently asks for (the widest is 1.0
-#: arcsec).
-DEFAULT_SEARCH_SEPARATION = 1.5 * units.arcsec
+#: catalog's limit up to this radius therefore needs no new query at all.
+#:
+#: One arcsecond is the ceiling: beyond it a positional match is not a match any
+#: more (the nearest Gaia source that far from a bright star is as likely to be
+#: an unrelated neighbour), so nothing here searches wider.
+DEFAULT_SEARCH_SEPARATION = 1.0 * units.arcsec
 
 #: A batch may stay queued or executing for this long before the job is aborted.
 JOB_TIMEOUT = 2700.0
@@ -794,7 +796,9 @@ def check_regression(
 
     A positional crossmatch does not shrink by itself: fewer matches mean the
     archive returned an incomplete result, and overwriting the cache would hide
-    that behind a smaller catalog.
+    that behind a smaller catalog. The comparison only means something between
+    runs that searched the same radius, so a deliberate change of
+    ``search_separation`` re-baselines instead of tripping the guard.
     """
     if not previous:
         return
@@ -802,6 +806,38 @@ def check_regression(
     after = crossmatch.meta.get("n_matched")
     if not isinstance(before, int) or not isinstance(after, int) or before <= 0:
         return
+
+    old_radius = previous.get("max_separation_arcsec")
+    new_radius = crossmatch.meta.get("max_separation_arcsec")
+    if (
+        isinstance(old_radius, (int, float))
+        and isinstance(new_radius, (int, float))
+        and abs(old_radius - new_radius) > 1e-6
+    ):
+        log.info(
+            "search radius changed from %.2f to %.2f arcsec: re-baselining the "
+            "crossmatch guard (%s -> %s stars matched)",
+            old_radius,
+            new_radius,
+            f"{before:,}",
+            f"{after:,}",
+        )
+        return
+
+    # Fewer matches are expected when the search radius itself was narrowed, so
+    # the guard only applies to runs that searched the same distance.
+    before_radius = previous.get("max_separation_arcsec")
+    after_radius = crossmatch.meta.get("max_separation_arcsec")
+    if before_radius != after_radius:
+        log.info(
+            "%s: search radius changed from %s to %s arcsec, so the new baseline "
+            "replaces the old one",
+            key or "crossmatch",
+            before_radius,
+            after_radius,
+        )
+        return
+
     if after >= before * (1.0 - tolerance):
         return
 
@@ -863,10 +899,10 @@ def crossmatch_catalog(
 
     Two radii, deliberately: ``max_separation`` is what the catalog wants, while
     the archive is searched with ``search_separation`` (by default
-    :data:`DEFAULT_SEARCH_SEPARATION`, which is wider than any catalog needs)
-    and the cache keeps everything found that way, along with the separations.
-    The catalog's own limit is then applied on every load, cached or not, so a
-    wider match radius later is a one-line change with no TAP query.
+    :data:`DEFAULT_SEARCH_SEPARATION`) and the cache keeps everything found that
+    way, along with the separations. The catalog's own limit is then applied on
+    every load, cached or not, so lowering a match radius -- or raising it again
+    towards the search radius -- never costs a TAP query.
 
     ``make_catalog`` is only called when the cache is missing, so a cache hit
     stays cheap. The cache is written *after* the comparison with the previous
