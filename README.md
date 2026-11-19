@@ -205,6 +205,23 @@ astrotune-delta-kiel --run-dir models/my_run       # where in the Kiel diagram d
 All write to `models/my_run/delta/`: `star_table.npz` is every observation of
 every star (grouped by star), and the fit is the latent-y likelihood with the
 star's value integrated out, so a star counts once however many catalogs saw it.
+The delta model corrects the catalog's **own** quoted sigma and pushes it through
+the bijector's Jacobian, `S = J diag(s^2 sigma_raw^2 + a^2) J^T`, so `s` and `a`
+are in the catalog's units and comparable across catalogs. Prepared tables
+therefore carry two uncertainties: `sigma_x` (quoted, rescaled, floored — what the
+bijector is trained on) and `sigma_x_raw` (quoted only — what the delta model
+learns from). Because the delta model's output does not depend on the bijector,
+its calibrated sigma can be fed back to train a new one:
+
+```
+astrotune-observations --sigma-source delta --delta-dir models/my_run
+astrotune-apply --run-dir models/my_run --sigma-source delta --delta-dir models/my_run
+```
+
+which is the iteration described in `porting_project.md` §9.10. Rebuild the star
+table (`astrotune-delta-train --rebuild`) after retraining the bijector: the
+stored Jacobian changes.
+
 Catalogs that run the same pipeline on the same spectra (APOGEE DR17 and SDSS-V
 ASPCAP) form a *group*: they share one correction and one systematic error, so a
 group of two is not counted as two independent measurements. `evaluation/shared.txt`

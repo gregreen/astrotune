@@ -186,8 +186,9 @@ def test_the_per_catalog_table_reports_the_four_numbers():
     assert set(body) == {"a", "b", "c"}
     for row in body.values():
         assert int(row[1].replace(",", "")) == 400  # entries of that catalog
-        assert float(row[2]) == pytest.approx(1.0, abs=0.02)  # sigma scale
-        assert float(row[3]) == pytest.approx(ADD_MIN_SIGMA, rel=0.02)
-        assert float(row[4]) == pytest.approx(8.0, abs=0.05)  # nu = 2 + softplus(6)
+        # four numbers per column: one per parameter, in PARAM_NAMES order
+        assert np.allclose([float(v) for v in row[2:6]], 1.0, atol=0.02)  # sigma scale
+        assert np.allclose([float(v) for v in row[6:10]], ADD_MIN_SIGMA, rtol=0.02)
+        assert float(row[10]) == pytest.approx(8.0, abs=0.05)  # nu = 2 + softplus(6)
         # ln det of (C + floor) is 4 ln(1 + floor^2 / C) above ln det C
-        assert 0.0 < float(row[5]) < 0.2
+        assert 0.0 < float(row[11]) < 0.2

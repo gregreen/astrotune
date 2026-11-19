@@ -469,18 +469,19 @@ def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) ->
     """One row per catalog: size, the two learned terms, the tail weight, and the effect.
 
     The rows are the *validation* entries of each catalog (the sample every other
-    number in ``evaluation/`` is measured on). ``median scale`` is the median of the
-    sigma scale ``exp(ln_scale / 2)`` over those entries and the parameters they
-    measure (1 = the quoted error is left alone), ``median add*`` the same for the
-    additive sigma *including the group's shared variance* (the floor is 0.003, so a
-    value above it is the systematic the catalog shares with the rest of its group),
-    ``nu`` the group's degrees of freedom, and ``median dln det*`` the median change in
-    the log determinant of the total entry covariance ``S + diag(tau^2)``,
-    ``ln det - ln det C_m`` over the measured submatrix -- how much volume the
-    correction adds or removes, and the one number that combines all three terms
-    (four parameters at scale 0.35 with nothing additive would be ``8 ln 0.35 =
-    -8.4``). The starred columns are the covariance the merge will use; the scale is
-    the part that is independent between the catalogs of a group.
+    number in ``evaluation/`` is measured on). ``median scale`` is, per parameter, the
+    median of the sigma scale ``exp(ln_scale / 2)`` over those entries that measure it
+    (1 = the quoted error is left alone); ``median add*`` is the same for the additive
+    sigma *including the group's shared variance* (the floor is 0.003, so a value above
+    it is the systematic the catalog shares with the rest of its group); ``nu`` is the
+    group's degrees of freedom; and ``median dln det*`` is the median change in the log
+    determinant of the total entry covariance ``S + diag(tau^2)``, ``ln det - ln det
+    C_m`` over the measured submatrix -- how much volume the correction adds or
+    removes, the one number that combines all three terms (four parameters at scale
+    0.35 with nothing additive would be ``8 ln 0.35 = -8.4``). The starred columns are
+    the covariance the merge will use; the scale is the part that is independent
+    between the catalogs of a group. Parameters a catalog does not measure print as
+    ``nan``.
     """
     from .covariance import entry_cov_np
     from .model import model_nu, model_shared, numpy_delta_fn
@@ -519,21 +520,31 @@ def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) ->
                 np.linalg.slogdet(new[rows][:, mask][:, :, mask])[1]
                 - np.linalg.slogdet(old[rows][:, mask][:, :, mask])[1])
 
-    lines = [f"{'catalog':24s}{'n':>9s}{'median scale':>14s}{'median add*':>13s}"
-             f"{'nu':>7s}{'median dln det*':>17s}",
-             "-" * 83]
+    lines = [f"{'catalog':24s}{'n':>9s}   median scale: "
+             + " ".join(f"{n:>7s}" for n in PARAM_NAMES)
+             + "    median add*: "
+             + " ".join(f"{n:>7s}" for n in PARAM_NAMES)
+             + f"{'nu':>7s}{'median dln det*':>17s}",
+             "-" * 111]
     for k, key in enumerate(keys):
         label = registry.get_spec(key).label if key in registry.keys() else key
         in_cat = stars["c"] == k
-        measured = in_cat[:, None] & stars["m"]
-        if not measured.any():
+        if not (in_cat[:, None] & stars["m"]).any():
             continue
-        sc = float(np.median(s_val[measured]))
-        ad = float(np.median(a_val[measured]))
+        # Per parameter: a catalog that measures three parameters has three numbers,
+        # and a parameter it does not measure is ``nan``.
+        sc, ad = [], []
+        for p in range(N_PARAMS):
+            sel = in_cat & stars["m"][:, p]
+            sc.append(float(np.median(s_val[sel, p])) if sel.any() else np.nan)
+            ad.append(float(np.median(a_val[sel, p])) if sel.any() else np.nan)
         de = dlndet[in_cat & np.isfinite(dlndet)]
         nu_k = "-" if nu is None else f"{nu[stars['g'][np.argmax(in_cat)]]:.1f}"
-        lines.append(f"{label[:24]:24s}{int(in_cat.sum()):9,d}{sc:14.2f}{ad:12.4f}"
-                     f"{nu_k:>7s}{np.median(de) if de.size else np.nan:16.2f}")
+        det = np.median(de) if de.size else np.nan
+        lines.append(f"{label[:24]:24s}{int(in_cat.sum()):9,d}   "
+                     + " ".join(f"{v:7.2f}" for v in sc) + "    "
+                     + " ".join(f"{v:7.4f}" for v in ad)
+                     + f"{nu_k:>7s}{det:17.2f}")
     if shared is not None and np.any(np.asarray(shared) > 0):
         # Name the groups whose additive column carries a systematic, so the starred
         # numbers are not mistaken for a per-catalog property.
