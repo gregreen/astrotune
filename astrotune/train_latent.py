@@ -8,11 +8,27 @@ vector ``y`` per star and fits
 
     L_data = mean over observations of rho( sum_p (x_p - f_c^-1(y)_p)^2 / sigma_p^2 ),
 
-with ``rho`` the softened chi^2 of the pair loss. Every observation of a star is
-compared with the *same* ``y``, so no catalog is regressed onto another and the
-inverse-variance weighting cannot shrink a map. A parameter that a catalog does
-not measure carries ``sigma = 1e9``, so it drops out of the chi^2 without a
-mask.
+with ``rho`` the deviation of a Student's t,
+
+    rho(chi2) = (nu_c + d) log(1 + chi2 / nu_c) ,
+
+for an observation of catalog ``c`` that measures ``d`` parameters, and with the
+softened chi^2 of the pair loss, ``S * arcsinh(chi2 / S)``, as the alternative
+``--data-term softened``. The t is the default because it is a likelihood rather
+than a robustifier: minus twice its log density is the data term, so the ``y``
+step and the map descend the same likelihood, and its tail index is the ``nu`` a
+delta model fits to the same measurements. ``nu -> inf`` recovers the Gaussian
+chi^2 the pipeline was built around, so the change is to the tail and not to the
+calibration. It costs no iteration -- the curvature weight
+``(nu + d) / (nu + chi2)`` is one line, and the derivation is in
+``notes/gauss_newton_with_students_t.tex``. ``nu`` is a per-catalog constant:
+``--nu`` sets it, and observations built from a delta model's calibrated sigmas
+carry the values that model fitted (:func:`resolve_nu`).
+
+Every observation of a star is compared with the *same* ``y``, so no catalog is
+regressed onto another and the inverse-variance weighting cannot shrink a map. A
+parameter that a catalog does not measure carries ``sigma = 1e9``, so it drops
+out of the chi^2 without a mask.
 
 ``y`` starts at the precision-weighted mean of the star's observations. Each step
 then fits it by solving the star's Gauss-Newton normal equations with the
@@ -99,6 +115,9 @@ log = logging.getLogger(__name__)
 #: ``sigma_x`` above this marks a parameter that the catalog does not measure
 MISSING = 1e6
 
+#: The data terms :class:`LatentTrainConfig.data_term` accepts
+DATA_TERMS = ("student_t", "softened")
+
 #: Penalty metrics drawn by the progress figure
 LATENT_PENALTIES = (
     ("penalty_obs", "penalty (obs)"),
@@ -111,6 +130,12 @@ LATENT_PENALTIES = (
 METRIC_KEYS = (
     "loss",
     "chi2",
+    # The mean raw chi^2 of an observation, i.e. the Mahalanobis residual
+    # squared. ``chi2`` above is the *data term* the loss averages, which since
+    # the Student's t is written as a distortion of chi^2 -- the two agree in the
+    # bulk and part company in the tail, so this is the one number that can be
+    # compared across the two loss definitions.
+    "chi2_raw",
     "penalty_obs",
     "penalty_ctrl",
     "penalty_div",
@@ -260,6 +285,41 @@ class LatentTrainConfig:
     pretrain_steps: int = 0
 
     # Observation loss
+    #: Which data term the loss averages over the observations: ``"student_t"``
+    #: (the default) or ``"softened"``.
+    #:
+    #: ``student_t`` gives each observation a multivariate Student's t with
+    #: ``nu_c`` degrees of freedom, scale ``diag(sigma^2)`` and ``d`` measured
+    #: dimensions, and keeps the ``y``-dependent part of ``-2 ln p``:
+    #:
+    #:     rho = (nu + d) ln(1 + chi2 / nu) .
+    #:
+    #: The exact deviance is half that; the factor two is deliberate, because
+    #: then ``nu -> inf`` gives ``rho -> chi2`` (the quantity the pair loss
+    #: averages), so the control-point penalties keep the strength they were
+    #: tuned with. Its curvature, ``(nu + d) / (nu + chi2)``, is what the
+    #: Gauss-Newton step weights by, which is the weight derived in
+    #: ``notes/gauss_newton_with_students_t.tex``.
+    #:
+    #: ``softened`` is the pair loss's ``S * arcsinh(chi2 / S)`` with
+    #: ``S = chi2_turnover``, kept so that runs made before the t existed can
+    #: still be reproduced and resumed.
+    data_term: str = "student_t"
+    #: Degrees of freedom, for every catalog that does not bring its own -- see
+    #: :func:`resolve_nu`. ``nu = chi2_turnover = 50`` is the starting point and
+    #: not a measured value: it makes the t agree with the softened chi^2 to
+    #: first order. Both are quadratic near zero, both grow like ``ln chi2`` far
+    #: out, and both have a curvature weight that falls as ``1/chi2``; they differ
+    #: only in the shape of the turnover, which is sharper for the t (0.5 against
+    #: 0.71 at ``chi2 = nu``). Lower it to make the fit more robust.
+    nu: float = 50.0
+    #: Read ``nu`` per catalog from the observations file when the file records
+    #: it, which ``astrotune-observations --sigma-source delta`` arranges: that
+    #: file's sigma come from a delta model, and the ``nu`` written with them is
+    #: the one the same delta model fitted to those sigmas. A file built from the
+    #: floored sigma has no such attribute and every catalog gets ``nu`` above.
+    nu_from_observations: bool = True
+    #: Turnover of the softened chi^2. Only used by ``data_term="softened"``.
     chi2_turnover: float = 50.0
     #: Whether the path length of the observations' inverse map enters the loss
     #: (the pair trainer's ``pair_path_in_loss``, off by default there too).
@@ -346,6 +406,53 @@ def initial_y(obs_dict) -> np.ndarray:
         num.append(np.bincount(star, weights=w[:, p] * x[:, p], minlength=n_stars))
         den.append(np.bincount(star, weights=w[:, p], minlength=n_stars))
     return (np.stack(num, axis=1) / np.maximum(np.stack(den, axis=1), 1e-30)).astype("f4")
+
+
+def resolve_nu(
+    attrs: Optional[dict], n_cat: int, cfg: LatentTrainConfig
+) -> np.ndarray:
+    """The degrees of freedom of every catalog, ``(n_cat,)``.
+
+    ``cfg.nu`` is the default for all of them. A file made with
+    ``astrotune-observations --sigma-source delta`` carries a ``nu`` attribute
+    instead -- the delta model's fitted per-group ``nu``, expanded to one value
+    per catalog -- and those are used, so that the tail and the scale of a
+    measurement come from the same fit. That is what "the delta model calibrated
+    these sigmas" has to mean: the shape of their error distribution is part of
+    the calibration, and a sigma that was inflated to survive outliers should
+    not then be read by a nearly Gaussian likelihood.
+
+    The attribute is a comma-separated list in ``catalogs`` order, both written
+    by :mod:`astrotune.training_data`. A file whose catalog list is not this
+    run's prefix is refused rather than silently mis-indexed by position: the
+    observations index their catalog by position, so a mismatch would attach one
+    catalog's tail to another's measurements.
+    """
+    nu = float(cfg.nu)
+    if not nu > 0:
+        raise ValueError(f"nu must be positive, not {cfg.nu!r}")
+    if not cfg.nu_from_observations or not attrs or "nu" not in attrs:
+        return np.full(n_cat, nu, dtype="f4")
+
+    values = attrs["nu"]
+    if isinstance(values, bytes):
+        values = values.decode()
+    try:
+        nus = np.array([float(v) for v in str(values).split(",")], dtype="f8")
+    except ValueError as exc:
+        raise ValueError(f"the observations' nu attribute is not a list of numbers: {values!r}") from exc
+
+    keys = str(attrs.get("catalogs", "")).split(",")
+    expected = list(registry.keys()[:n_cat])
+    if list(keys[:n_cat]) != expected or len(nus) < n_cat:
+        raise ValueError(
+            f"the observations file records nu for {len(nus)} catalogs ({keys[:n_cat]}) "
+            f"but this run uses {n_cat} ({expected}); rebuild the observations or "
+            "pass --no-nu-from-observations to use --nu for every catalog"
+        )
+    if np.any(nus[:n_cat] <= 0):
+        raise ValueError(f"the observations' nu must be positive, not {nus[:n_cat]}")
+    return nus[:n_cat].astype("f4")
 
 
 def held_out_stars(n_stars: int, val_frac: float, seed: int) -> np.ndarray:
@@ -503,14 +610,36 @@ def _make_ctrl_dataset(arrays, batch_size: int, seed: int, n_repeat: Optional[in
 class LatentTrainer:
     """Holds the bijector, the free harmonized parameters and the data pipelines."""
 
-    def __init__(self, obs_dict, ctrl_dict, cfg: LatentTrainConfig):
+    def __init__(
+        self, obs_dict, ctrl_dict, cfg: LatentTrainConfig, attrs: Optional[dict] = None
+    ):
         if cfg.y_solver not in ("gauss_newton", "gradient"):
             raise ValueError(
                 f"y_solver must be 'gauss_newton' or 'gradient', not {cfg.y_solver!r}"
             )
+        if cfg.data_term not in DATA_TERMS:
+            raise ValueError(
+                f"data_term must be one of {DATA_TERMS}, not {cfg.data_term!r}"
+            )
         self.cfg = cfg
         self.n_dim = obs_dict["x"].shape[1]
         self.n_cat = int(ctrl_dict["c_control"].max()) + 1
+
+        # The tail weight of every catalog, ``(n_cat,)``: from the observations
+        # file when a delta model calibrated its sigmas, else ``cfg.nu``.
+        nu_cat = resolve_nu(attrs, self.n_cat, cfg)
+        self.nu_cat = tf.constant(nu_cat, dtype=tf.float32)
+        if cfg.data_term == "student_t":
+            if np.allclose(nu_cat, nu_cat[0]):
+                log.info("Data term: Student's t, nu = %.4g for every catalog", nu_cat[0])
+            else:
+                log.info(
+                    "Data term: Student's t, nu per catalog: %s",
+                    ", ".join(
+                        f"{registry.get_spec(k).label} {v:.2f}"
+                        for k, v in zip(registry.keys()[: self.n_cat], nu_cat)
+                    ),
+                )
 
         tf.random.set_seed(cfg.seed)
 
@@ -784,24 +913,77 @@ class LatentTrainer:
     # an error in the maths here. None of these helpers has data-dependent Python
     # control flow, so autograph has nothing to do for them in the first place.
     @tf.autograph.experimental.do_not_convert
-    def _normal_equations(self, x, xs, x_pred, jac, chi2_obs, star):
+    def _loss_inputs(self, x, xs, x_pred, c):
+        """``(chi2, d, nu)`` of every observation of the batch.
+
+        ``chi2`` is the squared Mahalanobis residual ``sum_p (x - x_pred)^2 /
+        sigma^2``; an unmeasured parameter has ``sigma = 1e9`` and contributes
+        nothing. ``d`` is the number of parameters the catalog *does* measure,
+        which is the dimension of the Student's t: the marginal of a
+        multivariate t over the axes that are known exactly is a t of the same
+        ``nu`` and the remaining dimensions, so those axes leave both the
+        quadratic form and the exponent. ``nu`` is the catalog's degrees of
+        freedom.
+        """
+        chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
+        d_obs = tf.reduce_sum(tf.cast(xs < MISSING, tf.float32), axis=1)
+        return chi2_obs, d_obs, tf.gather(self.nu_cat, c)
+
+    @tf.autograph.experimental.do_not_convert
+    def _data_term(self, chi2_obs, d_obs, nu_obs):
+        """The per-observation data term the loss averages.
+
+        ``(nu + d) ln(1 + chi2 / nu)`` for the Student's t: twice the exact
+        deviance, chosen so that ``nu -> inf`` gives ``chi2`` itself and the
+        penalties keep their calibration. Its curvature at ``chi2 = nu`` is half
+        what it is at zero, against 0.71 for the softened form, so the t turns
+        over more sharply; far beyond it both grow like ``ln chi2``.
+
+        ``S * arcsinh(chi2 / S)`` for the softened chi^2, unchanged.
+        """
+        cfg = self.cfg
+        if cfg.data_term == "student_t":
+            return (nu_obs + d_obs) * tf.math.log1p(chi2_obs / nu_obs)
+        return cfg.chi2_turnover * arcsinh_of_exp(
+            tf.math.log(chi2_obs + 1e-30) - tf.math.log(cfg.chi2_turnover)
+        )
+
+    @tf.autograph.experimental.do_not_convert
+    def _data_weight(self, chi2_obs, d_obs, nu_obs):
+        """``d rho / d chi2``: the curvature the Gauss-Newton step weights by.
+
+        For the t that is ``(nu + d) / (nu + chi2)``, which is the weight derived
+        in ``notes/gauss_newton_with_students_t.tex``. Freezing it at the current
+        ``y`` within a step -- which is what this being a function of the batch's
+        already-computed ``chi2_obs`` means -- is what keeps the normal matrix
+        positive semi-definite: the exact Hessian of the t carries a subtracted
+        rank-one term that turns the system indefinite beyond ``chi2 = nu``, and
+        a step off an indefinite matrix overshoots the mode.
+
+        For the softened chi^2 it is ``1 / sqrt(1 + (chi2 / S)^2)``.
+        """
+        cfg = self.cfg
+        if cfg.data_term == "student_t":
+            return (nu_obs + d_obs) / (nu_obs + chi2_obs)
+        return 1.0 / tf.sqrt(1.0 + (chi2_obs / cfg.chi2_turnover) ** 2)
+
+    @tf.autograph.experimental.do_not_convert
+    def _normal_equations(self, x, xs, x_pred, jac, weight, star):
         """Per-star ``(A, b)`` of the Gauss-Newton step in ``y``.
 
         With ``C = diag(sigma^2)`` diagonal, the normal equations of one
         observation are ``J^T W J`` and ``J^T W (x - x_pred)``, ``W =
-        w / sigma^2`` elementwise. The weight ``w`` is the curvature of the
-        softened chi^2 the loss actually uses: the loss is
-        ``S * arcsinh(chi2 / S)``, whose derivative with respect to ``chi2`` is
-        ``1 / sqrt(1 + (chi2 / S)^2)``, so weighting by it makes the step the
-        exact minimiser of that loss and not merely of a quadratic stand-in.
+        w / sigma^2`` elementwise, where ``w`` is the curvature of the data term
+        the loss actually uses (:meth:`_data_weight`), so the step is the exact
+        minimiser of that loss and not merely of a quadratic stand-in. The weight
+        is taken as an argument rather than recomputed here so that the loss and
+        the step cannot drift apart.
 
         Returns the summed matrices of shape ``(n_star, n_dim, n_dim)`` and
         vectors of shape ``(n_star, n_dim)``, and the ``tf.unique`` of the star
         index.
         """
-        cfg = self.cfg
-        weight = (1.0 / tf.sqrt(1.0 + (chi2_obs / cfg.chi2_turnover) ** 2))[:, None]
-        weight = weight / xs**2
+        weight = weight[:, None] / xs**2
         dx = x - x_pred
         A = tf.einsum("npa,np,npb->nab", jac, weight, jac)
         b = tf.einsum("npa,np,np->na", jac, weight, dx)
@@ -845,9 +1027,10 @@ class LatentTrainer:
         changed under it; the next sweep of the map then trains on the flung
         value, and the two can push each other away over a few steps.
         ``latent_gn_5h`` went from chi^2 4.1 to 105 in fifteen steps, which is too
-        large for one star to cause (the loss is a mean over 65k observations and
-        the arcsinh softening caps a single star's contribution), but not too
-        large for a self-feeding ``y``-map loop.
+        large for one star to cause (the loss is a mean over 65k observations, and
+        both data terms cap a single star's contribution -- logarithmically for
+        the arcsinh softening, and at ``(nu + d) log(1 + chi^2/nu)`` for the t), but
+        not too large for a self-feeding ``y``-map loop.
 
         So no star may move by more than ``y_trust_abs`` in any one parameter. The
         step is *scaled*, never clipped component by component: every component
@@ -882,8 +1065,9 @@ class LatentTrainer:
         x_pred, _, jac = self.bij.inverse_with_s_and_jac(
             tf.gather(self.y_val, star), c=c
         )
-        chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
-        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, chi2_obs, star)
+        chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c)
+        weight = self._data_weight(chi2_obs, d_obs, nu_obs)
+        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, weight, star)
         step = self._solve_y(A, b)
         if cfg.y_learning_rate:
             self.y_val.scatter_nd_add(
@@ -892,7 +1076,7 @@ class LatentTrainer:
         return tf.gather(self.y_val, star)
 
     def _gauss_newton_y(self, x, xs, c, star):
-        """Move ``y`` to the Gauss-Newton optimum of the batch's chi^2.
+        """Move ``y`` to the Gauss-Newton optimum of the batch's data term.
 
         Called before the map's gradient step, so the map trains against the
         harmonized values it will actually be scored with. The batch holds the
@@ -900,7 +1084,10 @@ class LatentTrainer:
         shuffled in star blocks), so one step is the full profile optimum for
         those stars rather than a partial one; the measurement on a finished run
         showed that a second step moves the mean softened chi^2 by only 2%,
-        hence one step here.
+        hence one step here. Under the Student's t the same holds a fortiori: the
+        weight is recomputed from the residual each sweep, so a second sweep
+        corrects for the weight having moved, which is a smaller effect than the
+        step itself.
 
         Returns the statistics of the step, which are recorded as metrics: the
         mean fraction the trust region allowed, the fraction of stars it capped,
@@ -912,8 +1099,9 @@ class LatentTrainer:
         if not cfg.y_learning_rate:
             return 1.0, 0.0, 0.0
         x_pred, _, jac = self.bij.inverse_with_s_and_jac(tf.gather(self.y, star), c=c)
-        chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
-        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, chi2_obs, star)
+        chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c)
+        weight = self._data_weight(chi2_obs, d_obs, nu_obs)
+        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, weight, star)
         step, allowed = self._solve_y(A, b, return_scale=True)
         self.y.scatter_nd_add(tf.expand_dims(uniq, 1), cfg.y_learning_rate * step)
         return (
@@ -1141,13 +1329,13 @@ class LatentTrainer:
             # Map every observation's harmonized value back into its catalog
             x_pred, s = bij.inverse_with_s(y, c=c)
 
-            # chi^2 of each observation. An unmeasured parameter has sigma = 1e9
-            # and contributes ~1e-18, so no mask is needed.
-            chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
-            chi2 = cfg.chi2_turnover * arcsinh_of_exp(
-                tf.math.log(chi2_obs + 1e-30) - tf.math.log(cfg.chi2_turnover)
-            )
-            chi2 = tf.reduce_mean(chi2)
+            # The data term of every observation. An unmeasured parameter has
+            # sigma = 1e9 and contributes ~1e-18 to chi^2, so no mask is needed;
+            # it does leave the t's dimension, which is why ``d`` counts the
+            # measured parameters rather than the width of the vector.
+            chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c)
+            chi2 = tf.reduce_mean(self._data_term(chi2_obs, d_obs, nu_obs))
+            chi2_raw = tf.reduce_mean(chi2_obs)
 
             # Path-length penalty of the observation transformations
             penalty_obs = cfg.l1_path * tf.reduce_mean(tf.abs(s)) + cfg.l2_path * tf.reduce_mean(
@@ -1188,6 +1376,7 @@ class LatentTrainer:
         res = {
             "loss": loss,
             "chi2": chi2,
+            "chi2_raw": chi2_raw,
             "penalty_obs": penalty_obs,
             "penalty_ctrl": penalty_ctrl,
             "penalty_div": penalty_div,
@@ -1616,6 +1805,11 @@ def _config_from_json(d: dict) -> dict:
     d = dict(d)
     if "freeze_vars" in d:
         d["freeze_vars"] = tuple(d["freeze_vars"])
+    # Runs started before the Student's t existed were trained and will be
+    # resumed with the softened chi^2, so that is what a missing ``data_term``
+    # means. Without this the new field's default would be filled in and a
+    # resume would silently change the objective halfway through a run.
+    d.setdefault("data_term", "softened")
     return d
 
 
@@ -1659,6 +1853,13 @@ def run_training(
         n_stars=int(obs_dict["n_stars"]),
         n_control=len(ctrl_dict["x_control"]),
     )
+    # Which degrees of freedom the run actually uses: ``cfg.nu`` for every
+    # catalog, or the per-catalog values that came with the sigmas. Recorded so
+    # that a resume cannot quietly train a different objective, and so that the
+    # run states the tail it was fitted with.
+    n_cat = int(ctrl_dict["c_control"].max()) + 1
+    obs_attrs = read_attrs(observations_path)
+    nu_values = resolve_nu(obs_attrs, n_cat, cfg)
     if resume:
         with open(cfg_path) as f:
             snapshot = json.load(f)
@@ -1669,6 +1870,13 @@ def run_training(
                     f"with ({key}: {snapshot.get(key)} -> {value})."
                 )
         _check_resumable(snapshot, cfg)
+        saved_nu = snapshot.get("nu_values")
+        if saved_nu is not None and not np.allclose(np.asarray(saved_nu), nu_values):
+            raise ValueError(
+                "The observations file's per-catalog nu differs from the one the run "
+                f"was started with ({saved_nu} -> {nu_values.tolist()})."
+            )
+        snapshot["nu_values"] = [float(v) for v in nu_values]
         snapshot["config"] = dataclasses.asdict(cfg)
         snapshot.setdefault("resumed", []).append(
             datetime.now().isoformat(timespec="seconds")
@@ -1678,16 +1886,17 @@ def run_training(
             "config": dataclasses.asdict(cfg),
             "loss": "latent_y",
             "observations_path": str(observations_path or config.OBSERVATIONS_PATH),
-            "observations_attrs": read_attrs(observations_path),
+            "observations_attrs": obs_attrs,
+            "nu_values": [float(v) for v in nu_values],
             **sizes,
-            "catalogs": list(registry.keys()[: int(ctrl_dict["c_control"].max()) + 1]),
+            "catalogs": list(registry.keys()[:n_cat]),
             "tensorflow": tf.__version__,
             "started": datetime.now().isoformat(timespec="seconds"),
         }
     with open(cfg_path, "w") as f:
         json.dump(snapshot, f, indent=2)
 
-    trainer = LatentTrainer(obs_dict, ctrl_dict, cfg)
+    trainer = LatentTrainer(obs_dict, ctrl_dict, cfg, attrs=obs_attrs)
     metrics = trainer.train(run_dir, resume=resume)
     trainer.save(run_dir, metrics)
     log.info("Saved model to %s", run_dir)

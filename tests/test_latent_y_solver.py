@@ -87,7 +87,9 @@ def test_gauss_newton_y_reaches_the_profile_optimum():
 
     # from the new point the step is a fixed point, so it must be far smaller
     # than the 0.15 displacement it has just undone
-    A1, b1, _ = tr._normal_equations(x, xs, x_pred1, jac1, chi2_after, star)
+    chi2_1, d1, nu1 = tr._loss_inputs(x, xs, x_pred1, c)
+    weight1 = tr._data_weight(chi2_1, d1, nu1)
+    A1, b1, _ = tr._normal_equations(x, xs, x_pred1, jac1, weight1, star)
     second = tr._solve_y(A1, b1).numpy()
     assert np.mean(np.abs(second)) < 0.05 * 0.15
 
@@ -154,8 +156,8 @@ def test_trust_region_leaves_an_ordinary_step_alone():
     tr = _small_trainer()
     x, xs, c, star = _first_stars(tr)
     x_pred, _, jac = tr.bij.inverse_with_s_and_jac(tf.gather(tr.y, star), c=c)
-    chi2 = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
-    A, b, _ = tr._normal_equations(x, xs, x_pred, jac, chi2, star)
+    chi2, d_obs, nu_obs = tr._loss_inputs(x, xs, x_pred, c)
+    A, b, _ = tr._normal_equations(x, xs, x_pred, jac, tr._data_weight(chi2, d_obs, nu_obs), star)
 
     blocked = _small_trainer(y_trust_abs=None)
     step, allowed = tr._solve_y(A, b, return_scale=True)
