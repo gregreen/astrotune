@@ -29,6 +29,11 @@ class Context:
     diagnostic_dir: Path
     make_plots: bool = True
     force: bool = False
+    #: Accept a crossmatch that matches fewer stars than the previous one instead
+    #: of treating it as an incomplete result from the archive.
+    allow_crossmatch_regression: bool = False
+    #: Which TAP service serves the Gaia DR3 table (see ``prep.gaia.ARCHIVES``).
+    gaia_archive: str = "esa"
     extra: dict = field(default_factory=dict)
 
     @property
@@ -36,7 +41,14 @@ class Context:
         return self.spec.n_params
 
 
-def make_context(key: str, *, make_plots: bool = True, force: bool = False) -> Context:
+def make_context(
+    key: str,
+    *,
+    make_plots: bool = True,
+    force: bool = False,
+    allow_crossmatch_regression: bool = False,
+    gaia_archive: str = "esa",
+) -> Context:
     spec = registry.get_spec(key)
     return Context(
         key=key,
@@ -47,6 +59,8 @@ def make_context(key: str, *, make_plots: bool = True, force: bool = False) -> C
         diagnostic_dir=config.diagnostic_dir(key),
         make_plots=make_plots,
         force=force,
+        allow_crossmatch_regression=allow_crossmatch_regression,
+        gaia_archive=gaia_archive,
     )
 
 
@@ -89,6 +103,9 @@ def build_table(t: Table, mask: np.ndarray, module, ctx: Context) -> Table:
         getattr(module, "EXTRA_COLS", ()),
         param_transf=transforms.PARAM_TRANSF[:d],
         param_unc_transf=transforms.apply_err_floors(unc_funcs, floors[:d]),
+        # ... and the same without the rescale and the floors, which is what the delta
+        # model sees: it learns both of those itself.
+        param_unc_transf_raw=transforms.PARAM_UNC_TRANSF[:d],
         param_errs=param_errs,
         mask=mask,
     )
@@ -100,13 +117,21 @@ def prepare(
     make_plots: bool = True,
     force: bool = False,
     save: bool = True,
+    allow_crossmatch_regression: bool = False,
+    gaia_archive: str = "esa",
 ) -> Table:
     """Run the full preparation chain for one catalog.
 
     Steps: download -> load -> derive columns -> quality cuts -> transform and
     assemble -> validate -> save -> diagnostics.
     """
-    ctx = make_context(key, make_plots=make_plots, force=force)
+    ctx = make_context(
+        key,
+        make_plots=make_plots,
+        force=force,
+        allow_crossmatch_regression=allow_crossmatch_regression,
+        gaia_archive=gaia_archive,
+    )
     module = registry.get_module(key)
     t0 = time.monotonic()
 
@@ -207,3 +232,16 @@ def _report_parity(key: str, table: Table) -> None:
     exempt = getattr(registry.get_module(key), "PARITY_EXEMPT", None)
     if exempt:
         log.warning("[%s] deliberate deviation from the legacy table: %s", key, exempt)
+
+    # A rebuild can legitimately *add* stars (a newer data release) but nothing
+    # in the catalog layer removes them, so a drop means something upstream lost
+    # rows -- most often an incomplete Gaia crossmatch.
+    n_ref, n_new = report.get("n_ref", 0), report.get("n_new", 0)
+    if n_ref and n_new < 0.95 * n_ref:
+        log.warning(
+            "[%s] %s fewer rows than the legacy table (%.1f%%) with unchanged cuts: "
+            "check whether the catalog lost stars, e.g. to an incomplete crossmatch",
+            key,
+            f"{n_ref - n_new:,}",
+            100 * (1 - n_new / n_ref),
+        )

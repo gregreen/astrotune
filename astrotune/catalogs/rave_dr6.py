@@ -24,7 +24,7 @@ import pandas as pd
 from astropy.table import Table
 
 from ..prep.download import download as download_file
-from ..prep.gaia import apply_crossmatch, gaia_crossmatch_batched
+from ..prep.gaia import crossmatch_catalog
 from ..prep.transforms import unmask
 
 KEY = "rave_dr6"
@@ -44,7 +44,6 @@ CROSSMATCH_FILE = "crossmatched.h5"
 JOIN_KEY = "rave_obs_id"
 
 #: Wide search radius, then a tighter cut on the nearest neighbor.
-SEARCH_SEPARATION = 1.0 * units.arcsec
 MAX_SEPARATION = 0.3 * units.arcsec
 
 ID_COL = "gdr3_source_id"
@@ -68,31 +67,32 @@ def download(ctx) -> None:
 
 
 def load(ctx) -> Table:
-    cache = ctx.interim_dir / CROSSMATCH_FILE
-    if cache.exists() and not ctx.force:
-        return Table.read(cache)
+    def read_catalog() -> Table:
+        merged = None
+        for fn in FNAMES:
+            df = pd.read_hdf(ctx.raw_dir / fn)
+            merged = df if merged is None else pd.merge(merged, df, on=JOIN_KEY, how="inner")
+        return Table.from_pandas(merged)
 
-    merged = None
-    for fn in FNAMES:
-        df = pd.read_hdf(ctx.raw_dir / fn)
-        merged = df if merged is None else pd.merge(merged, df, on=JOIN_KEY, how="inner")
+    def drop_unwritable(catalog: Table) -> Table:
+        if "cluster_flag" in catalog.colnames:  # object dtype, not HDF5-writable
+            catalog.remove_column("cluster_flag")
+        return catalog
 
-    catalog = Table.from_pandas(merged)
-    crossmatch = gaia_crossmatch_batched(
-        catalog["ra"],
-        catalog["dec"],
-        max_batch_size=1024 * 64,
-        max_separation=SEARCH_SEPARATION,
+    return crossmatch_catalog(
+        read_catalog,
+        ra_col="ra",
+        dec_col="dec",
+        cache_path=ctx.interim_dir / CROSSMATCH_FILE,
+        max_separation=MAX_SEPARATION,
+        archive=ctx.gaia_archive,
+        force=ctx.force,
+        allow_regression=ctx.allow_crossmatch_regression,
+        key=KEY,
         verbose=True,
+        postprocess=drop_unwritable,
+        serialize_metadata=True,
     )
-    catalog = apply_crossmatch(catalog, crossmatch, max_separation=MAX_SEPARATION)
-
-    if "cluster_flag" in catalog.colnames:  # object dtype, not HDF5-writable
-        catalog.remove_column("cluster_flag")
-
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    catalog.write(cache, serialize_metadata=True, overwrite=True)
-    return catalog
 
 
 def cuts(t: Table, ctx) -> dict:

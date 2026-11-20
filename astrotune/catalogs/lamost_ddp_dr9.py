@@ -31,7 +31,7 @@ from ..prep import plots
 from ..prep.abundances import calc_alpha_Fe_from_abundances
 from ..prep.cuts import snr_chisq_relation
 from ..prep.download import download as download_file
-from ..prep.gaia import apply_crossmatch, gaia_crossmatch_batched
+from ..prep.gaia import crossmatch_catalog
 from ..prep.transforms import unmask
 
 KEY = "lamost_ddp_dr9"
@@ -76,24 +76,22 @@ def total_snr(t: Table) -> np.ndarray:
 
 
 def load(ctx) -> Table:
-    cache = ctx.interim_dir / CACHE_FILE
-    if cache.exists() and not ctx.force:
-        return Table.read(cache)
+    def read_catalog() -> Table:
+        with fits.open(ctx.raw_dir / FILENAME, mode="readonly") as f:
+            return Table(f[HDU].data)
 
-    with fits.open(ctx.raw_dir / FILENAME, mode="readonly") as f:
-        catalog = Table(f[HDU].data)
-
-    crossmatch = gaia_crossmatch_batched(
-        catalog["RA"],
-        catalog["DEC"],
+    return crossmatch_catalog(
+        read_catalog,
+        ra_col="RA",
+        dec_col="DEC",
+        cache_path=ctx.interim_dir / CACHE_FILE,
         max_separation=MAX_SEPARATION,
-        max_batch_size=1024 * 1024,
+        archive=ctx.gaia_archive,
+        force=ctx.force,
+        allow_regression=ctx.allow_crossmatch_regression,
+        key=KEY,
+        serialize_metadata=True,
     )
-    matched = apply_crossmatch(catalog, crossmatch)
-
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    matched.write(cache, serialize_metadata=True, overwrite=True)
-    return matched
 
 
 def prepare_columns(t: Table, ctx) -> Table:

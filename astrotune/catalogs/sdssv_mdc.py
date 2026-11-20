@@ -4,6 +4,10 @@ References
 ----------
 Behmard et al. (2025), ApJ 982, 13
 
+Links:
+  * https://www.sdss.org/dr19/data_access/value-added-catalogs/?vac_id=10011
+  * https://data.sdss.org/datamodel/files/MWM_MDWARF/elemental_abundances
+
 Notes
 -----
 This catalog provides Teff, [Fe/H] and alpha abundances but **no surface
@@ -30,7 +34,7 @@ LABEL = "SDSS-V (MDw Cannon)"
 N_PARAMS = 4
 REFERENCE = "Behmard et al. 2025, ApJ 982, 13"
 SOURCES = (
-    "https://data.sdss.org/sas/dr19/vac/mwm/m-dwarf/elemental_abundances/"
+    "https://dr19.sdss.org/sas/dr19/vac/mwm/m-dwarf/elemental_abundances/"
     "mdwarf_abundances-1.0.2.fits",
 )
 FILENAME = "mdwarf_abundances-1.0.2.fits"

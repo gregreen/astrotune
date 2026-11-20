@@ -95,6 +95,20 @@ MISSING = 1e6
 #: Fewest stars for which a video is worth making
 MIN_STARS = 20
 
+#: ``--standard-overview`` draws these planes: the two parameter planes plus the
+#: parameter-by-parameter comparison, which only exists for pairs.
+STANDARD_OVERVIEW_PLANES = ("kiel", "feh_alpha", "param1v1")
+#: ... this many catalog pairs, i.e. every pair with *more* than this many stars
+#: in common ...
+STANDARD_OVERVIEW_MIN_SHARED = 10_000
+#: ... plus each catalog's strongest few pairs, so that no catalog is missing
+#: from the pair videos altogether.
+STANDARD_OVERVIEW_TOP_K = 3
+
+#: Pairs sampled per catalog pair for the pair videos. The shared-star *counts*
+#: always come from the full overlap; this only limits how many stars are drawn.
+PAIRS_PER_PAIR = 4096
+
 
 @dataclass(frozen=True)
 class Plane:
@@ -645,6 +659,143 @@ def make_plane_video(
 
 
 # --- Driver ---------------------------------------------------------------------
+def _pair_counts(pair_dict, n_cat: int) -> np.ndarray:
+    """Number of shared stars per catalog pair, as an ``(n_cat, n_cat)`` matrix.
+
+    Only used for a legacy pairs file, where the counts are the stored pairs
+    themselves; the observation-based path counts the full overlap instead.
+    """
+    lo = np.minimum(pair_dict["c0"], pair_dict["c1"]).astype("i8")
+    hi = np.maximum(pair_dict["c0"], pair_dict["c1"]).astype("i8")
+    counts = np.bincount(lo * n_cat + hi, minlength=n_cat * n_cat)
+    return counts.reshape(n_cat, n_cat)
+
+
+def observations_path(run_dir: Path) -> Optional[Path]:
+    """The observations file a run was trained on, as recorded in its ``config.json``."""
+    try:
+        with open(Path(run_dir) / "config.json") as f:
+            stored = json.load(f).get("observations_path")
+    except (OSError, ValueError):
+        return None
+    if not stored:
+        return None
+    path = Path(stored)
+    return path if path.is_absolute() else config.PROJECT_ROOT / path
+
+
+def pairs_from_observations(obs_dict, *, max_pairs: int = PAIRS_PER_PAIR, seed: int = 0):
+    """Catalog pairs and the shared-star counts, straight from the observations.
+
+    The observations are one row per catalog measurement, so two catalogs
+    observe the same star when their rows carry the same Gaia id. Every pair is
+    sampled (up to ``max_pairs`` ids, in both orientations, as the legacy pair
+    file stored them) for the trajectories, while the returned counts come from
+    the full overlap, which is what ``--all-pairs-min`` and the standard overview
+    select on.
+    """
+    ids = np.asarray(obs_dict["id"], dtype="i8")
+    cats = np.asarray(obs_dict["c"])
+    n_cat = int(cats.max()) + 1
+
+    # One row per (catalog, id): the first, if a star is measured twice.
+    rows_by_catalog, ids_by_catalog = [], []
+    for c in range(n_cat):
+        rows = np.flatnonzero(cats == c)
+        rows = rows[np.argsort(ids[rows], kind="stable")]
+        unique_ids, first = np.unique(ids[rows], return_index=True)
+        ids_by_catalog.append(unique_ids)
+        rows_by_catalog.append(rows[first])
+
+    counts = np.zeros((n_cat, n_cat), dtype="i8")
+    rng = np.random.default_rng(seed)
+    collected = {key: [] for key in ("c0", "c1", "x0", "x1", "xs0", "xs1")}
+    for i in range(n_cat):
+        for j in range(i + 1, n_cat):
+            if not len(ids_by_catalog[i]) or not len(ids_by_catalog[j]):
+                continue
+            _, left, right = np.intersect1d(
+                ids_by_catalog[i], ids_by_catalog[j], assume_unique=True, return_indices=True
+            )
+            counts[i, j] = counts[j, i] = len(left)
+            if len(left) == 0:
+                continue
+            if len(left) > max_pairs:
+                pick = np.sort(rng.choice(len(left), size=max_pairs, replace=False))
+                left, right = left[pick], right[pick]
+            half = len(left) // 2
+            for c0, c1, a, b in ((i, j, left[:half], right[:half]),
+                                 (j, i, right[half:], left[half:])):
+                if len(a) == 0:
+                    continue
+                collected["c0"].append(np.full(len(a), c0, dtype="i8"))
+                collected["c1"].append(np.full(len(a), c1, dtype="i8"))
+                collected["x0"].append(obs_dict["x"][rows_by_catalog[c0][a]])
+                collected["x1"].append(obs_dict["x"][rows_by_catalog[c1][b]])
+                collected["xs0"].append(obs_dict["xs"][rows_by_catalog[c0][a]])
+                collected["xs1"].append(obs_dict["xs"][rows_by_catalog[c1][b]])
+
+    pair_dict = {}
+    for key, parts in collected.items():
+        if parts:
+            pair_dict[key] = np.concatenate(parts)
+        else:  # no pair at all
+            pair_dict[key] = np.zeros((0, config.N_PARAMS) if key.startswith("x") else 0, dtype="f8")
+    return pair_dict, counts
+
+
+def load_run_data(run_dir: Path, pairs_path: Optional[Path] = None):
+    """``(pair_dict, ctrl_dict, counts)`` for a run.
+
+    By default this reads the observations the run was trained on -- the file
+    its ``config.json`` records -- so the videos show the run's own stars,
+    control points and catalog pairs. ``pairs_path`` selects a legacy
+    ``pairs_and_ctrl_points.h5`` instead, which predates the observation-based
+    data and only covers the catalogs of its time.
+    """
+    if pairs_path is not None:
+        log.info("reading legacy pair file %s", pairs_path)
+        pair_dict, ctrl_dict, counts = load_run_data(run_dir, pairs_path)
+        return pair_dict, ctrl_dict, _pair_counts(pair_dict, len(registry.keys()))
+
+    path = observations_path(run_dir)
+    if path is None or not path.exists():
+        raise FileNotFoundError(
+            f"{run_dir}/config.json does not record a usable observations file "
+            f"(looked for {path}); pass --pairs-path to use a legacy pairs file"
+        )
+    log.info("reading the run's observations: %s", path)
+    obs_dict, ctrl_dict = load_observations(path, fix_unknown_errors=False)
+    pair_dict, counts = pairs_from_observations(obs_dict)
+    return pair_dict, ctrl_dict, counts
+
+
+def _overview_pairs(counts: np.ndarray) -> List[Tuple[int, int]]:
+    """The pairs of the standard overview: above the threshold, plus the top few.
+
+    Every pair with more than :data:`STANDARD_OVERVIEW_MIN_SHARED` stars in
+    common, and on top of that each catalog's :data:`STANDARD_OVERVIEW_TOP_K`
+    strongest connections, so that a catalog with few overlaps is still
+    represented in the pair videos.
+    """
+    n_cat = counts.shape[0]
+    chosen = {
+        (int(i), int(j))
+        for i, j in zip(*np.where(np.triu(counts, k=1) > STANDARD_OVERVIEW_MIN_SHARED))
+    }
+
+    for c in range(n_cat):
+        partners = [
+            (int(counts[min(c, d), max(c, d)]), d) for d in range(n_cat) if d != c
+        ]
+        partners = [(n, d) for n, d in partners if n > 0]
+        partners.sort(key=lambda item: (-item[0], item[1]))
+        for _, d in partners[:STANDARD_OVERVIEW_TOP_K]:
+            chosen.add((min(c, d), max(c, d)))
+
+    return sorted(chosen)
+
+
 def make_videos(
     run_dir: Path,
     out_dir: Optional[Path] = None,
@@ -656,13 +807,19 @@ def make_videos(
     n_plot: int = 2048,
     data_path: Optional[Path] = None,
     all_pairs_min: Optional[int] = None,
-    batch_size: int = 16384,
+    standard_overview: bool = False,
 ) -> List[Path]:
     """Make the requested videos for a trained run; return their paths.
 
     ``planes`` may contain the pair-only ``param1v1`` and ``param1v1_diff``.
     With ``all_pairs_min`` every catalog pair with at least that many stars in
-    common is added to ``pairs``.
+    common is added to ``pairs`` (as the notebook did, with 50).
+
+    With ``standard_overview`` the run's usual set is added: the planes in
+    :data:`STANDARD_OVERVIEW_PLANES`, the unhighlighted videos, one highlight
+    per catalog, and the pairs of :func:`_overview_pairs` -- every pair with
+    more than :data:`STANDARD_OVERVIEW_MIN_SHARED` shared stars plus each
+    catalog's strongest :data:`STANDARD_OVERVIEW_TOP_K`.
     """
     from .model import load_bijector
     from .model.io import enable_memory_growth
@@ -676,33 +833,51 @@ def make_videos(
     if len(labels) < source.n_cat:  # the file has catalogs the registry no longer lists
         labels = [registry.get_spec(k).label for k in registry.keys()[: source.n_cat]]
     colors = catalog_colors(len(labels))
+    if standard_overview:
+        # every catalog highlighted individually (plus anything asked for)
+        highlights = list(dict.fromkeys([*registry.run_keys(run_dir), *highlights]))
 
+    bij = load_bijector(run_dir)
+    pair_dict, ctrl_dict, counts = load_run_data(run_dir, pairs_path)
+    catalogs = catalog_trajectories(bij, ctrl_dict, n_video_frames, n_plot)
     pair_idx = {
         tuple(sorted((registry.category_index(ka), registry.category_index(kb))))
         for ka, kb in pairs
     }
     if all_pairs_min is not None:
-        for i0 in range(source.n_cat):
-            for i1 in range(i0 + 1, source.n_cat):
-                if source.shared_count(i0, i1) >= all_pairs_min:
-                    pair_idx.add((i0, i1))
-    missing = [p for p in pair_idx if max(p) >= source.n_cat]
-    if missing:
-        raise ValueError(f"Pairs {missing} name catalogs the run does not have ({source.n_cat}).")
-
-    plan = build_plan(source, sorted(pair_idx), n_plot)
-    if plan.n_pair_before_dedup:
+        rows, cols = np.where(counts >= all_pairs_min)
+        pair_idx |= {(int(i), int(j)) for i, j in zip(rows, cols) if i < j}
+    if standard_overview:
+        overview = _overview_pairs(counts)
         log.info(
-            "Pair stars: %d before dedupe, %d distinct (star, catalog) rows",
-            plan.n_pair_before_dedup, plan.n_pair,
+            "standard overview: %d catalog pairs (%d with more than %s shared stars)",
+            len(overview),
+            sum(counts[i, j] > STANDARD_OVERVIEW_MIN_SHARED for i, j in overview),
+            f"{STANDARD_OVERVIEW_MIN_SHARED:,}",
         )
-    log.info(
-        "%d observations to integrate (%d control points + %d pair rows) in batches of %d",
-        len(plan), plan.n_ctrl, plan.n_pair, batch_size,
-    )
-    xt = integrate(load_bijector(run_dir), plan, n_video_frames, batch_size)
-    catalogs, pair_trajs = make_trajectories(plan, xt)
-    del xt
+        pair_idx |= set(overview)
+
+    # ``catalogs`` has one entry per catalog the *pair file* knows about, which
+    # can be fewer than the run's catalogs (a run trained after the registry grew
+    # has catalogs the pair file predates). Only the ones with control points can
+    # be drawn.
+    n_data = len(catalogs)
+    missing = [key for key in highlights if registry.category_index(key) >= n_data]
+    if missing:
+        log.warning(
+            "%d catalog(s) have no control points in the pair file and get no video: %s",
+            len(missing),
+            ", ".join(labels[registry.category_index(key)] for key in missing),
+        )
+        highlights = [key for key in highlights if registry.category_index(key) < n_data]
+    pair_idx = {(i0, i1) for i0, i1 in pair_idx if i1 < n_data}
+
+    pair_trajs = {}
+    pair_trajs = {}
+    for i0, i1 in sorted(pair_idx):
+        pair_trajs[(i0, i1)] = paired_trajectories(
+            bij, pair_dict, i0, i1, n_video_frames, n_plot
+        )
 
     paths = []
     kw = dict(n_video_frames=n_video_frames)
@@ -791,7 +966,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--all-pairs-min", type=int, default=None, metavar="N",
         help="also use every catalog pair with at least N stars in common",
     )
-    parser.add_argument("--no-plain", action="store_true", help="skip the unhighlighted videos")
+    parser.add_argument("--no-plain", action="store_true", help="skip the unhighlighted video")
+    parser.add_argument(
+        "--standard-overview",
+        action="store_true",
+        help=(
+            "also make the standard set: the kiel, feh_alpha and param1v1 planes, "
+            "one highlight per catalog, and every pair with more than "
+            f"{STANDARD_OVERVIEW_MIN_SHARED:,} shared stars plus each catalog's "
+            f"top {STANDARD_OVERVIEW_TOP_K}"
+        ),
+    )
     parser.add_argument("--n-frames", type=int, default=90)
     parser.add_argument("--n-plot", type=int, default=2048, help="stars per catalog")
     parser.add_argument(
@@ -799,37 +984,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="observations integrated per ODE call",
     )
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s")
 
-    if args.plane and args.all_planes:
-        parser.error("--plane and --all-planes are mutually exclusive")
-    if args.highlight and args.highlight_all:
-        parser.error("--highlight and --highlight-all are mutually exclusive")
-    planes = list(ALL_PLANES) if args.all_planes else (args.plane or ["kiel", "feh_alpha"])
+    highlights, pairs = args.highlight, [tuple(p) for p in args.pair]
+    if not args.standard_overview and not highlights and not pairs and not args.no_plain and args.all_pairs_min is None:  # the default set
+        highlights, pairs = [DEFAULT_HIGHLIGHT], [DEFAULT_PAIR]
 
-    run_keys = registry.run_keys(args.run_dir)
-    pairs = [tuple(p) for p in args.pair]
-    if args.highlight_all:
-        highlights = list(run_keys)
-    elif args.highlight:
-        highlights = list(args.highlight)
-    elif not args.no_plain and not pairs and args.all_pairs_min is None:
-        highlights = [k for k in [DEFAULT_HIGHLIGHT] if k in run_keys]
-        pairs = [DEFAULT_PAIR] if set(DEFAULT_PAIR) <= set(run_keys) else []
-        if not highlights and not pairs:
-            log.warning("This run has neither %s nor %s, so nothing is highlighted by "
-                        "default; pass --highlight or --highlight-all",
-                        DEFAULT_HIGHLIGHT, DEFAULT_PAIR)
-    else:
-        highlights = []
-    unknown = [k for k in highlights + [k for p in pairs for k in p] if k not in run_keys]
-    if unknown:
-        parser.error(f"unknown catalog key(s) {unknown}; the run has {list(run_keys)}")
+    planes = list(args.plane)
+    if args.standard_overview:
+        planes = list(dict.fromkeys([*STANDARD_OVERVIEW_PLANES, *planes]))
 
     make_videos(
         args.run_dir, args.out_dir, highlights, pairs,
-        planes=planes, plain=not args.no_plain, n_video_frames=args.n_frames, n_plot=args.n_plot,
-        data_path=args.data_path, all_pairs_min=args.all_pairs_min, batch_size=args.batch_size,
+        planes=planes or list(PLANES),
+        plain=not args.no_plain, n_video_frames=args.n_frames, n_plot=args.n_plot,
+        pairs_path=args.pairs_path, all_pairs_min=args.all_pairs_min,
+        standard_overview=args.standard_overview,
     )
     return 0
 

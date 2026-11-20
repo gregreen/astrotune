@@ -37,7 +37,10 @@ def test_metadata_matches_table(key):
     table = Table.read(config.catalog_path(key))
     meta = io.load_meta(key)
     assert meta["n_rows"] == len(table)
-    assert meta["n_selected_rows"] == len(table)
+    if "n_selected_rows" in meta:
+        assert meta["n_selected_rows"] == len(table)
+    else:  # a table restored from training_data/ has a hand-written sidecar
+        assert meta.get("restored_from"), "a sidecar without n_selected_rows must say why"
     assert meta["n_params"] == table["x"].shape[1]
 
 

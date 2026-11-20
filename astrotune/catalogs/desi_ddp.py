@@ -23,7 +23,7 @@ from astropy.table import Table
 from ..prep import plots
 from ..prep.abundances import calc_alpha_Fe_from_abundances
 from ..prep.download import download as download_file
-from ..prep.gaia import apply_crossmatch, gaia_crossmatch_batched
+from ..prep.gaia import crossmatch_catalog
 from ..prep.transforms import unmask
 
 KEY = "desi_ddp"
@@ -54,24 +54,32 @@ def download(ctx) -> None:
 
 
 def load(ctx) -> Table:
-    cache = ctx.interim_dir / CROSSMATCH_FILE
-    if cache.exists() and not ctx.force:
-        return Table.read(cache)
+    def read_catalog() -> Table:
+        with fits.open(ctx.raw_dir / FILENAME, mode="readonly") as f:
+            return Table(f[HDU].data)
 
-    with fits.open(ctx.raw_dir / FILENAME, mode="readonly") as f:
-        catalog = Table(f[HDU].data)
-
-    crossmatch = gaia_crossmatch_batched(
-        catalog["RAdeg"], catalog["DEdeg"], max_separation=MAX_SEPARATION
+    return crossmatch_catalog(
+        read_catalog,
+        ra_col="RAdeg",
+        dec_col="DEdeg",
+        cache_path=ctx.interim_dir / CROSSMATCH_FILE,
+        max_separation=MAX_SEPARATION,
+        archive=ctx.gaia_archive,
+        force=ctx.force,
+        allow_regression=ctx.allow_crossmatch_regression,
+        key=KEY,
+        serialize_metadata=True,
     )
-    matched = apply_crossmatch(catalog, crossmatch)
-
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    matched.write(cache, serialize_metadata=True, overwrite=True)
-    return matched
 
 
 def prepare_columns(t: Table, ctx) -> Table:
+    # The notebook's cache carried the coordinates as ``ra``/``dec``; our own
+    # crossmatch keeps the release's names (RAdeg/DEdeg), and EXTRA_COLS asks for
+    # the former, so provide them here rather than depending on the cache.
+    if "ra" not in t.colnames:
+        t["ra"] = t["RAdeg"]
+        t["dec"] = t["DEdeg"]
+
     alpha_fe, alpha_fe_err, abundances = calc_alpha_Fe_from_abundances(
         t, "[{x}/Fe]", "e_[{x}/Fe]"
     )

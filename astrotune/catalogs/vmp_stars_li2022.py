@@ -23,7 +23,7 @@ from astropy.table import Table
 
 from ..prep import plots
 from ..prep.download import download as download_file
-from ..prep.gaia import apply_crossmatch, gaia_crossmatch_batched
+from ..prep.gaia import crossmatch_catalog
 from ..prep.transforms import unmask
 
 KEY = "vmp_stars_li2022"
@@ -38,8 +38,11 @@ TABLE_FILE = "table2.dat"
 README_FILE = "readme.txt"
 CROSSMATCH_FILE = "crossmatched.fits"
 
-#: Maximum separation for the Gaia DR3 match.
-MAX_SEPARATION = 0.5 * units.arcsec
+#: Maximum separation for the Gaia DR3 match. The notebook used 1.0 arcsec for
+#: this catalog (``apply_crossmatch(..., max_separation=1.*units.arcsec)``), and
+#: with 0.5 a fifth of the sample disappears, so 1.0 is what the legacy table
+#: reproduces. It is also the widest match we trust at all.
+MAX_SEPARATION = 1.0 * units.arcsec
 
 ID_COL = "gdr3_source_id"
 PARAM_COLS = ("Teff", "FeH", "logg")
@@ -57,21 +60,22 @@ def download(ctx) -> None:
 
 
 def load(ctx) -> Table:
-    cache = ctx.interim_dir / CROSSMATCH_FILE
-    if cache.exists() and not ctx.force:
-        return Table.read(cache)
+    def read_catalog() -> Table:
+        return Table.read(
+            ctx.raw_dir / TABLE_FILE, format="cds", readme=str(ctx.raw_dir / README_FILE)
+        )
 
-    catalog = Table.read(
-        ctx.raw_dir / TABLE_FILE, format="cds", readme=str(ctx.raw_dir / README_FILE)
+    return crossmatch_catalog(
+        read_catalog,
+        ra_col="RAdeg",
+        dec_col="DEdeg",
+        cache_path=ctx.interim_dir / CROSSMATCH_FILE,
+        max_separation=MAX_SEPARATION,
+        archive=ctx.gaia_archive,
+        force=ctx.force,
+        allow_regression=ctx.allow_crossmatch_regression,
+        key=KEY,
     )
-    crossmatch = gaia_crossmatch_batched(
-        catalog["RAdeg"], catalog["DEdeg"], max_separation=MAX_SEPARATION
-    )
-    matched = apply_crossmatch(catalog, crossmatch)
-
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    matched.write(cache, overwrite=True)
-    return matched
 
 
 def cuts(t: Table, ctx) -> dict:

@@ -98,6 +98,7 @@ def extract_table(
     *,
     param_transf: Optional[Sequence[Callable]] = None,
     param_unc_transf: Optional[Sequence[Callable]] = None,
+    param_unc_transf_raw: Optional[Sequence[Callable]] = None,
     param_errs=None,
     mask=None,
 ) -> Table:
@@ -118,6 +119,11 @@ def extract_table(
     param_transf, param_unc_transf
         Callables applied to the parameters / uncertainties. Default to the
         identity.
+    param_unc_transf_raw
+        The same, but without the catalog's own rescale and without the error
+        floors. Used for the ``sigma_x_raw`` column: what the catalog reported,
+        in our parameter units. The bijector is trained on ``sigma_x`` (scaled
+        and floored), the delta model on ``sigma_x_raw``.
     param_errs
         Regularization errors. Either ``(n, d)``-shaped, already aligned with
         the full input table, or a per-parameter sequence of constants. When
@@ -173,6 +179,16 @@ def extract_table(
             "x_err": param_errs,
         }
     )
+    if param_unc_transf_raw is not None:
+        # What the catalog reported, in our units: no catalog rescale, no floor.
+        sigma_raw = np.stack(
+            [
+                f(unmask(t[k0][valid]), unmask(t[k1][valid]))
+                for f, k0, k1 in zip(param_unc_transf_raw, param_keys, param_unc_keys)
+            ],
+            axis=1,
+        )
+        out["sigma_x_raw"] = np.asarray(sigma_raw, dtype="f4")
     for k in extra_keys:
         out[k] = unmask(t[k][valid])
     return out

@@ -120,7 +120,7 @@ astrotune/
   videos.py          Kiel / [Fe/H]-[alpha/Fe] / param1v1 videos (`astrotune-videos`)
   apply.py           harmonize each catalog, merge by Gaia id (`astrotune-apply`)
   merge.py           combination of Gaussian estimates + outlier rejection (NumPy only)
-  delta/             post-hoc learned extra uncertainties (§9.10): pairs.py, diagnostics.py
+  delta/             post-hoc learned extra uncertainties (§9.10): stars.py, diagnostics.py
                      (`astrotune-delta-diagnose`), model.py, train.py (`astrotune-delta-train`)
   prep/
     download.py      cached HTTP downloads, SDSS-V auth via env/prompt
@@ -1221,7 +1221,7 @@ data (§10).
   (`data/pairs_*.h5`; new ones record `error_floors` in their attributes) must be rebuilt
   with `astrotune-pairs`; the transform caches (`<run>/harmonized/transform_cache_*`) now
   carry a checksum of `x` and `sigma_x` and are recomputed when it does not match (old ones
-  are treated as stale); the delta pair tables (`<run>/delta/pair_table.npz`) are not
+  are treated as stale); the delta star tables (`<run>/delta/star_table.npz`) are not
   checked: rebuild them with `--rebuild` after `astrotune-apply`.
 - **Number of categories is per run, not global.** `load_bijector` reads the
   catalog list from the run's `config.json` (`registry.run_keys`); `evaluate`,
@@ -1339,11 +1339,28 @@ Idea (owner): after the bijector is trained, learn an extra variance per catalog
 entry, `ln_delta_cov(x, ln σ_x, catalog)` → 4 numbers, as a function of the
 entry's *own* catalog parameters (same transforms, e.g. `5 ln(Teff/5000 K)`),
 the log of its reported uncertainties, and the catalog (FiLM, reusing
-`VectorNetwork`). The output lives in the *harmonized* space. Objective: for each
-pair of entries of one star, the Gaussian likelihood of `d = y_a − y_b` with
-`S = C_a + C_b + diag(exp(ln_δ_a) + exp(ln_δ_b))`, **including `ln det S`** (without
-it the fit would inflate the errors to infinity). Parameters not measured by both
-catalogs are dropped from the quadratic form and the determinant. This is a
+`VectorNetwork`). The output lives in the *harmonized* space.
+
+**Objective (since 2026-11-14: one likelihood term per star).** A star has one
+unknown harmonized value `z`, and each of its entries is a measurement of it:
+`y_k = z + e_k`, `e_k ~ N(0, S_k)`, `S_k = C_k + diag(exp(ln_δ_k))`, independent
+given `z`. Marginalising `z` with a flat prior gives
+`-2 ln p = Σ_k d_kᵀ S_k⁻¹ d_k + ln det A + Σ_k ln det S_k + n_res ln 2π`, with
+`A = Σ_k S_k⁻¹`, `d_k = y_k − z`, `z = A⁻¹ Σ_k S_k⁻¹ y_k` (the precision-weighted
+mean, i.e. the three-cornered hat) and `n_res` the dimension of the space of
+differences. Both determinants are needed (without `ln det S` the fit inflates the
+errors to infinity; `ln det A` is what makes the variance trade between catalogs
+identifiable). Parameters an entry does not measure are dropped from the quadratic
+form *and* from its determinant, and a parameter no entry of the star measures is
+dropped from `ln det A`. For `K = 2` this is algebraically the old pair likelihood,
+constant included, which is also the regression test.
+
+This replaced a likelihood that put one term on each unordered *pair* of entries:
+for a star in `K` catalogs that was `K(K−1)/2` terms built from `K` numbers, 63.6 %
+of them from stars with `K ≥ 3` in the 20-catalog data, neither independent nor
+correctly weighted (a `K = 5` star carried 10 terms; the prior on its `ln_δ` was
+applied 4 times per entry). The file, the functions and the cache are named for
+stars now (`delta/stars.py`, `star_nll`, `star_table.npz`). This is a
 less ambitious, post-hoc replacement for the learned error model the notebook
 trained *jointly* with the bijector (`ln_err_model`, not ported, §9.3). Decisions
 made with the owner: Gaussian likelihood and diagonal, additive-only for now
@@ -1355,25 +1372,34 @@ astrotune-delta-diagnose --run-dir models/X        # calibration, no model; ~30 
 astrotune-delta-train --run-dir models/X           # baselines + network; ~3 min
 ```
 
-Everything goes to `<run>/delta/`: `pair_table.npz` (cache), `diagnostics/`,
+Everything goes to `<run>/delta/`: `star_table.npz` (cache), `diagnostics/`,
 `delta_model.*` + `delta_model_config.json` (`model.load_delta_model`, and
 `model.numpy_delta_fn(model)(x, ln_sigma, catalog)`), `evaluation/`
 (`comparison.txt/json`, calibration figures with `_none` / `_network`,
 `learned_delta.png`). The bijector is frozen, so training uses precomputed `y`,
-`C` per pair (no ODE): it is cheap and has to be redone when the bijector changes.
+`C` per entry (no ODE): it is cheap and has to be redone when the bijector changes.
+The batches are flat arrays of entries plus the star each belongs to, and every
+per-star quantity is a segmented reduction (`unsorted_segment_sum` in TF,
+`np.add.reduceat` in the numpy diagnostics): no loop over observations, no ragged
+tensor, blocks cut on star boundaries so a star is never split across batches.
 
 Design choices to know about: **one row per star per catalog** (the first in the
-table: no many-to-many pairs from repeated spectra, unlike the bijector
-training); the train/validation split is **by star** (id hash, 1/8); pairs are a
-composite likelihood (the three pairs of a triple are correlated; a per-star
-likelihood would be the principled upgrade); `ln_δ` has a smooth floor at
+table: no many-to-many rows from repeated spectra, unlike the bijector training);
+the train/validation split is **by star** (id hash, 1/8) and is the validation set
+the likelihood is evaluated on, so the NLL per star is comparable across catalog
+sets; the per-catalog excess table comes from the stars in exactly two catalogs
+(`delta.diagnostics.three_cornered_hat`), where the residual variance is exactly
+`S_1 + S_2` -- with `K ≥ 3` the entry residual carries `−A⁻¹` and a naive median of
+it recovers about a third of the true extra variance; `ln_δ` has a smooth floor at
 σ = 0.003 and a weak Gaussian prior (center σ = 0.03, width 3 in ln-variance,
-weight 0.01 per sample). The pair difference constrains only `Σ_j + Σ_k`; the
-split between catalogs is identified through triangles of catalogs and the
-likelihood is very flat along it (needs ~1,000 steps at high lr to converge in
-the synthetic test), so poorly connected catalogs (VMP, PIGS, SLAM, MDC) are
-prior-dominated. Tests: `tests/test_delta.py` (likelihood vs scipy incl. masking,
-recovery of known extra variances, diagnostics on synthetic pairs).
+weight 0.01 per entry). A star in two catalogs constrains only `Σ_j + Σ_k`; the
+split between catalogs is identified through stars in three or more catalogs and
+through the smooth dependence of `ln_δ` on `(x, ln σ_x, catalog)`, and the
+likelihood is very flat along it (needs ~1,000 steps at high lr to converge in the
+synthetic test), so poorly connected catalogs (VMP, PIGS, SLAM, MDC) are
+prior-dominated. Tests: `tests/test_delta.py` (K = 2 against scipy exactly; K = 4
+against the difference-space density; recovery of known extra variances;
+diagnostics incl. masking; block coverage).
 
 **Findings on `models/turnover50_8ep` (16 catalogs, 1.43 M pairs, rough)** —
 before any delta (`diagnostics/summary.txt`):
@@ -1411,13 +1437,179 @@ led to lowering the [α/Fe] floor from 0.05 to 0.02 (§9.8); the numbers above a
 
 Prerequisites and API: a run needs its transform cache (`astrotune-apply`), so the
 19-catalog runs have to be applied first (only `models/turnover50_8ep` has been). In
-code: `delta.pairs.get_pair_table`, `delta.diagnostics.diagnose` / `pair_stats`
+code: `delta.stars.get_star_table`, `delta.diagnostics.diagnose` / `entry_stats`
 (accept an optional `delta_fn(x, ln_sigma, catalog) -> ln_delta`, so the same
 calibration measures can be computed with any covariance model),
-`delta.train.fit` / `run`, `delta.model.pair_nll`. To use a learned delta in the merge
+`delta.train.fit` / `run`, `delta.model.star_nll`. To use a learned delta in the merge
 add `diag(exp(ln_delta))` to each entry's covariance in `apply.transform_catalog`
 (only for parameters the catalog measures) and drop the 0.03 floor in `merge.py`;
 the model's `ln σ_x` input is `log(sigma_x)`, set to 0 where a parameter is not measured.
+
+#### Star likelihood instead of the pair likelihood (2026-11-17)
+
+Everything above was written for a pair likelihood (one row per catalog pair, the
+difference of the two harmonized values). 63.6 % of those rows come from stars in
+three or more catalogs, so the same measurement was counted several times and the
+"pairs" were not independent. The delta model is now fitted to the **star**
+likelihood: each star has one latent true value `y` with a flat prior, a catalog `a`
+reports `x_a = y + ε_a` with `Cov = S_a + ΔC_a(x_a, ln σ_a)`, and `y` is integrated
+out analytically, giving one NLL term per star (see `delta/model.py:star_nll`). For
+`K = 2` this is algebraically the old pair likelihood; for `K > 2` it is not, and it
+is the correct one. The three-cornered-hat estimator for the excess covariance also
+had to change: the naive per-entry `Σ_a (S_a − A⁻¹)` over the star's own entries is
+biased low when `K ≥ 3`, so `delta.diagnostics.three_cornered_hat` uses only the
+two-entry stars, where the estimator is unbiased.
+
+On `models/latent_adam_lr2e4_20cat` (20 catalogs, 2 248 647 stars, 5 392 548
+entries), validation NLL per star: none −2.186, floor 0.03 −3.765, constant per
+catalog −4.782, **network −5.646**. The learned σ_δ is at the 0.003 floor for
+APOGEE, ASCAP and GALAH (their errors needed shrinking, which an additive term
+cannot do) and largest for the narrow-line catalogs (DESI Nagaraj, MDC, BOSSNet).
+Calibration improves but is not solved: median PIT 0.324 (0.5 is calibrated) and
+per-catalog scale ratios 0.76–1.00 mean the Gaussian excess still buys tail
+coverage by over-widening the core; `P(sf < 1e-3)` falls from 15.8 % to 0.67 %
+(nominal 0.1 %). The heavy-tailed likelihood is still the next step.
+
+#### Where the variance is added (`astrotune-delta-kiel`)
+
+`delta/kiel.py` turns the fitted model into pictures: for each catalog a 4×4 page,
+a column per parameter and a row per [Fe/H] bin ([Fe/H] descending downwards), with
+the median ΔC in (Teff, logg) bins inside each panel, on a log colour scale whose
+bottom is the model's floor. The sample is the star table by default (`--all` uses
+every prepared row, encoded as in training; the network just extrapolates, so that
+is only useful in comparison). On the 20-catalog run this says: APOGEE asks for
+nothing over half its diagram (49 % of bins within a factor of three of the floor)
+and asks only on the giant branch; CLAM sits at 1.6e-2 with hot spots at the cool
+metal-poor edge; Pristine asks for the most (median 5.4e-2); nobody asks for
+anything in APOGEE [α/Fe]. SDSS-V (MDw Cannon) cannot be drawn: it measures no logg
+at all.
+
+#### Groups and a shared systematic (2026-11-18)
+
+Some catalogs are not independent: APOGEE DR17 and the SDSS-V ASPCAP release run the
+*same* parameter pipeline (ASPCAP) on the *same* spectra, so their estimates share
+their mistakes. The evidence is in the pair χ² of the 20-catalog run: APOGEE×SDSS-V
+(ASPCAP) sits at χ²/ν = 0.36 overall but **0.04 in [α/Fe]** (they agree far too well)
+while the same pair is 1.18 in [Fe/H]; APOGEE×SDSS-V (APOGEENet) — same spectra,
+different pipeline — is a healthy 0.91. No per-catalog rescaling can represent that:
+inflating either covariance inflates their *difference* too, and the difference is
+the thing that is too small.
+
+So the model now has a **group hierarchy**. `registry.GROUPS` maps a pipeline to its
+member keys (currently only `{"aspcap": ("apogee_dr17", "sdssv_aspcap")}`), and
+`registry.group_of` / `group_index` / `group_labels` / `group_multiplicity` translate
+catalogs to groups. Two consequences:
+
+1. The model's category is the **group**, not the catalog: one `ln_scale`, one
+   `ln_add` and one ν per group, and a group's catalogs share their correction. This
+   is not cosmetic — it is what makes the model identifiable. For a pair, the fit has
+   two observables (the within-group difference, which measures `S_1 + S_2`, and the
+   comparison with other groups, which measures `(S_1⁻¹ + S_2⁻¹)⁻¹ + G`), and with the
+   two covariances and G all free there is a flat direction trading a larger shared
+   term against a more unequal split. Sharing the correction fixes the split by
+   construction.
+2. Each group also gets a **shared covariance** `G_g` (diagonal, per parameter), as a
+   latent value between the star and its entries: `t_g = z + u_g`,
+   `u_g ~ N(0, G_g)`, `y_a = t_g + ε_a`. Entries of one group then agree more than
+   their quoted errors say, and disagree with other groups more. `star_nll` implements
+   it as the same marginal applied twice (within group, then across groups; Woodbury
+   gives `V_g = A_g⁻¹ + G_g`), so `shared = 0` reduces it to the flat likelihood
+   exactly — that identity is a unit test. A group of one catalog has `G_g ≡ 0` by
+   construction (a mask, not a small number), so the 19 singleton groups are
+   unaffected.
+
+Bookkeeping: `delta/stars.py` derives `g` from `c` on load (`with_groups`), so an
+existing `star_table.npz` stays valid; `delta/train.py` saves `n_cat` = the number of
+**groups** plus `multiplicity` and `group_labels` in `delta_model_config.json` and
+writes `evaluation/shared.txt` next to `nu.txt`; `delta/kiel.py` and
+`delta/uncertainties.py` plot the **total** σ (`S_a + G_g`), because that is the error
+the merge must use. Two covariances have to be kept apart everywhere:
+`S_a` (independent, what the within-group difference measures) and
+`S_a + G_{g(a)}` (what to use when comparing with anything outside the group).
+`notes/error_calibration_model.tex` derives all of it.
+
+**Results on `models/latent_adam_lr2e4_20cat` (20 catalogs -> 19 groups).** Validation
+NLL per star: none −2.186, floor 0.03 −3.765, constant add −5.449, constant
+scale+add −5.820, **network −6.489** (was −6.430 ungrouped: the hierarchy buys 0.06
+per star, i.e. the APOGEE×ASPCAP rows were being fitted as if independent). The
+pooled scale ratios move to 1.02 / 1.06 / 1.17 / 1.00 for
+Teff / [Fe/H] / logg / [α/Fe] (ungrouped: 1.07 / 1.10 / 1.15 / 1.13) and the median
+PIT to 0.492 (0.507). The [α/Fe] column is the point: with the group in place the
+pooled [α/Fe] ratio returns to 1.00, and the ASPCAP [α/Fe] error is reported as
+σ = 0.014 dex of which 0.0139 *is the shared part* -- two ASPCAP catalogs essentially
+cannot be combined on that axis. The fitted shared systematic of the group
+(`evaluation/shared.txt`) is σ = 0.016 (Teff, harmonized units), 0.010 ([Fe/H]),
+0.005 (logg), 0.014 dex ([α/Fe]); every other group is exactly 0. In absolute terms
+the ASPCAP [α/Fe] error goes from a quoted median 0.0248 to 0.0146 (the quoted-vs-
+calibrated figure in `uncertainty_distribution/`). Pair χ² over 2 M validation
+pairs: median χ²/ν 1.04 -> 0.88 and `P(null sf < 1e-3)` 11.8 % -> 0.28 % (nominal
+0.1 %), with the shared term included in the cross-group pairs.
+
+One diagnostic caveat: `entry_stats` adds `G` to the entry covariance, but `G`
+cancels from a star's *own* combined value when all its entries are in one group, so
+the **per-catalog** rows of a grouped catalog read too low (APOGEE [α/Fe] 0.45). The
+pooled numbers are dominated by multi-group stars and are fine; `pair_chi2` treats
+the distinction exactly.
+
+#### Two sigmas, and the correction in the catalogs' own units (2026-11-19)
+
+The floors and the per-catalog rescalings (`ERROR_FLOORS`, `UNC_SCALES`) are part of
+the *bijector's* likelihood -- `train_latent.py` weights every observation by
+`1/sigma_x^2` -- so they cannot be removed from `prep`. The delta model, by
+contrast, must not see our own floor: it should learn the calibration from what the
+catalog actually reported. Prepared tables therefore carry **two** uncertainties:
+
+| column | contents | reader |
+|---|---|---|
+| `sigma_x` | `hypot(UNC_SCALES * quoted, ERROR_FLOORS)` | the bijector (`train_latent`), and `apply` |
+| `sigma_x_raw` | the quoted sigma in our units, no rescale, no floor | the delta model |
+
+`prep.transforms.extract_table(..., param_unc_transf_raw=...)` builds the second
+column in the same pass as the first. `delta.stars.raw_sigma` reads it, and falls
+back to `prep.error_scale.quoted_sigma`, which inverts the rescale and the floor
+exactly (verified to 1e-6) -- so tables written before the column existed still work.
+
+With `sigma_raw` in hand the correction acts where the error was quoted. The delta
+model's two learned numbers are now in the **catalog's own units**:
+
+    S = J diag(v) J^T,   v_p = exp(ln_scale_p) * sigma_raw_p^2 + exp(ln_add_p)
+
+(`delta/covariance.py`), so `s = exp(ln_scale/2)` is "this catalog's quoted error is
+wrong by this factor" and `a = exp(ln_add/2)` is "this much is missing", both
+comparable across catalogs and parameters. `J` is the bijector's Jacobian at the
+entry's own parameters, now stored in the star table (16 floats per entry, in place
+of the harmonized `C`, which is reconstructed from it, so the file size is
+unchanged). It is recomputed when the star table is built (`apply.make_forward_and_jacobian`),
+so the transform cache is exactly what `apply` needs and nothing more. The group's
+shared systematic stays a *harmonized* diagonal added at the second level of the
+hierarchy (`V_g = A_g^-1 + G_g`); keeping it out of `S` is what makes that
+factorization exact.
+
+#### The iteration, and feeding sigma back
+
+Because the delta model's output depends only on the entry's own parameters and its
+catalog -- not on the bijector -- one fitted model yields a table of calibrated
+sigmas that any number of bijector retrainings can read:
+
+```
+bijector (sigma_x = scaled + floored) -> delta model (needs J)
+    -> sigma_cal = sqrt(exp(ln_scale) sigma_raw^2 + exp(ln_add))
+    -> astrotune-observations --sigma-source delta --delta-dir models/X
+    -> new bijector -> rebuild the star table (J changed) -> new delta model -> ...
+```
+
+`delta/feed.py:calibrated_sigma` writes `delta/calibrated_sigma/<key>.npz`, keyed by
+a checksum of the model's weights; `training_data.load_tables(sigma_source="delta")`
+substitutes it into the in-memory `sigma_x` *before* deduplication, leaving the
+prepared files untouched; `astrotune-apply --sigma-source delta` does the same and
+keeps its transform cache in a separate directory (`transform_cache_none_delta`).
+The star table does not depend on the sigma source (it always carries `sigma_raw`,
+the prepared `sig0` and `J`) but it *does* depend on the bijector, so it must be
+rebuilt after a bijector retrain.
+
+Remaining work is the driver, plus the two related decisions recorded in `TODO.md`:
+correlated entries in the merge (the `y`-solve still treats a catalog group as
+independent) and Student-t tails in the bijector training.
 
 ### 9.11 Catalog connectivity figure (`astrotune-catalog-graph`)
 

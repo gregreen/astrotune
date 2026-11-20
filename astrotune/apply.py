@@ -92,14 +92,44 @@ def make_transform(bij):
         ]
     )
     def transform(xx, sigma_xx, cc):
-        with tf.GradientTape(watch_accessed_variables=False, persistent=True) as g:
-            g.watch(xx)
-            yy = bij._forward(xx, c=cc)
-        dyy_dxx = g.batch_jacobian(yy, xx, experimental_use_pfor=False)
+        yy, dyy_dxx = _forward_and_jacobian(bij, xx, cc)
         cov_yy = tf.einsum("bik,bk,bjk->bij", dyy_dxx, sigma_xx**2, dyy_dxx)
         return yy, cov_yy
 
     return transform
+
+
+def _forward_and_jacobian(bij, xx, cc):
+    """``bij._forward`` and its Jacobian ``dy_i/dx_j`` for a batch."""
+    import tensorflow as tf
+
+    with tf.GradientTape(watch_accessed_variables=False) as g:
+        g.watch(xx)
+        yy = bij._forward(xx, c=cc)
+    return yy, g.batch_jacobian(yy, xx, experimental_use_pfor=False)
+
+
+def make_forward_and_jacobian(bij):
+    """``f(x, c) -> (y, J)``, traced.
+
+    The delta model needs ``J`` to push the catalogs' own covariances into the
+    harmonized space (``S = J diag(v) J^T``); it is the same Jacobian ``apply``
+    uses, so it is computed by the same code.
+    """
+    import tensorflow as tf
+
+    n_params = config.N_PARAMS
+
+    @tf.function(
+        input_signature=[
+            tf.TensorSpec([None, n_params]),
+            tf.TensorSpec([None], dtype=tf.int32),
+        ]
+    )
+    def forward_and_jacobian(xx, cc):
+        return _forward_and_jacobian(bij, xx, cc)
+
+    return forward_and_jacobian
 
 
 def padded_inputs(table: Table):
@@ -404,8 +434,17 @@ def apply_run(
     batch_size: int = 4096,
     only: Optional[Sequence[str]] = None,
     reuse_transform: bool = False,
+    sigma_source: str = "floored",
+    delta_dir: Optional[Path] = None,
 ) -> Dict[str, Path]:
-    """Transform and merge all catalogs of a trained run; return the output paths."""
+    """Transform and merge all catalogs of a trained run; return the output paths.
+
+    ``sigma_source="delta"`` replaces each catalog's ``sigma_x`` by the calibrated
+    sigma of a trained delta model (``delta_dir``) before transforming, so the
+    harmonized covariances are the ones the delta model considers right, not the ones
+    the prepared tables carry. That is how a bijector trained on calibrated errors is
+    applied consistently.
+    """
     from .model import load_bijector
     from .model.io import enable_memory_growth
     from .training_data import load_tables
@@ -424,8 +463,11 @@ def apply_run(
         raise RuntimeError("The registry order no longer matches the run's catalog list.")
 
     log.info("Applying %s to %d catalogs", run_dir, len(keys))
-    tables = load_tables(keys, dedupe=dedupe)
-    cache_dir = out_dir / f"transform_cache_{dedupe}"
+    tables = load_tables(keys, dedupe=dedupe, sigma_source=sigma_source,
+                         delta_dir=delta_dir)
+    # A different sigma is a different covariance: keep the two caches apart.
+    tag = f"transform_cache_{dedupe}" + ("" if sigma_source == "floored" else f"_{sigma_source}")
+    cache_dir = out_dir / tag
     transform = None
 
     estimates = []
@@ -462,6 +504,8 @@ def apply_run(
         columns=COLUMN_DOC,
         merge=dict(
             eps_err=eps_err, chi2_max=chi2_max, n_iter=n_iter, dedupe=dedupe,
+            sigma_source=sigma_source,
+            delta_dir=str(delta_dir) if delta_dir else "",
             param_lims=[list(l) for l in PARAM_LIMS],
             rejected_history=merged.rejected_history, **counts,
         ),
@@ -496,12 +540,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "only valid for the same model and --dedupe")
     parser.add_argument("--only", nargs="+", metavar="KEY", default=None,
                         help="only these catalogs (for quick tests)")
+    parser.add_argument("--sigma-source", choices=("floored", "delta"), default="floored",
+                        help="sigma_x to propagate: the prepared (scaled and floored) column, "
+                        "or the calibrated sigma of a trained delta model (needs --delta-dir)")
+    parser.add_argument("--delta-dir", type=Path, default=None,
+                        help="run directory holding delta/delta_model.* for --sigma-source delta")
     args = parser.parse_args(argv)
+    if args.sigma_source == "delta" and args.delta_dir is None:
+        parser.error("--sigma-source delta needs --delta-dir")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     apply_run(
         args.run_dir, args.out_dir, dedupe=args.dedupe, eps_err=args.eps_err,
         chi2_max=args.chi2_max, n_iter=args.n_iter, batch_size=args.batch_size, only=args.only,
-        reuse_transform=args.reuse_transform,
+        reuse_transform=args.reuse_transform, sigma_source=args.sigma_source,
+        delta_dir=args.delta_dir,
     )
     return 0
 

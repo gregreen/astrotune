@@ -28,6 +28,12 @@ those that are too faint for the graph.
 
 The counts (rows, unique stars, shared stars) are written to
 ``catalog_overlaps.json`` and are independent of any trained model.
+
+*PageRank.* The same counts give the PageRank of the overlap network: an undirected
+graph on the catalogs, one edge for every pair sharing at least one star, weighted by
+the number of shared stars. The ranking is computed for the whole network and for the
+catalogs that measure [alpha/Fe], and those that measure log g; :func:`pagerank_table`
+writes it to ``catalog_pagerank.ecsv`` next to the figures.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
+from astropy.table import Table
 
 if not os.environ.get("DISPLAY"):  # headless by default
     import matplotlib
@@ -159,6 +166,99 @@ def compute_overlaps(keys: Optional[Sequence[str]] = None) -> dict:
         keys=keys, labels=[registry.get_spec(k).label for k in keys], rows=rows,
         unique=[int(len(a)) for a in ids], shared=shared.tolist(), n_measured=measured,
     )
+
+
+# --- PageRank -------------------------------------------------------------------
+#: Damping of the PageRank walk (the usual 0.85).
+PAGERANK_DAMPING = 0.85
+
+#: The subsets that get a ranking: ``(parameter, title)``, ``None`` = every catalog. A
+#: catalog belongs to a subset when at least one of its stars measures the parameter.
+PAGERANK_SUBSETS: Tuple[Tuple[Optional[str], str], ...] = (
+    (None, "all catalogs"),
+    ("alpha", "catalogs with [alpha/Fe]"),
+    ("logg", "catalogs with log g"),
+)
+
+
+def pagerank(weights: np.ndarray, damping: float = PAGERANK_DAMPING, tol: float = 1e-14,
+             max_iter: int = 500) -> np.ndarray:
+    """PageRank of a symmetric, non-negative weight matrix (a weighted undirected graph).
+
+    Standard power iteration: ``p <- damping * P p + (damping * p[dangling] + 1 - damp) / n``
+    with ``P[j, i] = w[i, j] / sum_j w[i, j]`` the walk transition matrix. Isolated
+    nodes contribute only through the teleport term.
+    """
+    w = np.array(weights, dtype=float)
+    np.fill_diagonal(w, 0.0)
+    n = len(w)
+    if n == 0:
+        return np.zeros(0)
+    out = w.sum(axis=1)
+    dangling = out <= 0
+    safe = np.where(dangling, 1.0, out)
+    P = (w / safe[:, None]).T  # column-stochastic: column i = transitions out of node i
+    p = np.full(n, 1.0 / n)
+    for _ in range(max_iter):
+        teleport = damping * p[dangling].sum() + (1.0 - damping)
+        nxt = damping * (P @ p) + teleport / n
+        if np.abs(nxt - p).sum() < tol:
+            p = nxt
+            break
+        p = nxt
+    return p / p.sum()
+
+
+def compute_pagerank(data: dict, damping: float = PAGERANK_DAMPING) -> Dict[str, dict]:
+    """PageRank of the overlap network for every subset in :data:`PAGERANK_SUBSETS`.
+
+    Keyed by ``"all"``, ``"alpha"`` and ``"logg"``; each value holds the catalog keys,
+    their scores (summing to one over the subset) and the number of edges of the subgraph
+    the subset induces (every pair with at least one shared star).
+    """
+    keys, shared = data["keys"], np.asarray(data["shared"], dtype=float)
+    out = {}
+    for param, _ in PAGERANK_SUBSETS:
+        idx = list(range(len(keys)))
+        if param is not None:
+            j = PARAM_INDEX[param]
+            idx = [k for k in idx if data["n_measured"][k][j] > 0]
+        sub = shared[np.ix_(idx, idx)]
+        out[param or "all"] = dict(
+            keys=[keys[k] for k in idx], score=pagerank(sub, damping),
+            n_edges=int(np.triu(sub > 0, 1).sum()),
+        )
+    return out
+
+
+def pagerank_table(data: dict, damping: float = PAGERANK_DAMPING) -> Table:
+    """One row per catalog, named by its key, with its score and rank in each subset.
+
+    A subset that excludes a catalog (it measures the parameter for no star) leaves that
+    catalog's score and rank masked. Rows are ordered by the score in the full network.
+    """
+    keys = list(data["keys"])
+    ranks = compute_pagerank(data, damping)
+    totality = dict(zip(ranks["all"]["keys"], ranks["all"]["score"]))
+    order = np.argsort([-totality[k] for k in keys])
+    cols = {}
+    for name, res in ranks.items():
+        score = dict(zip(res["keys"], res["score"]))
+        by_score = np.argsort(-res["score"])
+        rank = {res["keys"][i]: r for r, i in enumerate(by_score, start=1)}
+        s = np.array([score.get(k, np.nan) for k in keys])
+        mask = ~np.isfinite(s)
+        cols[f"pagerank_{name}"] = np.ma.masked_array(s, mask)[order]
+        cols[f"rank_{name}"] = np.ma.masked_array(
+            np.array([rank.get(k, 0) for k in keys], dtype=int), mask)[order]
+    table = Table([np.array([keys[i] for i in order], dtype=str)] + list(cols.values()),
+                  names=["catalog"] + list(cols))
+    table.meta = dict(
+        damping=damping,
+        edges="every pair of catalogs sharing at least one star; weight = stars shared (Gaia DR3 id)",
+        subsets="; ".join(f"{param or 'all'}: {title}" for param, title in PAGERANK_SUBSETS),
+    )
+    return table
 
 
 # --- Layout ---------------------------------------------------------------------
@@ -806,7 +906,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     info = plot_graph(data, args.out_dir / f"catalog_graph_{args.layout}", args.min_shared, args.layout,
                       args.top_k, args.restarts, args.seed, curved=not args.straight_edges)
     plot_matrix(data, args.out_dir / "catalog_matrix")
+    table_path = args.out_dir / "catalog_pagerank.ecsv"
+    pagerank_table(data).write(table_path, format="ascii.ecsv", overwrite=True)
     print(f"{info['n_edges']} edges drawn, {info['crossings']} crossings (weighted {info['weighted_crossings']:.1f})")
+    print(f"PageRank of {len(data['keys'])} catalogs written to {table_path}")
     return 0
 
 
