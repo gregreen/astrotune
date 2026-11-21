@@ -436,6 +436,8 @@ def apply_run(
     reuse_transform: bool = False,
     sigma_source: str = "floored",
     delta_dir: Optional[Path] = None,
+    ode_rtol: Optional[float] = None,
+    ode_atol: Optional[float] = None,
 ) -> Dict[str, Path]:
     """Transform and merge all catalogs of a trained run; return the output paths.
 
@@ -444,6 +446,12 @@ def apply_run(
     harmonized covariances are the ones the delta model considers right, not the ones
     the prepared tables carry. That is how a bijector trained on calibrated errors is
     applied consistently.
+
+    ``ode_rtol``/``ode_atol`` override the run's training tolerance for this pass.
+    Worth tightening for a product meant to be trusted: the solver controls its step
+    against a batch-RMS error, so one star's own error can be up to
+    ``sqrt(batch) * tol`` regardless of how easy that star is (see
+    :func:`astrotune.model.io.load_bijector`).``None`` keeps the trained values.
     """
     from .model import load_bijector
     from .model.io import enable_memory_growth
@@ -475,7 +483,9 @@ def apply_run(
         e = load_cached(cache_dir, idx, np.asarray(t["id"]), t) if reuse_transform else None
         if e is None:
             if transform is None:
-                transform = make_transform(load_bijector(run_dir))
+                transform = make_transform(
+                    load_bijector(run_dir, rtol=ode_rtol, atol=ode_atol)
+                )
             e = transform_catalog(transform, t, idx, batch_size, desc=key)
             save_cached(cache_dir, e, t)
         else:
@@ -508,6 +518,19 @@ def apply_run(
             delta_dir=str(delta_dir) if delta_dir else "",
             param_lims=[list(l) for l in PARAM_LIMS],
             rejected_history=merged.rejected_history, **counts,
+        ),
+        transform=dict(
+            # What produced the harmonized values: the solver's tolerances (the run's
+            # own unless overridden here) and the batch the ODE was fed, because the
+            # per-star accuracy is ~sqrt(batch) * tol.
+            ode_rtol=ode_rtol if ode_rtol is not None else cfg.get("config", {}).get("ode_rtol"),
+            ode_atol=ode_atol if ode_atol is not None else cfg.get("config", {}).get("ode_atol"),
+            overridden=ode_rtol is not None or ode_atol is not None,
+            batch_size=batch_size,
+            batch_effect=(
+                "per-star error ~ sqrt(batch_size) * ode_tol; tighten the "
+                "tolerance rather than the batch"
+            ),
         ),
         training=cfg,
     )
@@ -545,6 +568,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "or the calibrated sigma of a trained delta model (needs --delta-dir)")
     parser.add_argument("--delta-dir", type=Path, default=None,
                         help="run directory holding delta/delta_model.* for --sigma-source delta")
+    parser.add_argument(
+        "--ode-rtol", type=float, default=None,
+        help="relative tolerance of the ODE solve; default: the run's training value "
+        "(ode_rtol). The solver's step size is controlled against a batch RMS, so an "
+        "individual star can be off by up to sqrt(batch) * tol; 1e-6 costs about 4x "
+        "the time of 1e-5 and buys 10x the accuracy",
+    )
+    parser.add_argument(
+        "--ode-atol", type=float, default=None,
+        help="absolute tolerance of the ODE solve; default: the run's training value",
+    )
     args = parser.parse_args(argv)
     if args.sigma_source == "delta" and args.delta_dir is None:
         parser.error("--sigma-source delta needs --delta-dir")
@@ -553,7 +587,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.run_dir, args.out_dir, dedupe=args.dedupe, eps_err=args.eps_err,
         chi2_max=args.chi2_max, n_iter=args.n_iter, batch_size=args.batch_size, only=args.only,
         reuse_transform=args.reuse_transform, sigma_source=args.sigma_source,
-        delta_dir=args.delta_dir,
+        delta_dir=args.delta_dir, ode_rtol=args.ode_rtol, ode_atol=args.ode_atol,
     )
     return 0
 

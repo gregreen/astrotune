@@ -22,12 +22,22 @@ def enable_memory_growth() -> None:
             pass
 
 
-def load_bijector(run_dir) -> ODEBijector:
+def load_bijector(run_dir, rtol=None, atol=None) -> ODEBijector:
     """Restore the bijector from the latest checkpoint in ``run_dir``.
 
     Unlike the exported SavedModel, which only exposes ``to_harmonized`` and
     ``from_harmonized``, this returns the full :class:`ODEBijector`
     (``return_path``, ``forward_with_s``, ...).
+
+    ``rtol``/``atol`` override the run's training tolerance (``ode_rtol``,
+    ``ode_atol`` in its ``config.json``). They matter for the *products*: the
+    solver controls its step size against an RMS of the scaled error over the
+    whole batch, so an individual star's own error can be up to
+    ``sqrt(batch) * tol`` -- 2.6e-3 at a batch of 65,536 and tol 1e-5, whatever
+    the star itself is doing. Tightening the tolerance is the cheap way to
+    recover that: measured on this model, each decade costs about 4x the time
+    (1e-5 -> 1e-6 goes from 3.2 s to 12.8 s per 4,096 rows), where a smaller
+    batch would cost linearly in the number of calls and only buy sqrt(N).
     """
     run_dir = Path(run_dir)
     with open(run_dir / "config.json") as f:
@@ -38,8 +48,8 @@ def load_bijector(run_dir) -> ODEBijector:
         n_cond=len(registry.run_keys(run_dir)),
         hidden_size=cfg["hidden_size"],
         n_hidden=cfg["n_hidden"],
-        rtol=cfg["ode_rtol"],
-        atol=cfg["ode_atol"],
+        rtol=cfg["ode_rtol"] if rtol is None else rtol,
+        atol=cfg["ode_atol"] if atol is None else atol,
         vector_network_kwargs=dict(use_residual=True, use_film=True, use_layer_norm=True),
     )
     # The checkpoint directory is scanned rather than read through
