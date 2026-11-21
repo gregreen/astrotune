@@ -92,6 +92,7 @@ from tensorflow import keras
 from tqdm.auto import tqdm
 
 from . import config, registry
+from . import profile
 from .evaluate import (
     PARAM_SHORT,
     evaluate_bijector,
@@ -101,7 +102,7 @@ from .evaluate import (
 )
 from .model import ODEBijector
 from .model.io import enable_memory_growth
-from .train import arcsinh_of_exp
+from .profile import DATA_TERMS, MISSING
 from .training_data import load_observations, read_attrs
 from .training_plots import (
     catalog_colors,
@@ -111,12 +112,6 @@ from .training_plots import (
 )
 
 log = logging.getLogger(__name__)
-
-#: ``sigma_x`` above this marks a parameter that the catalog does not measure
-MISSING = 1e6
-
-#: The data terms :class:`LatentTrainConfig.data_term` accepts
-DATA_TERMS = ("student_t", "softened")
 
 #: Penalty metrics drawn by the progress figure
 LATENT_PENALTIES = (
@@ -916,134 +911,59 @@ class LatentTrainer:
     def _loss_inputs(self, x, xs, x_pred, c):
         """``(chi2, d, nu)`` of every observation of the batch.
 
-        ``chi2`` is the squared Mahalanobis residual ``sum_p (x - x_pred)^2 /
-        sigma^2``; an unmeasured parameter has ``sigma = 1e9`` and contributes
-        nothing. ``d`` is the number of parameters the catalog *does* measure,
-        which is the dimension of the Student's t: the marginal of a
-        multivariate t over the axes that are known exactly is a t of the same
-        ``nu`` and the remaining dimensions, so those axes leave both the
-        quadratic form and the exponent. ``nu`` is the catalog's degrees of
-        freedom.
+        See :func:`astrotune.profile.loss_inputs`; this is the trainer's thin wrapper,
+        which supplies the per-catalog degrees of freedom it resolved at startup.
         """
-        chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
-        d_obs = tf.reduce_sum(tf.cast(xs < MISSING, tf.float32), axis=1)
-        return chi2_obs, d_obs, tf.gather(self.nu_cat, c)
+        return profile.loss_inputs(x, xs, x_pred, c, self.nu_cat)
 
     @tf.autograph.experimental.do_not_convert
     def _data_term(self, chi2_obs, d_obs, nu_obs):
         """The per-observation data term the loss averages.
 
-        ``(nu + d) ln(1 + chi2 / nu)`` for the Student's t: twice the exact
-        deviance, chosen so that ``nu -> inf`` gives ``chi2`` itself and the
-        penalties keep their calibration. Its curvature at ``chi2 = nu`` is half
-        what it is at zero, against 0.71 for the softened form, so the t turns
-        over more sharply; far beyond it both grow like ``ln chi2``.
-
-        ``S * arcsinh(chi2 / S)`` for the softened chi^2, unchanged.
+        See :func:`astrotune.profile.data_term`; ``cfg.data_term`` picks the Student's
+        t (default) or the softened chi^2.
         """
-        cfg = self.cfg
-        if cfg.data_term == "student_t":
-            return (nu_obs + d_obs) * tf.math.log1p(chi2_obs / nu_obs)
-        return cfg.chi2_turnover * arcsinh_of_exp(
-            tf.math.log(chi2_obs + 1e-30) - tf.math.log(cfg.chi2_turnover)
+        return profile.data_term(
+            chi2_obs, d_obs, nu_obs,
+            data_term=self.cfg.data_term, chi2_turnover=self.cfg.chi2_turnover,
         )
 
     @tf.autograph.experimental.do_not_convert
     def _data_weight(self, chi2_obs, d_obs, nu_obs):
-        """``d rho / d chi2``: the curvature the Gauss-Newton step weights by.
+        """``d rho / d chi2``, the curvature the Gauss-Newton step weights by.
 
-        For the t that is ``(nu + d) / (nu + chi2)``, which is the weight derived
-        in ``notes/gauss_newton_with_students_t.tex``. Freezing it at the current
-        ``y`` within a step -- which is what this being a function of the batch's
-        already-computed ``chi2_obs`` means -- is what keeps the normal matrix
-        positive semi-definite: the exact Hessian of the t carries a subtracted
-        rank-one term that turns the system indefinite beyond ``chi2 = nu``, and
-        a step off an indefinite matrix overshoots the mode.
-
-        For the softened chi^2 it is ``1 / sqrt(1 + (chi2 / S)^2)``.
+        See :func:`astrotune.profile.data_weight`.
         """
-        cfg = self.cfg
-        if cfg.data_term == "student_t":
-            return (nu_obs + d_obs) / (nu_obs + chi2_obs)
-        return 1.0 / tf.sqrt(1.0 + (chi2_obs / cfg.chi2_turnover) ** 2)
+        return profile.data_weight(
+            chi2_obs, d_obs, nu_obs,
+            data_term=self.cfg.data_term, chi2_turnover=self.cfg.chi2_turnover,
+        )
 
     @tf.autograph.experimental.do_not_convert
     def _normal_equations(self, x, xs, x_pred, jac, weight, star):
         """Per-star ``(A, b)`` of the Gauss-Newton step in ``y``.
 
-        With ``C = diag(sigma^2)`` diagonal, the normal equations of one
-        observation are ``J^T W J`` and ``J^T W (x - x_pred)``, ``W =
-        w / sigma^2`` elementwise, where ``w`` is the curvature of the data term
-        the loss actually uses (:meth:`_data_weight`), so the step is the exact
-        minimiser of that loss and not merely of a quadratic stand-in. The weight
-        is taken as an argument rather than recomputed here so that the loss and
-        the step cannot drift apart.
-
-        Returns the summed matrices of shape ``(n_star, n_dim, n_dim)`` and
-        vectors of shape ``(n_star, n_dim)``, and the ``tf.unique`` of the star
-        index.
+        See :func:`astrotune.profile.normal_equations`; the merge calls the same
+        function, so "the merged ``y``" and "the trained ``y``" are one estimator.
         """
-        weight = weight[:, None] / xs**2
-        dx = x - x_pred
-        A = tf.einsum("npa,np,npb->nab", jac, weight, jac)
-        b = tf.einsum("npa,np,np->na", jac, weight, dx)
-        uniq, inv = tf.unique(star)
-        n = tf.size(uniq)
-        return (
-            tf.math.unsorted_segment_sum(A, inv, n),
-            tf.math.unsorted_segment_sum(b, inv, n),
-            uniq,
-        )
+        return profile.normal_equations(x, xs, x_pred, jac, weight, star)
 
     @tf.autograph.experimental.do_not_convert
     def _solve_y(self, A, b, return_scale=False):
-        """Solve the per-star normal equations, with a ridge for flat directions.
+        """Solve the per-star normal equations, then apply the trust region.
 
-        A parameter that none of a star's catalogs measures has ``sigma = 1e9``,
-        so its row and column of ``A`` are ~1e-18 and the system is singular; the
-        ridge makes the step in that direction ~0 instead of undefined, which is
-        the same outcome the ``den > 1e-6`` test gives the gradient solver. It is
-        diagonal on purpose: an off-diagonal term would leak the other
-        components' steps into a direction they say nothing about. It also damps
-        the nearly-flat directions, where the full step is hundreds of sigma.
-
-        The result is then passed through the trust region, and the fraction of
-        the step that radii allowed is returned as well when ``return_scale``.
+        See :func:`astrotune.profile.solve`: the ridge handles the directions a star
+        says nothing about (``sigma = 1e9``), and the trust region caps how far one
+        star may move in one sweep. That cap is not decoration: a nearly singular
+        ``A`` admits steps of hundreds of sigma, the map then trains on the flung
+        value, and the two can push each other away -- ``latent_gn_5h`` went from
+        chi^2 4.1 to 105 in fifteen steps before it was added. The step is *scaled*,
+        never clipped component by component, so its direction survives.
         """
-        n_dim = tf.shape(b)[-1]
-        scale = tf.reduce_mean(tf.linalg.diag_part(A), axis=1)[:, None, None]
-        ridge = (self.cfg.y_ridge * scale + 1e-8) * tf.eye(n_dim, dtype=A.dtype)
-        step = tf.linalg.solve(A + ridge, b[:, :, None])[:, :, 0]
-        step, allowed = self._trust_region(step)
-        return (step, allowed) if return_scale else step
-
-    @tf.autograph.experimental.do_not_convert
-    def _trust_region(self, step):
-        """Scale whole steps down to the trust radius; returns ``(step, allowed)``.
-
-        A Gauss-Newton step is a full Newton step, and where a star's normal
-        matrix is nearly singular it can be arbitrarily large. A star flung like
-        that is a star whose `y` is being fitted against a map that has just
-        changed under it; the next sweep of the map then trains on the flung
-        value, and the two can push each other away over a few steps.
-        ``latent_gn_5h`` went from chi^2 4.1 to 105 in fifteen steps, which is too
-        large for one star to cause (the loss is a mean over 65k observations, and
-        both data terms cap a single star's contribution -- logarithmically for
-        the arcsinh softening, and at ``(nu + d) log(1 + chi^2/nu)`` for the t), but
-        not too large for a self-feeding ``y``-map loop.
-
-        So no star may move by more than ``y_trust_abs`` in any one parameter. The
-        step is *scaled*, never clipped component by component: every component
-        keeps its share, so the scaled step is still the exact minimiser of the
-        quadratic along that line, and the normal-equation solve is untouched in
-        the (overwhelmingly common) case where nothing binds.
-        """
-        cfg = self.cfg
-        if not cfg.y_trust_abs:
-            return step, tf.ones_like(step[:, 0])
-        biggest = tf.reduce_max(tf.abs(step), axis=1)
-        allowed = tf.minimum(1.0, cfg.y_trust_abs / tf.maximum(biggest, 1e-12))
-        return step * allowed[:, None], allowed
+        return profile.solve(
+            A, b, ridge=self.cfg.y_ridge, trust=self.cfg.y_trust_abs or 0.0,
+            return_scale=return_scale,
+        )
 
     def _fit_y_val(self, x, xs, c, star) -> tf.Tensor:
         """One Gauss-Newton sweep of the held-out stars' ``y``, kept between calls.

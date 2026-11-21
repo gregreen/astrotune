@@ -325,22 +325,23 @@ def test_build_star_table_groups_entries_by_star(tmp_path, monkeypatch):
     def fake_jac(bij):
         def f(xx, cc):
             n = int(len(xx))
-            return np.zeros((n, 4), "f4"), np.broadcast_to(
-                np.eye(4, dtype="f4"), (n, 4, 4)).copy()
+            # tag the harmonized value with the catalog index, as the real table would
+            # carry the catalog's own value there
+            y = np.repeat(np.asarray(cc, "f4")[:, None] + 1.0, 4, axis=1)
+            return y, np.broadcast_to(np.eye(4, dtype="f4"), (n, 4, 4)).copy()
 
         return f
 
-    def fake_cached(cache_dir, index, ids, table=None):
-        n = len(ids)
-        y = np.full((n, 4), index + 1.0, "f4")  # tagged with the catalog index
-        cov = np.broadcast_to(np.eye(4, dtype="f4"), (n, 4, 4)).copy()
-        return Estimates(index, ids, y, cov, np.ones((n, 4), bool))
-
     monkeypatch.setattr(td, "load_tables", fake_tables)
-    monkeypatch.setattr(ap, "load_cached", fake_cached)
     monkeypatch.setattr(ap, "make_forward_and_jacobian", fake_jac)
     # the real bijector loader needs a trained model; the fake ignores it
     monkeypatch.setattr("astrotune.model.load_bijector", lambda *a, **k: None)
+    # and the transform cache must not be consulted at all: the star table is a
+    # function of the prepared tables and the bijector (see _catalog_entries)
+    monkeypatch.setattr(
+        ap, "load_cached",
+        lambda *a, **k: pytest.fail("build_star_table must not read apply's cache"),
+    )
 
     stars, out_keys = st.build_star_table(tmp_path / "run", cache)
     assert tuple(out_keys) == tuple(keys)
