@@ -351,3 +351,27 @@ def test_build_star_table_groups_entries_by_star(tmp_path, monkeypatch):
     assert np.array_equal(stars["seg"], [0, 0, 0, 1, 1])
     assert np.array_equal(stars["c"], [0, 1, 2, 0, 2])  # star-major, catalog ascending
     assert np.allclose(stars["y"][:, 0], [1, 2, 3, 1, 3])  # rows follow their catalog
+
+
+def test_training_history_plot_survives_partial_histories(tmp_path):
+    """The three fits record different things; the figure must handle each."""
+    from astrotune.delta.train import plot_training_history
+
+    # a const arm: no nu, no shared term, no validation set
+    const = [dict(epoch=e, train_nll=1.0 / e, loss=1.0 / e, prior=0.0, l2=0.0,
+                  nu_prior=0.0, shared_prior=0.0, control=0.0, grad_norm=10.0 / e)
+             for e in range(1, 4)]
+    # a full arm: everything, including the per-group nu vector
+    net = [dict(epoch=e, train_nll=1.0 / e, val_nll=1.1 / e, loss=1.2 / e,
+                data=1.0 / e, prior=0.1 / e, l2=0.1 / e, nu_prior=0.01 / e,
+                shared_prior=0.001 / e, control=0.0001 / e, grad_norm=5.0 / e,
+                nu=[5.0 + e, 8.0 - e], nu_median=6.5, nu_min=5.0 + e,
+                nu_max=8.0 - e, shared_sigma_median=1e-3 / e,
+                shared_sigma_max=2e-3 / e)
+           for e in range(1, 4)]
+    path = plot_training_history({"const add": const, "network": net},
+                                 tmp_path / "history.png", title="test")
+    assert path.exists() and path.stat().st_size > 10000
+    # an empty history is not an error either (a fit that was skipped)
+    assert plot_training_history({}, tmp_path / "empty.png") == tmp_path / "empty.png"
+

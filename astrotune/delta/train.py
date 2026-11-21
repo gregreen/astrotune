@@ -176,39 +176,184 @@ def fit(model, stars, cfg: DeltaConfig, epochs: int, lr: float, val=None,
             shared_t = model.shared.variance() if n_group is not None else None
             nll, params = star_nll(batch, model, nu=nu, n_group=n_group, shared=shared_t)
             data = tf.reduce_mean(nll)
-            prior = cfg.prior_weight * prior_penalty(batch, params)
-            loss = data + tf.cast(prior, tf.float64) + tf.cast(cfg.l2_weights * l2_penalty(model), tf.float64)
+            # Every term is kept separately: the history below plots them, and a
+            # prior that has quietly taken over the fit is only visible that way.
+            prior = tf.cast(cfg.prior_weight * prior_penalty(batch, params), tf.float64)
+            l2 = tf.cast(cfg.l2_weights * l2_penalty(model), tf.float64)
+            loss = data + prior + l2
+            zero = tf.constant(0.0, tf.float64)
+            nu_prior = zero
             if getattr(model, "tail", None) is not None:
                 # One Gaussian prior per catalog on the unconstrained dof coordinate
-                loss += tf.cast(cfg.nu_prior_weight * model.tail.prior_penalty(
+                nu_prior = tf.cast(cfg.nu_prior_weight * model.tail.prior_penalty(
                     cfg.nu_prior_mean, cfg.nu_prior_sd), tf.float64)
+                loss += nu_prior
+            shared_prior = zero
             if getattr(model, "shared", None) is not None:
                 # ... and one that pulls each group's shared variance down to the floor
-                loss += tf.cast(cfg.shared_prior_weight * model.shared.prior_penalty(),
-                                tf.float64)
+                shared_prior = tf.cast(cfg.shared_prior_weight * model.shared.prior_penalty(),
+                                       tf.float64)
+                loss += shared_prior
+            control_term = zero
             if control is not None and cfg.control_weight:
                 # Away from the data the model is pulled to scale 1, add 0: the same
                 # prior, evaluated on points the likelihood never sees.
-                loss += tf.cast(cfg.control_weight * control_penalty(control, model), tf.float64)
+                control_term = tf.cast(cfg.control_weight * control_penalty(control, model),
+                                       tf.float64)
+                loss += control_term
         grads = tape.gradient(loss, variables)
+        # Before clipping: once clipped, every step's norm is capped and the trace
+        # stops saying anything about the fit.
+        grad_norm = tf.linalg.global_norm(grads)
         grads, _ = tf.clip_by_global_norm(grads, cfg.clip_norm)
         opt.apply_gradients(zip(grads, variables))
-        return data
+        return dict(
+            data=data, prior=prior, l2=l2, nu_prior=nu_prior,
+            shared_prior=shared_prior, control=control_term, loss=loss,
+            grad_norm=tf.cast(grad_norm, tf.float64),
+        )
 
     history = []
     for epoch in range(epochs):
         perm = rng.permutation(n_star)
-        losses = []
+        parts: dict = {}
         for idx, seg, n in tqdm(block_indices(stars, perm, cfg.batch_size),
                                 total=steps, desc=f"{desc} {epoch + 1}/{epochs}", leave=False):
-            losses.append(float(step(make_batch(stars, idx, seg))))
-        rec = dict(epoch=epoch + 1, train_nll=float(np.mean(losses)))
+            for key, value in step(make_batch(stars, idx, seg)).items():
+                parts.setdefault(key, []).append(float(value))
+        rec = dict(epoch=epoch + 1, train_nll=float(np.mean(parts["data"])))
+        rec.update({k: float(np.mean(v)) for k, v in parts.items() if k != "data"})
         if val is not None:
             rec["val_nll"] = mean_star_nll(val, model, max_stars=cfg.val_max_stars)
+        # The learned parameters at the end of the epoch: where the tail weights and
+        # the shared systematics have got to, which the losses alone do not show.
+        tail = getattr(model, "tail", None)
+        if tail is not None:
+            nu_v = np.asarray(tail().numpy(), dtype="f8").ravel()
+            if nu_v.size:
+                rec["nu_median"] = float(np.median(nu_v))
+                rec["nu_min"] = float(nu_v.min())
+                rec["nu_max"] = float(nu_v.max())
+                rec["nu"] = [float(x) for x in nu_v]
+        shared_obj = getattr(model, "shared", None)
+        if shared_obj is not None:
+            var = np.asarray(shared_obj.variance().numpy(), dtype="f8")
+            if var.size:
+                sig = np.sqrt(np.maximum(var, 0.0))
+                rec["shared_sigma_median"] = float(np.median(sig))
+                rec["shared_sigma_max"] = float(sig.max())
         history.append(rec)
-        log.info("%s epoch %d/%d: %s", desc, epoch + 1, epochs,
-                 ", ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "epoch"))
+        log.info(
+            "%s epoch %d/%d: data %.4f%s  loss %.4f  |grad| %.3g",
+            desc, epoch + 1, epochs, rec["train_nll"],
+            "" if val is None else f", val {rec['val_nll']:.4f}",
+            rec["loss"], rec["grad_norm"],
+        )
     return history
+
+
+def plot_training_history(histories: dict, path: Path, title: str = "") -> Path:
+    """What each fit did, epoch by epoch: the data term, every prior, and nu.
+
+    ``histories`` maps an arm name (``"const add"``, ``"const scale+add"``,
+    ``"network"``) to the list of records :func:`fit` returns. Six panels:
+
+    * the NLL per star against epoch, every arm, with its validation curve dashed;
+    * the loss components of the last arm -- the data term against each prior, which
+      is how a prior that has quietly taken over the fit becomes visible;
+    * the gradient norm before clipping, so a fit that has stalled shows up;
+    * every group's ``nu`` per epoch, with the median, because the tail weights are
+      learned but the losses barely move once they are near their prior;
+    * the shared systematic's sigma per epoch, and
+    * the validation minus training NLL, the generalisation gap.
+    """
+    import matplotlib
+
+    if not os.environ.get("DISPLAY"):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    arms = [(name, hist) for name, hist in histories.items() if hist]
+    if not arms:
+        return path
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7.5), layout="constrained")
+    main, comp, grad, tail, shared, gap = axes.flat
+
+    for name, hist in arms:
+        epoch = [r["epoch"] for r in hist]
+        main.plot(epoch, [r["train_nll"] for r in hist], label=name)
+        val = [(r["epoch"], r["val_nll"]) for r in hist if "val_nll" in r]
+        if val:
+            main.plot(*zip(*val), ls="--", lw=1.0, color=main.lines[-1].get_color())
+    main.set(xlabel="epoch", ylabel="NLL per star",
+             title="data term (solid) and validation (dashed)")
+    main.legend(fontsize=7)
+
+    name, hist = arms[-1]
+    epoch = np.asarray([r["epoch"] for r in hist], dtype="f8")
+    for key, label in (("loss", "total"), ("data", "data term"), ("prior", "prior"),
+                       ("l2", "weight decay"), ("nu_prior", "prior on nu"),
+                       ("shared_prior", "prior on the shared term"),
+                       ("control", "control points")):
+        values = np.asarray([r.get(key, 0.0) for r in hist], dtype="f8")
+        if np.any(np.abs(values) > 0):
+            comp.semilogy(epoch, np.maximum(np.abs(values), 1e-12), label=label, lw=1.2)
+    comp.set(xlabel="epoch", ylabel="mean |term|", title=f"{name}: loss components")
+    comp.legend(fontsize=7)
+
+    for name, hist in arms:
+        grad.plot([r["epoch"] for r in hist],
+                  [max(r.get("grad_norm", 0.0), 1e-12) for r in hist], label=name)
+    grad.set(xlabel="epoch", ylabel="|grad| before clipping", title="gradient norm", yscale="log")
+    grad.legend(fontsize=7)
+
+    nu_rows = [r for r in hist if "nu" in r]
+    if nu_rows:
+        nu = np.asarray([r["nu"] for r in nu_rows], dtype="f8")  # (epochs, n_group)
+        e = np.asarray([r["epoch"] for r in nu_rows], dtype="f8")
+        tail.plot(e, nu, color="0.7", lw=0.7)
+        tail.plot(e, np.median(nu, axis=1), color="C0", lw=2.0, label="median")
+        tail.plot(e, nu.min(axis=1), color="C3", lw=1.0, ls=":", label="min")
+        tail.plot(e, nu.max(axis=1), color="C3", lw=1.0, ls=":", label="max")
+        tail.axhline(2.0, color="0.4", ls="--", lw=0.8)  # the floor: nu = 2 + softplus
+        tail.set(xlabel="epoch", ylabel="nu", title="tail weight per group (learned)")
+        tail.legend(fontsize=7)
+    else:
+        tail.set_axis_off()
+
+    rows = [r for r in hist if "shared_sigma_median" in r]
+    if rows:
+        shared.plot([r["epoch"] for r in rows], [r["shared_sigma_median"] for r in rows],
+                    color="C2", label="median")
+        shared.plot([r["epoch"] for r in rows], [r["shared_sigma_max"] for r in rows],
+                    color="C2", lw=1.0, ls=":", label="max")
+        shared.set(xlabel="epoch", ylabel="shared sigma", title="shared systematic", yscale="log")
+        shared.legend(fontsize=7)
+    else:
+        shared.set_axis_off()
+
+    plotted = False
+    for name, hist in arms:
+        pairs = [(r["epoch"], r["val_nll"] - r["train_nll"]) for r in hist
+                 if "val_nll" in r and "train_nll" in r]
+        if pairs:
+            gap.plot(*zip(*pairs), label=name)
+            plotted = True
+    if plotted:
+        gap.axhline(0.0, color="0.5", lw=0.8)
+        gap.set(xlabel="epoch", ylabel="validation - training NLL",
+                title="generalisation gap")
+        gap.legend(fontsize=7)
+    else:
+        gap.set_axis_off()
+
+    if title:
+        fig.suptitle(title, fontsize=10)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
 
 
 def plot_learned_delta(model, stars, labels: Sequence[str], path: Path) -> Path:
@@ -344,6 +489,13 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         multiplicity=list(multiplicity), group_labels=list(group_labels),
         model_type="scale_add", config=dataclasses.asdict(cfg), val_history=hist,
     ))
+    # Before the diagnostics, so the training traces survive a failure in them.
+    plot_training_history(
+        {"const add": hist_const, "const scale+add": hist_const_sa, "network": hist},
+        ev_dir / "training_history.png",
+        title=f"{run_dir.name}: delta model training",
+    )
+    log.info("wrote %s", ev_dir / "training_history.png")
 
     nll, results, nus, shareds = {}, {}, {}, {}
     for name, fn in models.items():
