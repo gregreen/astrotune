@@ -108,6 +108,65 @@ def convergence(runs: dict, window: int = 5) -> str:
     return "\n".join(lines)
 
 
+def load_prior(out_dir: Path):
+    """The nu prior the run was fitted with, in nu (not raw) coordinates."""
+    path = Path(out_dir) / "delta_model_config.json"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        cfg = json.load(f).get("config", {})
+    raw = cfg.get("nu_prior_mean")
+    if raw is None:
+        return None
+    return 2.0 + float(np.logaddexp(0.0, float(raw)))  # nu = 2 + softplus(raw)
+
+
+def prior_pull(runs: dict, priors: dict, arm: str = "network scale+add") -> str:
+    """How much of each group's nu is the prior, and how much is the data?
+
+    Runs that differ only in the prior mean give one point per group each, so a
+    straight line through them answers the question directly:
+
+    * slope ~ 1 -- the group follows whatever prior it is given; the data do not
+      constrain nu at all, and the number reported is the prior, not a measurement;
+    * slope ~ 0 -- nu is set by the data, and the two runs agree on it.
+
+    The intercept is then the prior-free value, ``nu`` extrapolated to a prior mean
+    of zero, which is what the data alone would say if the group is pinned.
+    """
+    points = [(priors[name], run["nus"][arm]) for name, run in runs.items()
+              if priors.get(name) is not None and run.get("nus", {}).get(arm)]
+    if len(points) < 2:
+        return ""
+    xs = np.asarray([p for p, _ in points], dtype="f8")
+    if np.ptp(xs) == 0:
+        return ""
+    labels = None
+    for run in runs.values():
+        if run.get("group_labels"):
+            labels = run["group_labels"]
+            break
+    ys = np.asarray([nus for _, nus in points], dtype="f8")  # (n_run, n_group)
+    lines = ["", f"prior pull of nu ({arm}): nu against the prior mean it was given",
+             f"{'group':38s}" + "".join(f"{'prior ' + format(x, '.1f'):>11s}" for x in xs)
+             + f"{'slope':>8s}{'nu at prior 0':>15s}{'resid':>8s}"]
+    rows = []
+    for i in range(ys.shape[1]):
+        y = ys[:, i]
+        b, a = np.polyfit(xs, y, 1)
+        resid = float(np.sqrt(np.mean((y - (a + b * xs)) ** 2))) if len(xs) > 2 else float("nan")
+        rows.append((labels[i] if labels else str(i), y, b, a, resid))
+    for label, y, b, a, resid in sorted(rows, key=lambda r: -r[2]):
+        lines.append(f"{label:38s}" + "".join(f"{v:11.2f}" for v in y)
+                     + f"{b:8.2f}{a:15.2f}{resid:8.2f}")
+    pinned = [r[0] for r in rows if r[2] > 0.7]
+    data = [r[0] for r in rows if r[2] < 0.35]
+    lines.append("")
+    lines.append(f"slope > 0.7 (nu is the prior, not a measurement): {', '.join(pinned) or 'none'}")
+    lines.append(f"slope < 0.35 (nu is set by the data): {', '.join(data) or 'none'}")
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("out_dirs", nargs="+", type=Path)
@@ -115,15 +174,22 @@ def main(argv=None) -> int:
                         help="labels for the rows (default: the directory names)")
     parser.add_argument("--window", type=int, default=5,
                         help="epochs to look back over when judging convergence")
+    parser.add_argument("--arm", default="network scale+add",
+                        help="arm used for the prior-pull analysis")
     args = parser.parse_args(argv)
 
     names = args.names or [d.resolve().name for d in args.out_dirs]
     runs = {}
+    priors = {}
     for name, out_dir in zip(names, args.out_dirs):
         runs[name] = load(out_dir)
+        priors[name] = load_prior(out_dir)
     print(headline(runs))
     print(nu_table(runs))
     print(convergence(runs, args.window))
+    pull = prior_pull(runs, priors, args.arm)
+    if pull:
+        print(pull)
     return 0
 
 
