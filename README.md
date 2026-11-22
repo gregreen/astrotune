@@ -360,10 +360,14 @@ estimator rather than of a different one.
 * **Hyperparameters** (`LatentTrainConfig`; every field is a CLI flag): 64 units,
   3 hidden layers, batch 65536 observations, 250 epochs, Adam with `beta_2=0.99`
   and AMSGrad, 8 cosine phases with 5 % warmup, global-norm clip 100,
-  `data_term = student_t`, `nu = 50`, ODE `rtol = atol = 1e-5`. The defaults are
-  the reference notebook's, except the data term: `nu = 50` is the value at which
-  the t and the softened χ² agree to first order, so it changes the shape of the
-  tail and nothing else. Lower `--nu` for a stricter robustifier.
+  `data_term = student_t`, `nu = 25`, ODE `rtol = atol = 1e-5`. The defaults are
+  the reference notebook's, except the data term. `nu = 25` is chosen so that the
+  Gauss-Newton weight `(ν + d)/(ν + χ²)` is half its small-residual value at
+  `χ² = 25` and falls as `1/χ²` beyond: an observation more than ~5σ from the
+  fitted value then stops being able to pull the solution, while everything inside
+  4σ is fitted as in the Gaussian case (weight 0.97 at `χ² = 1`). (The earlier
+  default, 50, was the value at which the t and the softened χ² agree to first
+  order.) Lower `--nu` for a stricter robustifier.
 * **Which ν a run used is recorded, not assumed.** `config.json` carries
   `nu_values` (one per catalog) next to the hyperparameters, because the default
   path — `--nu` for everything vs. the per-catalog values that came with the
@@ -496,6 +500,19 @@ and `evaluation/shared.txt` (the fitted `G_g` per group and parameter). Weights
 are fitted with Adam against the star likelihood plus weak priors that say what
 the correction should be where the data are silent (nothing added, no shared term),
 imposed both on the data and on control points.
+
+**The prior on ν** is `ν = 25 ± 10`, stated in ν rather than in the unconstrained
+coordinate (`--nu-prior-space nu`), so that `p(ν)` is a Gaussian cut off at ν = 2
+that vanishes there instead of piling up against the Cauchy limit. Both numbers
+have a reason that fits in a sentence: ν = 25 puts the turnover of the
+Gauss-Newton weight `(ν + d)/(ν + χ²)` at χ² = 25, i.e. it suppresses the pull of
+~5σ outliers and leaves everything inside 4σ essentially untouched (weight 0.97
+at χ² = 1); and σ_ν = 10 makes it weak — the whole range the catalogs ask for
+(4 to 32 in our own tests) is inside 2σ, while ν ~ 2 is 2.3σ away, so it is
+excluded without being forbidden. The weakness has a cost worth stating: for the
+catalogs that do not measure ν, the fitted value is mostly the prior's, which is
+why `nu.txt` should be read together with `evaluation/nu_det_c.png` (how much the
+covariance actually moved) rather than on its own.
 
 Three degeneracies to know when reading the numbers: scale and additive term are
 separated only by the *spread* of quoted uncertainties within a group; inside a

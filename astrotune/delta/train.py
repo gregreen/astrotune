@@ -81,9 +81,19 @@ class DeltaConfig:
     #: Where the prior on nu is Gaussian: in ``raw`` (``nu = 2 + softplus(raw)``, so
     #: ``p(nu)`` rises towards ``nu = 2``) or in ``nu`` itself (a half-Gaussian on
     #: ``nu >= 2``, which vanishes at 2). The mean and sd are read in that space.
-    nu_prior_space: str = "raw"
-    nu_prior_mean: float = 6.0  # in the unconstrained coordinate: nu = 2 + softplus(6) = 8
-    nu_prior_sd: float = 2.0  # 95 % of the prior mass on nu in [4.1, 12.0]
+    #: ``nu`` is the default: the prior is then a statement about the tail weight
+    #: rather than about an unconstrained coordinate.
+    nu_prior_space: str = "nu"
+    #: Default prior ``nu = 25 +- 10``. Two reasons, both worth stating in a paper:
+    #: nu = 25 caps the influence of an observation at ``chi2 ~ 25`` (the GN weight
+    #: ``(nu + d)/(nu + chi2)`` is half its small-residual value there and falls as
+    #: ``1/chi2`` beyond), i.e. it suppresses ~5-sigma outliers and leaves the rest
+    #: of the distribution alone; and sd = 10 makes that weak -- every nu in the
+    #: range the data ask for (4 to 32 in our own tests) sits within 2 sigma, while
+    #: the Cauchy limit nu = 2 is 2.3 sigma away, so the fit can move nu where the
+    #: data want it but cannot wander to nu ~ 2.
+    nu_prior_mean: float = 25.0
+    nu_prior_sd: float = 10.0
     nu_prior_weight: float = 0.01
     #: Prior that pulls each group's shared variance down to the floor
     shared_prior_weight: float = 0.01

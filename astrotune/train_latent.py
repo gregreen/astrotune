@@ -301,13 +301,17 @@ class LatentTrainConfig:
     #: still be reproduced and resumed.
     data_term: str = "student_t"
     #: Degrees of freedom, for every catalog that does not bring its own -- see
-    #: :func:`resolve_nu`. ``nu = chi2_turnover = 50`` is the starting point and
-    #: not a measured value: it makes the t agree with the softened chi^2 to
-    #: first order. Both are quadratic near zero, both grow like ``ln chi2`` far
-    #: out, and both have a curvature weight that falls as ``1/chi2``; they differ
-    #: only in the shape of the turnover, which is sharper for the t (0.5 against
-    #: 0.71 at ``chi2 = nu``). Lower it to make the fit more robust.
-    nu: float = 50.0
+    #: :func:`resolve_nu`. The default is 25, which caps the influence of an
+    #: observation at ``chi2 ~ 25``: the Gauss-Newton weight
+    #: ``(nu + d) / (nu + chi2)`` is then half its small-residual value at
+    #: ``chi2 = 25`` and falls as ``1/chi2`` beyond, so ~5-sigma outliers are
+    #: suppressed while everything below 4-sigma is fitted as in the Gaussian case
+    #: (weight 0.97 at ``chi2 = 1``). It also stays clear of the ``nu = 2`` limit,
+    #: where the t is nearly Cauchy and no catalog in the survey asks for it.
+    #: ``nu = chi2_turnover = 50`` was the earlier default: the value at which the
+    #: t and the softened chi^2 agree to first order. Lower ``--nu`` for a stricter
+    #: robustifier.
+    nu: float = 25.0
     #: Read ``nu`` per catalog from the observations file when the file records
     #: it, which ``astrotune-observations --sigma-source delta`` arranges: that
     #: file's sigma come from a delta model, and the ``nu`` written with them is
