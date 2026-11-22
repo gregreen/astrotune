@@ -408,6 +408,53 @@ def test_nu_prior_density_is_normalised(tmp_path):
     assert path.exists() and path.stat().st_size > 10000
 
 
+def test_the_volume_change_is_reported_per_parameter(tmp_path):
+    """A catalog reporting three parameters must not look smaller than one with four.
+
+    Same scale, same additive floor, so the only difference between the catalogs is
+    how many parameters they measure. Divided by that number, the two agree.
+    """
+    from astrotune.delta.model import ADD_MIN_SIGMA, ConstScaleAdd
+    from astrotune.delta.train import catalog_summary, plot_nu_det_c
+
+    s = _synthetic_stars(n_star=500, n_cat=3)
+    s["m"] = np.array(s["m"], copy=True)
+    s["m"][s["c"] == 2, 3] = False  # catalog 2 does not measure the fourth parameter
+    out = catalog_summary(ConstScaleAdd(3), s, ("a", "b", "c"))
+    assert np.isfinite(out["det"]).all()
+    assert np.allclose(out["det"][2], out["det"][0], rtol=1e-3)
+    # and the change is the floor's, per parameter: ln(1 + add^2 / C)
+    expected = np.log1p(float(ADD_MIN_SIGMA) ** 2 / 0.03 ** 2)
+    assert np.allclose(out["det"], expected, rtol=0.05)
+
+    path = plot_nu_det_c(out, tmp_path / "nu_det_c.png")
+    assert path.exists() and path.stat().st_size > 10000
+
+
+def test_label_positions_leave_the_dots_and_each_other_clear():
+    """The layout of the point labels: no overlaps, leaders on the box edges."""
+    from astrotune.delta.train import _label_positions
+
+    pts = np.array([[0.5, 0.5], [0.7, 0.4], [1.4, 1.1], [1.8, 0.6]])
+    sizes = np.tile([0.9, 0.12], (len(pts), 1))  # 11 characters or so, at 6.5pt
+    centres, ends = _label_positions(pts, sizes, (0.0, 2.5, 0.0, 1.5))
+    assert np.all(np.isfinite(centres)) and np.all(np.isfinite(ends))
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            # boxes are disjoint in at least one direction
+            dx = abs(centres[i, 0] - centres[j, 0]) - (sizes[i, 0] + sizes[j, 0]) / 2
+            dy = abs(centres[i, 1] - centres[j, 1]) - (sizes[i, 1] + sizes[j, 1]) / 2
+            assert dx > 0 or dy > 0
+        # no label sits on any dot
+        for p in pts:
+            assert (abs(p[0] - centres[i, 0]) > sizes[i, 0] / 2
+                    or abs(p[1] - centres[i, 1]) > sizes[i, 1] / 2)
+        # the leader stops on the label's boundary
+        assert np.allclose(ends[i], np.clip(pts[i],
+                                            centres[i] - sizes[i] / 2,
+                                            centres[i] + sizes[i] / 2))
+
+
 def test_nu_prior_in_nu_space_is_quadratic_in_nu():
     """The penalty is a Gaussian in nu, not in the unconstrained coordinate."""
     from astrotune.delta.model import TailWeight

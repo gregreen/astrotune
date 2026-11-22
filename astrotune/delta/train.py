@@ -647,6 +647,10 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     cat_table = per_catalog_table(net, val, keys)
     log.info("\n%s", cat_table)
     (ev_dir / "per_catalog.txt").write_text(cat_table + "\n")
+    # The same numbers as a picture: does the group that asks for heavy tails also
+    # have its covariance inflated (or shrunk) most?
+    plot_nu_det_c(catalog_summary(net, val, keys), ev_dir / "nu_det_c.png",
+                  title=f"{run_dir.name}: nu against the volume of the corrected covariance")
     # The additive-only constant model is the maximum-likelihood three-cornered hat:
     # one excess variance per catalog and parameter that makes the entries agree.
     const_sigma = np.exp(0.5 * const_add.raw.numpy())
@@ -743,23 +747,17 @@ def format_nu(nus: Dict[str, Optional[np.ndarray]], labels: Sequence[str]) -> st
     return "\n".join(lines)
 
 
-def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) -> str:
-    """One row per catalog: size, the two learned terms, the tail weight, and the effect.
+def catalog_summary(model, stars, keys: Sequence[str], chunk: int = 65_536) -> dict:
+    """Per catalog: the size, the two learned terms, ``nu``, and the volume change.
 
-    The rows are the *validation* entries of each catalog (the sample every other
-    number in ``evaluation/`` is measured on). ``median scale`` is, per parameter, the
-    median of the sigma scale ``exp(ln_scale / 2)`` over those entries that measure it
-    (1 = the quoted error is left alone); ``median add*`` is the same for the additive
-    sigma *including the group's shared variance* (the floor is 0.003, so a value above
-    it is the systematic the catalog shares with the rest of its group); ``nu`` is the
-    group's degrees of freedom; and ``median dln det*`` is the median change in the log
-    determinant of the total entry covariance ``S + diag(tau^2)``, ``ln det - ln det
-    C_m`` over the measured submatrix -- how much volume the correction adds or
-    removes, the one number that combines all three terms (four parameters at scale
-    0.35 with nothing additive would be ``8 ln 0.35 = -8.4``). The starred columns are
-    the covariance the merge will use; the scale is the part that is independent
-    between the catalogs of a group. Parameters a catalog does not measure print as
-    ``nan``.
+    The numbers behind :func:`per_catalog_table` and the ``nu``-against-volume plot,
+    so the two cannot disagree. ``det`` is the median over the catalog's entries of
+    ``(ln det(S + diag(tau^2)) - ln det C_m) / n_measured`` -- the change in the log
+    determinant of the covariance the merge will use, per measured parameter. The
+    division is what makes a catalog that measures three parameters comparable with
+    one that measures four: the total volume change of a 4-parameter covariance is
+    four times the average per-parameter change, so leaving it out would rank the
+    catalogs by how many parameters they happen to report.
     """
     from .covariance import entry_cov_np
     from .model import model_nu, model_shared, numpy_delta_fn
@@ -796,33 +794,236 @@ def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) ->
                 continue
             dlndet[lo + np.flatnonzero(rows)] = (
                 np.linalg.slogdet(new[rows][:, mask][:, :, mask])[1]
-                - np.linalg.slogdet(old[rows][:, mask][:, :, mask])[1])
+                - np.linalg.slogdet(old[rows][:, mask][:, :, mask])[1]) / float(mask.sum())
 
+    count = np.zeros(n_cat, dtype="i8")
+    scale = np.full((n_cat, n_par), np.nan)
+    add = np.full((n_cat, n_par), np.nan)
+    det = np.full(n_cat, np.nan)
+    nu_cat = np.full(n_cat, np.nan)
+    for k in range(n_cat):
+        in_cat = stars["c"] == k
+        count[k] = int(in_cat.sum())
+        for p in range(n_par):
+            sel = in_cat & stars["m"][:, p]
+            if sel.any():
+                scale[k, p] = float(np.median(s_val[sel, p]))
+                add[k, p] = float(np.median(a_val[sel, p]))
+        de = dlndet[in_cat & np.isfinite(dlndet)]
+        if de.size:
+            det[k] = float(np.median(de))
+        if nu is not None and in_cat.any():
+            nu_cat[k] = float(nu[stars["g"][np.argmax(in_cat)]])
+    return dict(keys=tuple(keys), n=count, scale=scale, add=add, det=det, nu=nu_cat)
+
+
+def _label_positions(points, sizes, bounds, pad: float = 0.05, passes: int = 15):
+    """Place a horizontal label near each point by minimising a layout energy.
+
+    Everything is in inches, so distances mean the same thing in both directions.
+    ``points`` is ``(n, 2)``, ``sizes`` is ``(n, 2)`` of ``(width, height)``, and
+    ``bounds`` is ``(x0, x1, y0, y1)`` of the point cloud. The energy sums
+
+    * overlapping labels, weighted by the overlapping area;
+    * a label sitting on top of a point (any point, its own included);
+    * a label that leaves the box the points occupy;
+    * two leader lines crossing;
+    * and, weakly, the distance from a label to its own point, which is what keeps a
+      free label next to its dot instead of merely somewhere legal.
+
+    The labels are placed by coordinate descent over a fixed set of candidate
+    positions around each dot -- eight directions at three distances -- started from
+    a few different configurations, since the energy is not convex.
+    """
+    n = len(points)
+    half = sizes / 2.0
+    dirs = np.array([[0, 1], [1, 1], [1, 0], [1, -1],
+                     [0, -1], [-1, -1], [-1, 0], [-1, 1]], dtype="f8")
+    dirs /= np.linalg.norm(dirs, axis=1)[:, None]
+    gaps = np.array([0.05, 0.13, 0.24])
+    # Candidate box centres: just outside the dot in that direction, so the leader
+    # line leaves the dot and meets the near face of the box.
+    extent = (np.abs(dirs[:, 0])[None, :] * half[:, None, 0]
+              + np.abs(dirs[:, 1])[None, :] * half[:, None, 1])  # (n, n_dir)
+    cand = np.empty((n, len(dirs) * len(gaps), 2))
+    for gi, g in enumerate(gaps):
+        for di in range(len(dirs)):
+            col = gi * len(dirs) + di
+            cand[:, col] = points + dirs[di] * (g + extent[:, di])[:, None]
+    w, h = sizes[:, 0], sizes[:, 1]
+
+    def leader_ends(centres):
+        """Where each leader meets its label box (the nearest point on the box)."""
+        q = np.empty_like(centres)
+        q[:, 0] = np.clip(points[:, 0], centres[:, 0] - w / 2, centres[:, 0] + w / 2)
+        q[:, 1] = np.clip(points[:, 1], centres[:, 1] - h / 2, centres[:, 1] + h / 2)
+        return q
+
+    def energy(a):
+        cen = cand[np.arange(n), a]
+        dx = np.abs(cen[:, None, 0] - cen[None, :, 0]) - (w[:, None] + w[None, :]) / 2
+        dy = np.abs(cen[:, None, 1] - cen[None, :, 1]) - (h[:, None] + h[None, :]) / 2
+        overlap = np.clip(pad - dx, 0, None) * np.clip(pad - dy, 0, None)
+        e = 60.0 * np.triu(overlap, 1).sum()
+        # a label covering a dot: its own is excluded only when the box is clear of
+        # it, which the candidates already ensure
+        inx = np.abs(points[None, :, 0] - cen[:, None, 0]) < w[:, None] / 2 + 0.02
+        iny = np.abs(points[None, :, 1] - cen[:, None, 1]) < h[:, None] / 2 + 0.02
+        e += 40.0 * (inx & iny).sum()
+        outside = (np.clip(bounds[0] - (cen[:, 0] - w / 2), 0, None)
+                   + np.clip((cen[:, 0] + w / 2) - bounds[1], 0, None)
+                   + np.clip(bounds[2] - (cen[:, 1] - h / 2), 0, None)
+                   + np.clip((cen[:, 1] + h / 2) - bounds[3], 0, None))
+        e += 12.0 * outside.sum()
+        q = leader_ends(cen)
+        # Two segments cross when each has the other's endpoints on opposite sides of
+        # its own line; the transpose gives the second segment's test.
+        def cross(o, a1, b):
+            return ((a1[None, :, 0] - o[:, None, 0]) * (b[:, None, 1] - o[:, None, 1])
+                    - (a1[None, :, 1] - o[:, None, 1]) * (b[:, None, 0] - o[:, None, 0]))
+        straddle = (cross(points, q, points) * cross(points, q, q)) < 0
+        e += 4.0 * float((straddle & straddle.T).sum()) / 2.0
+        e += 1.0 * float(np.linalg.norm(cen - points, axis=1).sum())
+        return e
+
+    best_a, best_e = None, np.inf
+    for start in (0, 2, 4, 6):  # four of the eight directions
+        a = np.full(n, start * len(gaps) + 1)
+        e = energy(a)
+        for _ in range(passes):
+            moved = False
+            for i in range(n):
+                cur, best_i, best_e_i = a[i], a[i], e
+                for c in range(cand.shape[1]):
+                    if c == cur:
+                        continue
+                    a[i] = c
+                    ec = energy(a)
+                    if ec < best_e_i - 1e-9:
+                        best_i, best_e_i = c, ec
+                a[i] = best_i
+                moved |= best_i != cur
+                e = best_e_i
+            if not moved:
+                break
+        if e < best_e:
+            best_a, best_e = a.copy(), e
+    return cand[np.arange(n), best_a], leader_ends(cand[np.arange(n), best_a])
+
+
+def plot_nu_det_c(summary: dict, path: Path, title: str = "") -> Path:
+    """``nu`` against the volume of the corrected covariance, one dot per catalog.
+
+    ``nu`` is one number per group and ``dln det C`` is one per catalog, so the two
+    members of a group sit at the same ``nu``. The panel asks whether the catalogs
+    that ask for heavy tails are the ones whose covariance is being inflated or
+    shrunk most: they need not be related, since ``nu`` describes the shape of the
+    residual distribution and ``dln det C`` its width.
+    """
+    import matplotlib
+
+    if not os.environ.get("DISPLAY"):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x = np.asarray(summary["nu"], dtype="f8")
+    y = np.asarray(summary["det"], dtype="f8")
+    labels = [str(k) for k in summary["keys"]]
+    keep = np.flatnonzero(np.isfinite(x) & np.isfinite(y))
+    if not keep.size:
+        return path
+
+    fig_w, fig_h = 12.0, 8.0
+    fs = 6.5
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    left, right, bottom, top = 0.075, 0.995, 0.085, 0.935
+    fig.subplots_adjust(left=left, right=right, bottom=bottom, top=top)
+    ax_w, ax_h = fig_w * (right - left), fig_h * (top - bottom)
+
+    xr = float(x[keep].max() - x[keep].min()) or 1.0
+    yr = float(y[keep].max() - y[keep].min()) or 1.0
+    xlim = (float(x[keep].min()) - 0.06 * xr, float(x[keep].max()) + 0.10 * xr)
+    ylim = (float(y[keep].min()) - 0.15 * yr, float(y[keep].max()) + 0.15 * yr)
+    ax.set(xlim=xlim, ylim=ylim)
+
+    def to_inch(px, py):
+        return np.stack([(px - xlim[0]) / (xlim[1] - xlim[0]) * ax_w,
+                         (py - ylim[0]) / (ylim[1] - ylim[0]) * ax_h], axis=-1)
+
+    def to_data(ix, iy):
+        return ((ix / ax_w) * (xlim[1] - xlim[0]) + xlim[0],
+                (iy / ax_h) * (ylim[1] - ylim[0]) + ylim[0])
+
+    pts = to_inch(x[keep], y[keep])
+    # A label's footprint, from its point size; 0.58 em per character is right for
+    # DejaVu Sans at this size to within a few per cent.
+    sizes = np.stack([0.58 * fs * np.array([len(labels[j]) for j in keep]) / 72.0,
+                      np.full(len(keep), 1.35 * fs / 72.0)], axis=-1)
+    lo_pt = pts.min(axis=0)
+    hi_pt = pts.max(axis=0)
+    centres, ends = _label_positions(pts, sizes, (lo_pt[0], hi_pt[0], lo_pt[1], hi_pt[1]))
+
+    for k, j in enumerate(keep):
+        (lx, ly), (qx, qy) = to_data(centres[k, 0], centres[k, 1]), to_data(ends[k, 0],
+                                                                           ends[k, 1])
+        ax.plot([x[j], qx], [y[j], qy], color="0.6", lw=0.5, zorder=1)
+        ax.plot([x[j]], [y[j]], marker="o", ms=5, color="C3", zorder=3)
+        ax.text(lx, ly, labels[j], fontsize=fs, ha="center", va="center", zorder=4)
+
+    ax.axhline(0.0, color="0.5", lw=0.8)
+    ax.set(xlabel=r"$\nu$ (group's degrees of freedom)",
+           ylabel=r"$\Delta \ln \det C\,/\,n_{\rm measured}$ (median over the catalog)",
+           title=title or "nu against the volume of the corrected covariance")
+    ax.grid(alpha=0.2)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
+
+
+def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) -> str:
+    """One row per catalog: size, the two learned terms, the tail weight, and the effect.
+
+    The rows are the *validation* entries of each catalog (the sample every other
+    number in ``evaluation/`` is measured on). ``median scale`` is, per parameter, the
+    median of the sigma scale ``exp(ln_scale / 2)`` over those entries that measure it
+    (1 = the quoted error is left alone); ``median add*`` is the same for the additive
+    sigma *including the group's shared variance* (the floor is 0.003, so a value above
+    it is the systematic the catalog shares with the rest of its group); ``nu`` is the
+    group's degrees of freedom; and ``median dln det/p*`` is the median change in the
+    log determinant of the total entry covariance ``S + diag(tau^2)``,
+    ``(ln det - ln det C_m) / n_measured`` over the measured submatrix -- how much
+    volume the correction adds or removes *per parameter*, which is the one number
+    that combines all three terms and means the same thing for a catalog reporting
+    three parameters as for one reporting four (at scale 0.35 with nothing additive,
+    ``2 ln 0.35 = -2.1`` either way). The starred columns are
+    the covariance the merge will use; the scale is the part that is independent
+    between the catalogs of a group. Parameters a catalog does not measure print as
+    ``nan``.
+    """
+    from .model import model_shared
+
+    summary = catalog_summary(model, stars, keys, chunk)
+    shared = model_shared(model)
     lines = [f"{'catalog':24s}{'n':>9s}   median scale: "
              + " ".join(f"{n:>7s}" for n in PARAM_NAMES)
              + "    median add*: "
              + " ".join(f"{n:>7s}" for n in PARAM_NAMES)
-             + f"{'nu':>7s}{'median dln det*':>17s}",
+             + f"{'nu':>7s}{'median dln det/p*':>17s}",
              "-" * 111]
-    for k, key in enumerate(keys):
+    for k, key in enumerate(summary["keys"]):
         label = registry.get_spec(key).label if key in registry.keys() else key
-        in_cat = stars["c"] == k
-        if not (in_cat[:, None] & stars["m"]).any():
-            continue
+        sc, ad = summary["scale"][k], summary["add"][k]
+        if not np.isfinite(np.r_[sc, ad]).any():
+            continue  # a catalog that measures nothing has nothing to report
         # Per parameter: a catalog that measures three parameters has three numbers,
         # and a parameter it does not measure is ``nan``.
-        sc, ad = [], []
-        for p in range(N_PARAMS):
-            sel = in_cat & stars["m"][:, p]
-            sc.append(float(np.median(s_val[sel, p])) if sel.any() else np.nan)
-            ad.append(float(np.median(a_val[sel, p])) if sel.any() else np.nan)
-        de = dlndet[in_cat & np.isfinite(dlndet)]
-        nu_k = "-" if nu is None else f"{nu[stars['g'][np.argmax(in_cat)]]:.1f}"
-        det = np.median(de) if de.size else np.nan
-        lines.append(f"{label[:24]:24s}{int(in_cat.sum()):9,d}   "
+        nu_k = "-" if not np.isfinite(summary["nu"][k]) else f"{summary['nu'][k]:.1f}"
+        lines.append(f"{label[:24]:24s}{int(summary['n'][k]):9,d}   "
                      + " ".join(f"{v:7.2f}" for v in sc) + "    "
                      + " ".join(f"{v:7.4f}" for v in ad)
-                     + f"{nu_k:>7s}{det:17.2f}")
+                     + f"{nu_k:>7s}{summary['det'][k]:17.2f}")
     if shared is not None and np.any(np.asarray(shared) > 0):
         # Name the groups whose additive column carries a systematic, so the starred
         # numbers are not mistaken for a per-catalog property.
