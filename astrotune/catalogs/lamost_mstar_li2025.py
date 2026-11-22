@@ -49,7 +49,8 @@ stars shared with APOGEE, ASPCAP, SLAM, MDw Cannon, DESI and LAMOST DD-Payne):
   -1.35...0.45, [alpha/M] -0.03...0.31). Inside it the distributions are
   truncated by the flag at those limits rather than piled up against them
   (the highest fraction within 5% of an edge is 3%), so no further cuts on
-  extreme values are needed.
+  extreme values are needed. However, we impose a cut at logg < 5.1 in order
+  to remove a small unphysical mode that one can identify by eye on the Kiel diagram.
 * A total SNR, the quadrature sum of the five bands (negative values, the
   ``-9999`` sentinel, count as zero), above :data:`SNR_MIN`. For M stars it is
   ~1.4 x ``snr_i`` (the u and g bands are empty), so 30 is close to the paper's
@@ -146,6 +147,7 @@ def cuts(t: Table, ctx) -> dict:
         f"SNR_tot > {SNR_MIN:g}": total_snr(t) > SNR_MIN,
         "class consistent with the Gaia CMD": class_consistent_with_cmd(t),
         "uncertainties finite and below limits": errors_ok,
+        "logg < 5.1": unmask(t["logg"]) < 5.1 # Cut off unphysical mode on Kiel diagram
     }
 
 
