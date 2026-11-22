@@ -103,6 +103,20 @@ class DeltaConfig:
     groups: bool = True
 
 
+def nu_init(cfg: "DeltaConfig") -> Tuple[float, float]:
+    """Where a fresh fit starts its tail weight: the prior mean, as ``(nu, raw)``.
+
+    ``TailWeight`` is built with an initial ``nu = 8``, which is a fallback and not a
+    statement about anything; a run should start where its prior says the answer is,
+    so that a wide prior centred at 32 does not spend its first epochs travelling
+    from 8. The raw value is the exact inverse of ``nu = 2 + softplus(raw)``.
+    """
+    nu = (float(cfg.nu_prior_mean) if cfg.nu_prior_space == "nu"
+          else 2.0 + float(np.logaddexp(0.0, float(cfg.nu_prior_mean))))
+    raw = float(np.log(np.expm1(max(nu - 2.0, 1e-6))))
+    return nu, raw
+
+
 def _spec(tf):
     """Input signature: one trace for every block, whatever its length."""
     return {
@@ -597,17 +611,29 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     ref = as_prepared(val)
     models = {"quoted (as prepared)": fixed_delta(0.0)}
     tables_for = {"quoted (as prepared)": ref}
-    const_add = ConstDelta(n_group, multiplicity)
+    # Every arm starts its tail weight at the prior mean of nu, in whichever space the
+    # prior is stated: the arbitrary nu = 8 that TailWeight is built with is only a
+    # fallback, and starting a 32 +- 16 fit at 8 spends the first epochs travelling.
+    nu0, raw0 = nu_init(cfg)
+
+    def start_at_the_prior(m):
+        """Put the model's tail weight on the prior mean."""
+        m.tail.raw.assign(np.full(n_group, raw0, dtype="f4"))
+        return m
+
+    log.info("nu starts at %.2f (the prior mean)", nu0)
+    const_add = start_at_the_prior(ConstDelta(n_group, multiplicity))
     hist_const = fit(const_add, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
                      desc="const add", control=ctrl)
     models["constant add"] = const_add
 
-    const = ConstScaleAdd(n_group, multiplicity)
+    const = start_at_the_prior(ConstScaleAdd(n_group, multiplicity))
     hist_const_sa = fit(const, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
                         desc="const scale+add", control=ctrl)
     models["constant scale+add"] = const
 
-    net = ScaleAddNetwork(n_group, cfg.hidden_size, cfg.n_hidden, multiplicity)
+    net = start_at_the_prior(ScaleAddNetwork(n_group, cfg.hidden_size, cfg.n_hidden,
+                                             multiplicity))
     hist = fit(net, train, cfg, cfg.epochs, cfg.learning_rate, val, desc="network", control=ctrl)
     models["network scale+add"] = net
 
@@ -615,6 +641,7 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         n_cat=n_group, hidden_size=cfg.hidden_size, n_hidden=cfg.n_hidden, keys=list(keys),
         multiplicity=list(multiplicity), group_labels=list(group_labels),
         model_type="scale_add", config=dataclasses.asdict(cfg), val_history=hist,
+        nu_init=nu0,
     ))
     # Before the diagnostics, so the training traces survive a failure in them.
     plot_training_history(

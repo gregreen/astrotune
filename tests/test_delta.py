@@ -474,3 +474,21 @@ def test_nu_prior_in_nu_space_is_quadratic_in_nu():
         t.prior_penalty(16.0, 4.0, "nope")
 
 
+def test_a_fit_starts_its_tail_weight_at_the_prior_mean():
+    """Not at the arbitrary nu = 8 TailWeight is built with, whatever the prior."""
+    from astrotune.delta.model import TailWeight
+    from astrotune.delta.train import DeltaConfig, nu_init
+
+    for space, mean, expected in (("nu", 25.0, 25.0), ("nu", 4.0, 4.0),
+                                  ("raw", 6.0, 8.0), ("raw", 30.0, 32.0)):
+        nu0, raw0 = nu_init(DeltaConfig(nu_prior_space=space, nu_prior_mean=mean))
+        # in raw space the prior mean is a softplus away from the mean of nu
+        assert nu0 == pytest.approx(expected, rel=1e-3)
+        t = TailWeight(2)
+        t.raw.assign(np.full(2, raw0, dtype="f4"))
+        # the raw value is the exact inverse of nu = 2 + softplus(raw)
+        assert np.allclose(t().numpy(), nu0, rtol=1e-5)
+        # and it is the prior's own minimum, so the fit starts unpenalised
+        assert float(t.prior_penalty(mean, 3.0, space)) == pytest.approx(0.0, abs=1e-6)
+
+
