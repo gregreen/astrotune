@@ -78,6 +78,10 @@ class DeltaConfig:
     pair_chi2_max: Optional[int] = 2_000_000
     #: Learn a per-catalog degrees of freedom for a Student's t (False: Gaussian)
     learn_nu: bool = True
+    #: Where the prior on nu is Gaussian: in ``raw`` (``nu = 2 + softplus(raw)``, so
+    #: ``p(nu)`` rises towards ``nu = 2``) or in ``nu`` itself (a half-Gaussian on
+    #: ``nu >= 2``, which vanishes at 2). The mean and sd are read in that space.
+    nu_prior_space: str = "raw"
     nu_prior_mean: float = 6.0  # in the unconstrained coordinate: nu = 2 + softplus(6) = 8
     nu_prior_sd: float = 2.0  # 95 % of the prior mass on nu in [4.1, 12.0]
     nu_prior_weight: float = 0.01
@@ -184,9 +188,9 @@ def fit(model, stars, cfg: DeltaConfig, epochs: int, lr: float, val=None,
             zero = tf.constant(0.0, tf.float64)
             nu_prior = zero
             if getattr(model, "tail", None) is not None:
-                # One Gaussian prior per catalog on the unconstrained dof coordinate
+                # One Gaussian per catalog on the tail weight, in raw or in nu.
                 nu_prior = tf.cast(cfg.nu_prior_weight * model.tail.prior_penalty(
-                    cfg.nu_prior_mean, cfg.nu_prior_sd), tf.float64)
+                    cfg.nu_prior_mean, cfg.nu_prior_sd, cfg.nu_prior_space), tf.float64)
                 loss += nu_prior
             shared_prior = zero
             if getattr(model, "shared", None) is not None:
@@ -349,6 +353,119 @@ def plot_training_history(histories: dict, path: Path, title: str = "") -> Path:
 
     if title:
         fig.suptitle(title, fontsize=10)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
+
+
+def nu_prior_curve(nu, mean: float, sd: float, space: str = "raw"):
+    """``p(nu)`` for the prior used on the tail weight.
+
+    With ``space="raw"`` the prior is Gaussian in the unconstrained coordinate and
+
+        p(nu) = N(raw(nu); mean, sd) * |d raw / d nu|,
+
+    with ``raw(nu) = log(exp(nu - 2) - 1)`` and ``d raw / d nu = 1 / (1 -
+    exp(-(nu - 2)))``. The Jacobian is what the figure is for: it makes ``p(nu)``
+    diverge as ``nu -> 2``, because the softplus squeezes an ever longer stretch of
+    ``raw`` into a shrinking ``d nu`` there.
+
+    With ``space="nu"`` the prior is the half-Gaussian
+
+        p(nu) ~ exp(-(nu - mean)^2 / 2 sd^2)   on nu >= 2,  0 below,
+
+    which has no such spike: it vanishes at ``nu = 2`` and is a plain Gaussian
+    above it.
+    """
+    nu = np.atleast_1d(np.asarray(nu, dtype="f8"))
+    t = np.maximum(nu - 2.0, 1e-12)  # nu - 2, the softplus output
+    if space == "nu":
+        dens = np.exp(-0.5 * ((nu - mean) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
+        return np.where(t > 0.0, dens, 0.0)
+    if space != "raw":
+        raise ValueError(f"unknown nu prior space {space!r}; use 'raw' or 'nu'")
+    raw = np.log(np.expm1(np.minimum(t, 700.0)))  # inverse softplus
+    dens = np.exp(-0.5 * ((raw - mean) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
+    return dens / (1.0 - np.exp(-t))  # the Jacobian d raw / d nu
+
+
+def plot_nu_prior(nu_values, keys: Sequence[str], prior_mean: float, prior_sd: float,
+                  path: Path, title: str = "", space: str = "raw") -> Path:
+    """The prior on ``nu``, with each group's learned ``nu`` marked on it.
+
+    The point of the figure is to show in one glance how much of each group's
+    ``nu`` is the prior: a dot near the peak is a parameter the prior set, a dot
+    out on the flank is one the data moved. The curves differ only in width and
+    centre, so runs with different priors can be compared page for page.
+    """
+    import matplotlib
+
+    if not os.environ.get("DISPLAY"):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from .. import registry
+
+    nu_values = np.asarray(nu_values, dtype="f8").ravel()
+    # One label per group, in registry-key form; a group of two catalogs is named
+    # for both, since they share the value.
+    gidx = registry.group_index(keys)
+    labels = []
+    for g in range(len(nu_values)):
+        members = [k for k, gi in zip(keys, gidx) if gi == g]
+        labels.append("+".join(members) if members else str(g))
+
+    prior_nu = (float(prior_mean) if space == "nu"
+                else 2.0 + float(np.logaddexp(0.0, prior_mean)))  # nu at the prior mean
+    # p(nu) diverges at nu = 2 under the raw-space prior (integrably), so the curve is
+    # cut where it is still small in every prior we use rather than at the singularity.
+    lo, hi = 2.5, max(nu_values.max(), prior_nu + 3.5 * prior_sd, 10.0) * 1.08
+    grid = np.linspace(lo, hi, 1200)
+    curve = nu_prior_curve(grid, prior_mean, prior_sd, space)
+    peak = float(curve.max())
+
+    fig_h, fs = 9.0, 6.5
+    fig, ax = plt.subplots(figsize=(12, fig_h), layout="constrained")
+
+    # Nearly all the groups sit within a tenth of nu of the prior mean, so their
+    # labels cannot stand side by side above their own dots. They are instead
+    # spread rightwards into a row (never leftwards, so the order still reads off
+    # the axis) and drawn from one common baseline, each with a leader line back to
+    # its dot.
+    gap = (fs / 72.0) / (12.0 * 0.85) * (hi - lo) * 1.25  # a label's width, in nu
+    label_x = {}
+    last = -np.inf
+    for i in np.argsort(nu_values):
+        x = max(nu_values[i], last + gap)
+        label_x[i] = x
+        last = x
+    # Height of the tallest label as a fraction of the axes, from its point size.
+    hf = (max(len(s) for s in labels) * 0.62 + 1.0) * fs / 72.0 / (fig_h * 0.82)
+    base = peak * 1.05
+    top = base / (1.0 - hf)
+
+    ax.plot(grid, curve, color="C0", lw=1.6)
+    ax.fill_between(grid, 0.0, curve, color="C0", alpha=0.10)
+    ax.axvline(prior_nu, color="C0", ls="--", lw=0.9, alpha=0.7)
+    ax.annotate(f"prior: $\\nu$ = {prior_nu:.1f} $\\pm$ {prior_sd:.1f}",
+                xy=(prior_nu, peak * 0.42), xytext=(-11, 0),
+                textcoords="offset points", fontsize=8, color="C3", rotation=90,
+                va="center")
+
+    for i in np.argsort(nu_values):
+        x = nu_values[i]
+        y = float(nu_prior_curve(x, prior_mean, prior_sd, space)[0])
+        ax.plot([x, label_x[i]], [y, base], color="0.6", lw=0.5, zorder=1)
+        ax.plot([x], [y], marker="o", ms=4.5, color="C3", zorder=3)
+        ax.text(label_x[i], base, labels[i], rotation=90, fontsize=fs,
+                ha="center", va="bottom", zorder=4)
+
+    ax.set(xlabel=r"$\nu$ (degrees of freedom)", ylabel=r"$p(\nu)$",
+           xlim=(lo, max(hi, last + 2 * gap)), ylim=(0.0, top),
+           title=title or "prior on nu")
+    ax.grid(alpha=0.2)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=110)
@@ -550,6 +667,15 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     plot_diagnostics(results["network scale+add"], labels, ev_dir, "_network")
     plot_diagnostics(results["quoted (as prepared)"], labels, ev_dir, "_none")
     plot_learned_delta(net, val, labels, ev_dir / "learned_delta.png")
+    # The prior on nu with every group's learned value on it: how much of each nu
+    # was the prior, and how much the data.
+    if nus.get("network scale+add") is not None:
+        plot_nu_prior(nus["network scale+add"], keys, cfg.nu_prior_mean, cfg.nu_prior_sd,
+                      ev_dir / "nu_prior.png",
+                      title=(f"{run_dir.name}: prior on nu "
+                             f"({cfg.nu_prior_mean:g} $\\pm$ {cfg.nu_prior_sd:g}"
+                             + (" in nu)" if cfg.nu_prior_space == "nu" else " in raw)")),
+                      space=cfg.nu_prior_space)
     if cfg.pair_chi2:
         # Two observations of one star: the difference's covariance is S_a + S_b with
         # nothing estimated in between, so the chi2 distribution is a direct test.

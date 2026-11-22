@@ -8,6 +8,9 @@
 #   e64         --epochs 64, everything else as in models/latent_student_t_iter2_20cat
 #   e64_nu14_6  the same, with the prior on raw moved from 6 +- 2 to 14 +- 6
 #   e64_nu30_16 the same, with the prior on raw moved to 30 +- 16
+#   e64_nus8_2  the same, with the prior stated in nu: 8 +- 2, cut off at nu = 2
+#   e64_nus16_4  ... 16 +- 4
+#   e64_nus32_16 ... 32 +- 16
 #
 # nu = 2 + softplus(raw), so raw = 14 +- 6 puts the prior mean at nu = 16.0 and
 # raw = 30 +- 16 at nu = 32.0 (against 8.0 before). Movement in the prior is close to
@@ -59,5 +62,15 @@ experiment e64_nu14_6 "$RUN/delta_e64_nu14_6" --epochs 64 \
     --nu-prior-mean 14 --nu-prior-sd 6
 experiment e64_nu30_16 "$RUN/delta_e64_nu30_16" --epochs 64 \
     --nu-prior-mean 30 --nu-prior-sd 16
+
+# The same three priors, stated in nu instead of raw: p(nu) is then a Gaussian cut
+# off at nu = 2, so it no longer piles up against the Cauchy limit. These are the
+# runs to compare, since the prior is now the thing being varied and nothing else.
+experiment e64_nus8_2 "$RUN/delta_e64_nus8_2" --epochs 64 \
+    --nu-prior-space nu --nu-prior-mean 8 --nu-prior-sd 2
+experiment e64_nus16_4 "$RUN/delta_e64_nus16_4" --epochs 64 \
+    --nu-prior-space nu --nu-prior-mean 16 --nu-prior-sd 4
+experiment e64_nus32_16 "$RUN/delta_e64_nus32_16" --epochs 64 \
+    --nu-prior-space nu --nu-prior-mean 32 --nu-prior-sd 16
 
 echo "=== all done $(date)"

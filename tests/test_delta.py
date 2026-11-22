@@ -375,3 +375,55 @@ def test_training_history_plot_survives_partial_histories(tmp_path):
     # an empty history is not an error either (a fit that was skipped)
     assert plot_training_history({}, tmp_path / "empty.png") == tmp_path / "empty.png"
 
+
+def test_nu_prior_density_is_normalised(tmp_path):
+    """p(nu) is the prior on raw moved to nu, so it must integrate to one."""
+    from astrotune.delta.train import nu_prior_curve, plot_nu_prior
+
+    # A geometric grid: the Jacobian diverges at nu = 2, so uniform sampling there
+    # would both miss the mass and cost a fortune.
+    nu = 2.0 + np.logspace(-12, 4, 400_000)
+    for mean, sd in ((6.0, 2.0), (14.0, 6.0), (30.0, 16.0)):
+        dens = nu_prior_curve(nu, mean, sd)
+        assert np.all(dens >= 0)
+        assert np.isclose(np.trapz(dens, nu), 1.0, atol=5e-3)
+        # the far tail has to die away, or the curve would not be plottable
+        assert dens[-1] < 1e-8 * dens.max()
+
+        # The nu-space prior is the same statement made directly: a Gaussian cut off
+        # at 2, so it stays small there instead of piling up at the boundary.
+        flat = np.linspace(2.0, 60.0, 400_000)
+        gauss = nu_prior_curve(flat, 8.0, 2.0, "nu")
+        assert gauss[0] < 0.05 * gauss.max()
+        assert np.isclose(np.trapz(gauss, flat), 1.0, atol=5e-3)
+        # ... whereas the raw-space prior rises towards nu = 2, above its own peak
+        raw_near_two = nu_prior_curve(np.array([2.001, 2.01, 2.1]), 14.0, 6.0)
+        interior = nu_prior_curve(flat[flat > 6.0], 14.0, 6.0).max()
+        assert raw_near_two[0] > interior
+        assert raw_near_two[0] > raw_near_two[-1]
+
+    keys = ("apogee_dr17", "sdssv_aspcap", "galah_dr4")
+    nu_values = np.array([7.0, 7.0, 9.5])  # the first two share a group
+    path = plot_nu_prior(nu_values, keys, 8.0, 2.0, tmp_path / "nu_prior.png", space="nu")
+    assert path.exists() and path.stat().st_size > 10000
+
+
+def test_nu_prior_in_nu_space_is_quadratic_in_nu():
+    """The penalty is a Gaussian in nu, not in the unconstrained coordinate."""
+    from astrotune.delta.model import TailWeight
+    from astrotune.delta.train import DeltaConfig
+
+    cfg = DeltaConfig(nu_prior_space="nu", nu_prior_mean=16.0, nu_prior_sd=4.0)
+    assert cfg.nu_prior_space == "nu"
+    t = TailWeight(3)
+    t.raw.assign(np.array([np.log(np.expm1(16.0 - 2.0))] * 3, dtype="f4"))  # nu = 16
+    at_mean = float(t.prior_penalty(cfg.nu_prior_mean, cfg.nu_prior_sd, "nu"))
+    assert at_mean == pytest.approx(0.0, abs=1e-5)
+    assert float(t().numpy()[0]) == pytest.approx(16.0, rel=1e-4)
+    # one prior sd away in nu is a penalty of 0.5, whatever nu it is
+    t.raw.assign(np.array([np.log(np.expm1(12.0 - 2.0))] * 3, dtype="f4"))  # nu = 12
+    assert float(t.prior_penalty(16.0, 4.0, "nu")) == pytest.approx(0.5, rel=1e-3)
+    with pytest.raises(ValueError):
+        t.prior_penalty(16.0, 4.0, "nope")
+
+

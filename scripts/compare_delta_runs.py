@@ -109,7 +109,7 @@ def convergence(runs: dict, window: int = 5) -> str:
 
 
 def load_prior(out_dir: Path):
-    """The nu prior the run was fitted with, in nu (not raw) coordinates."""
+    """The nu prior the run was fitted with, as a mean in nu."""
     path = Path(out_dir) / "delta_model_config.json"
     if not path.exists():
         return None
@@ -118,6 +118,8 @@ def load_prior(out_dir: Path):
     raw = cfg.get("nu_prior_mean")
     if raw is None:
         return None
+    if cfg.get("nu_prior_space", "raw") == "nu":
+        return float(raw)  # already a mean in nu
     return 2.0 + float(np.logaddexp(0.0, float(raw)))  # nu = 2 + softplus(raw)
 
 
