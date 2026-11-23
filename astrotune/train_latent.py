@@ -187,8 +187,9 @@ class LatentTrainConfig:
     # per axis -- and fixed, so there is nothing to learn and nothing random. See
     # astrotune/model/fourier.py for why this is worth having.
     #: Wavelengths per parameter axis, log-spaced from ``lam_max`` down to ``lam_min``
-    #: in the units of that coordinate. 0 turns the parameter axes off.
-    fourier_n_modes: int = 5
+    #: in the units of that coordinate: six of them between 8 and 0.25 are exact
+    #: octaves. 0 turns the parameter axes off.
+    fourier_n_modes: int = 6
     fourier_lam_min: float = 0.25
     fourier_lam_max: float = 8.0
     #: Harmonics of the flow parameter, with wavelengths ``1, 1/2, 1/4 ...``: a

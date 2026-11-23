@@ -37,6 +37,12 @@ def test_the_ladders_are_separable_and_the_time_ladder_is_the_harmonics():
     # and one ladder can be switched off on its own
     assert FourierFeatures(n_in=5, n_modes=0, time_harmonics=2).n_waves == 2
 
+    # the defaults give exact octaves: 8, 4, 2, 1, 1/2, 1/4
+    default = FourierFeatures(n_in=5)
+    default_lam = default.wavelengths()[default.axes.numpy() == 1]
+    assert np.allclose(default_lam, [8.0, 4.0, 2.0, 1.0, 0.5, 0.25])
+    assert np.allclose(np.diff(np.log2(default_lam)), -1.0)
+
 
 def test_each_mode_is_periodic_in_its_own_axis_only():
     from astrotune.model.fourier import FourierFeatures

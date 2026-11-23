@@ -56,6 +56,8 @@ class FourierFeatures(snt.Module):
     Args:
       n_in: width of the coordinate handed to :meth:`__call__`.
       n_modes: wavelengths per parameter axis, log-spaced ``lam_max`` to ``lam_min``.
+        Six of them between the default 8 and 0.25 are exact octaves
+        (8, 4, 2, 1, 0.5, 0.25), since the range is ``2**5``.
       lam_min, lam_max: the shortest and longest wavelength, in the units of the
         coordinate itself. There is no per-axis rescaling: with separable modes each
         axis has its own ladder, so a shared scale would only blur what "one
@@ -69,7 +71,7 @@ class FourierFeatures(snt.Module):
     def __init__(
         self,
         n_in: int,
-        n_modes: int = 5,
+        n_modes: int = 6,
         lam_min: float = 0.25,
         lam_max: float = 8.0,
         time_harmonics: int = 2,
