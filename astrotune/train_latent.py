@@ -121,6 +121,10 @@ LATENT_PENALTIES = (
     ("penalty_l2", "penalty (l2)"),
 )
 
+#: Shapes the learning rate can follow; see
+#: :attr:`LatentTrainConfig.lr_schedule`.
+LR_SCHEDULES = ("cosine", "discrete")
+
 #: Per-step metrics recorded by the training loop
 METRIC_KEYS = (
     "loss",
@@ -180,7 +184,7 @@ class LatentTrainConfig:
 
     # Optimization
     batch_size: int = 16384  # observations per batch
-    n_epochs: int = 16
+    n_epochs: int = 256
     #: Independent block permutations concatenated into one epoch. The data of an
     #: epoch are ``block_shuffles`` passes over the training set, so with
     #: ``drop_remainder`` the rows lost at the end of an epoch are those of one
@@ -191,13 +195,33 @@ class LatentTrainConfig:
     #: shape) or kept (no row is ever skipped).
     drop_remainder: bool = False
     val_frac: float = 1 / 8  # fraction of *stars* held out
-    learning_rate: float = 1e-3
-    #: Number of piecewise-constant segments the rate is spread over; the rate
-    #: is halved from one segment to the next, so it covers a factor
+    #: Peak learning rate. Adam's step is roughly ``lr`` per coordinate whatever
+    #: the gradient does, so this number sets how far the map can travel per step:
+    #: an order of magnitude too large and a run walks into a distorted region that
+    #: it then punishes itself for. 1e-4 is the rate every production run has used.
+    learning_rate: float = 1e-4
+    #: Shape of the rate schedule.
+    #:
+    #: ``cosine``
+    #:     ``lr * (1 + cos(pi t / T)) / 2``: flat at the start -- zero slope, so the
+    #:     early steps are as gentle as a constant rate -- and rolling down to zero
+    #:     over the last epochs. The default, because a rate that decays early leaves
+    #:     the final epochs doing nothing: with the eight-segment schedule below, the
+    #:     last segment ran at ``lr / 128`` for an eighth of the run, and continuing
+    #:     a finished run at ``1e-4`` still found a lower loss.
+    #:
+    #: ``discrete``
+    #:     ``lr_schedule_phases`` equal segments with the rate halved at each
+    #:     boundary. Kept because every run made before this option existed used it,
+    #:     and because a constant rate is what an lr comparison wants (``phases = 1``).
+    lr_schedule: str = "cosine"
+    #: Number of piecewise-constant segments for ``lr_schedule="discrete"``; the
+    #: rate is halved from one segment to the next, so it covers a factor
     #: ``2 ** (lr_schedule_phases - 1)``. The segments are equal fractions of
     #: the run, which with ``n_epochs`` fixed is also equal fractions of its
     #: data, so the schedule is comparable across batch sizes. Set it to 1 for
-    #: a constant rate, which is what an lr comparison wants.
+    #: a constant rate, which is what an lr comparison wants. Unused by the
+    #: cosine schedule.
     lr_schedule_phases: int = 8
     #: Fraction of the run over which the rate ramps linearly from
     #: ``learning_rate / warmup_steps`` up to ``learning_rate`` before the decay
@@ -561,6 +585,36 @@ def _warmup_and_decay(decay, peak: float, warmup_steps: int):
     return _WarmupAndDecay(decay, peak, warmup_steps)
 
 
+def lr_schedule(cfg: "LatentTrainConfig", n_steps: int):
+    """The learning-rate schedule of a run, as a Keras schedule over ``n_steps``.
+
+    See :attr:`LatentTrainConfig.lr_schedule` for the two shapes. Both start at
+    ``cfg.learning_rate`` and end near zero; they differ in how much of the run is
+    spent at a useful rate. The cosine is flat at the start (zero slope) and rolls
+    down through the whole run, so no part of it is wasted; the discrete one holds
+    each segment flat and halves at the boundaries, which spends its last segment at
+    ``lr / 2 ** (phases - 1)`` -- an eighth of the run at ``lr / 128`` with the old
+    default of eight phases.
+    """
+    if cfg.lr_schedule not in LR_SCHEDULES:
+        raise ValueError(
+            f"lr_schedule must be one of {', '.join(LR_SCHEDULES)}, "
+            f"not {cfg.lr_schedule!r}"
+        )
+    n = max(8, int(n_steps))
+    if cfg.lr_schedule == "cosine":
+        return keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=cfg.learning_rate, decay_steps=n, alpha=0.0
+        )
+    k = max(1, min(int(cfg.lr_schedule_phases), n))
+    if k == 1:  # a constant rate; the decay needs one boundary to exist
+        boundaries, values = [n], [cfg.learning_rate, cfg.learning_rate]
+    else:
+        boundaries = [i * n // k for i in range(1, k)]
+        values = [cfg.learning_rate / 2**i for i in range(k)]
+    return keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
+
+
 def checkpoints_to_keep(steps, n_steps, every, recent=8, milestones=32):
     """Which of the saved checkpoints to keep: a recent band plus milestones.
 
@@ -700,15 +754,10 @@ class LatentTrainer:
         # The learning-rate budget is set by the number of steps, so the data
         # pipeline must be built first.
         n = max(8, self.n_steps)
-        k = max(1, min(int(cfg.lr_schedule_phases), n))
-        if k == 1:  # a constant rate; the decay needs one boundary to exist
-            boundaries, values = [n], [cfg.learning_rate, cfg.learning_rate]
-        else:
-            boundaries = [i * n // k for i in range(1, k)]
-            values = [cfg.learning_rate / 2**i for i in range(k)]
-        decay = keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
+        decay = lr_schedule(cfg, n)
         warmup_steps = int(cfg.lr_warmup_frac * n)
         self.learning_rate = _warmup_and_decay(decay, cfg.learning_rate, warmup_steps)
+        log.info("Learning-rate schedule: %s", cfg.lr_schedule)
         if warmup_steps:
             log.info(
                 "Learning rate ramps to %.3g over the first %d steps (%d%% of the run).",
@@ -1734,6 +1783,9 @@ def _config_from_json(d: dict) -> dict:
     # means. Without this the new field's default would be filled in and a
     # resume would silently change the objective halfway through a run.
     d.setdefault("data_term", "softened")
+    # Likewise a run that saved ``lr_schedule_phases`` and no ``lr_schedule`` spent
+    # its life on the discrete schedule, whatever the default is now.
+    d.setdefault("lr_schedule", "discrete" if "lr_schedule_phases" in d else "cosine")
     return d
 
 

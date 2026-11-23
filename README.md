@@ -358,16 +358,29 @@ estimator rather than of a different one.
 * **Validation by star**: ~1/8 of the stars, chosen by a hash of the id, so the
   split is identical across runs and cannot leak a star's other measurements.
 * **Hyperparameters** (`LatentTrainConfig`; every field is a CLI flag): 64 units,
-  3 hidden layers, batch 65536 observations, 250 epochs, Adam with `beta_2=0.99`
-  and AMSGrad, 8 cosine phases with 5 % warmup, global-norm clip 100,
+  3 hidden layers, Adam with `beta_2=0.99` and AMSGrad, global-norm clip 100,
   `data_term = student_t`, `nu = 25`, ODE `rtol = atol = 1e-5`. The defaults are
-  the reference notebook's, except the data term. `nu = 25` is chosen so that the
-  Gauss-Newton weight `(ν + d)/(ν + χ²)` is half its small-residual value at
-  `χ² = 25` and falls as `1/χ²` beyond: an observation more than ~5σ from the
-  fitted value then stops being able to pull the solution, while everything inside
-  4σ is fitted as in the Gaussian case (weight 0.97 at `χ² = 1`). (The earlier
-  default, 50, was the value at which the t and the softened χ² agree to first
-  order.) Lower `--nu` for a stricter robustifier.
+  the reference notebook's apart from the three below.
+  * `learning_rate = 1e-4`, `n_epochs = 256`, batch 16384 (the production runs
+    pass `--batch-size 65536` and take ~83 steps per epoch instead of ~130).
+    Adam's step is roughly `lr` per coordinate whatever the gradient does, so the
+    rate is what bounds how far a step can travel; 1e-3 was an order of
+    magnitude too large and let early runs walk into a distorted region.
+  * `lr_schedule = "cosine"` is the default: `lr * (1 + cos(πt/T))/2`, flat at the
+    start and rolling down to zero over the last epochs, with a 5 % linear warmup
+    in front of it. `lr_schedule = "discrete"` keeps the older shape — 8 equal
+    segments halving at each boundary — and `lr_schedule_phases = 1` any of them
+    makes it constant, which is what an lr comparison wants. The cosine is the
+    default because the discrete one spends its last eighth of the run at
+    `lr/128`, where nothing happens: continuing a finished 250-epoch run at
+    `lr = 1e-4` for 32 more epochs still lowered the loss monotonically.
+  * `nu = 25` is chosen so that the Gauss-Newton weight `(ν + d)/(ν + χ²)` is half
+    its small-residual value at `χ² = 25` and falls as `1/χ²` beyond: an
+    observation more than ~5σ from the fitted value then stops being able to pull
+    the solution, while everything inside 4σ is fitted as in the Gaussian case
+    (weight 0.97 at `χ² = 1`). (The earlier default, 50, was the value at which
+    the t and the softened χ² agree to first order.) Lower `--nu` for a stricter
+    robustifier.
 * **Which ν a run used is recorded, not assumed.** `config.json` carries
   `nu_values` (one per catalog) next to the hyperparameters, because the default
   path — `--nu` for everything vs. the per-catalog values that came with the
