@@ -182,6 +182,20 @@ class LatentTrainConfig:
     ode_rtol: float = 1e-5
     ode_atol: float = 1e-5
 
+    # Fourier features of the spacetime coordinate (t, x), concatenated to the input
+    # of the first dense layer. The modes are separable -- one ladder of wavelengths
+    # per axis -- and fixed, so there is nothing to learn and nothing random. See
+    # astrotune/model/fourier.py for why this is worth having.
+    #: Wavelengths per parameter axis, log-spaced from ``lam_max`` down to ``lam_min``
+    #: in the units of that coordinate. 0 turns the parameter axes off.
+    fourier_n_modes: int = 5
+    fourier_lam_min: float = 0.25
+    fourier_lam_max: float = 8.0
+    #: Harmonics of the flow parameter, with wavelengths ``1, 1/2, 1/4 ...``: a
+    #: frequency along ``t`` is a frequency along the integration, which the solver
+    #: has to resolve, so it is capped rather than log-spaced. 0 leaves ``t`` out.
+    fourier_time_harmonics: int = 2
+
     # Optimization
     #: Observations per batch: 2**16, the size every production run has used. The
     #: batch is what one Gauss-Newton solve and one optimizer step see, so it sets
@@ -589,6 +603,18 @@ def _warmup_and_decay(decay, peak: float, warmup_steps: int):
     return _WarmupAndDecay(decay, peak, warmup_steps)
 
 
+def fourier_kwargs(cfg: "LatentTrainConfig") -> Optional[dict]:
+    """The Fourier-block arguments for the bijector, or ``None`` when it is off."""
+    if cfg.fourier_n_modes <= 0 and cfg.fourier_time_harmonics <= 0:
+        return None
+    return dict(
+        n_modes=cfg.fourier_n_modes,
+        lam_min=cfg.fourier_lam_min,
+        lam_max=cfg.fourier_lam_max,
+        time_harmonics=cfg.fourier_time_harmonics,
+    )
+
+
 def lr_schedule(cfg: "LatentTrainConfig", n_steps: int):
     """The learning-rate schedule of a run, as a Keras schedule over ``n_steps``.
 
@@ -712,10 +738,18 @@ class LatentTrainer:
             rtol=cfg.ode_rtol,
             atol=cfg.ode_atol,
             vector_network_kwargs=dict(use_residual=True, use_film=True, use_layer_norm=True),
+            fourier=fourier_kwargs(cfg),
         )
         self.variables = list(self.bij.trainable_variables)
         n_vars = sum(int(np.prod(v.shape)) for v in self.variables)
         log.info("%d variables in bijector model.", n_vars)
+        if self.bij.v.n_features:
+            lam = self.bij.v.fourier.wavelengths()
+            log.info(
+                "Fourier features: %d (x: %d modes per axis, t: %d harmonics)",
+                self.bij.v.n_features, cfg.fourier_n_modes,
+                cfg.fourier_time_harmonics,
+            )
 
         # One gradient norm per parameter group, per step. Memory and the
         # checkpoint history are unchanged for one run, the pair of run-to-run
@@ -1790,6 +1824,10 @@ def _config_from_json(d: dict) -> dict:
     # Likewise a run that saved ``lr_schedule_phases`` and no ``lr_schedule`` spent
     # its life on the discrete schedule, whatever the default is now.
     d.setdefault("lr_schedule", "discrete" if "lr_schedule_phases" in d else "cosine")
+    # And a run that predates the Fourier block had no features.
+    if "fourier_n_modes" not in d:
+        d.setdefault("fourier_n_modes", 0)
+        d.setdefault("fourier_time_harmonics", 0)
     return d
 
 
