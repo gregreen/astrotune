@@ -99,18 +99,24 @@ def raw_sigma(table, key: str) -> np.ndarray:
     return quoted_sigma(key, np.asarray(table["sigma_x"])).astype("f4")
 
 
-def _catalog_entries(est, table, key: str, fwd_jac=None, index: Optional[int] = None):
+def _catalog_entries(table, key: str, fwd_jac, index: int):
     """First valid row per star, sorted by id: the arrays one catalog contributes.
 
     ``sig`` is the quoted sigma (:func:`raw_sigma`), ``sig0`` the prepared one the
-    current pipeline propagates, and ``J`` the bijector's Jacobian at those rows (from
-    ``fwd_jac(x, c)``), which is what lets the delta model work in the catalogs' units.
+    current pipeline propagates, and ``y``/``J`` the bijector's value and Jacobian at
+    those rows -- both from one ``fwd_jac`` call, which is what lets the delta model
+    work in the catalogs' units.
+
+    Nothing here comes from ``astrotune-apply``: the star table is a function of the
+    prepared table and the bijector alone. That is deliberate -- the delta stage is
+    half of the latent-y/delta iteration, and routing it through a transform cache
+    made it depend on a directory that a retrained bijector silently invalidates.
     """
     from ..apply import padded_inputs
 
     ids = np.asarray(table["id"])
     x, sigma, measured = padded_inputs(table)
-    ok = np.flatnonzero(np.isfinite(est.y).all(1) & np.isfinite(est.cov).all((1, 2)))
+    ok = np.flatnonzero(np.isfinite(x).all(1))
     _, first = np.unique(ids[ok], return_index=True)
     rows = ok[first]
 
@@ -118,17 +124,20 @@ def _catalog_entries(est, table, key: str, fwd_jac=None, index: Optional[int] = 
     sig = np.zeros_like(x)
     sig[:, : quoted.shape[1]] = quoted
     sig = np.where(measured, sig, 0.0)
-    jac = None
-    if fwd_jac is not None:
-        c = index if index is not None else registry.category_index(key)
-        # Chunked: a catalog can contribute millions of rows and the Jacobian is dense.
-        chunk = 65_536
-        out = np.empty((len(rows), x.shape[1], x.shape[1]), dtype="f4")
-        for lo in range(0, len(rows), chunk):
-            sl = slice(lo, min(lo + chunk, len(rows)))
-            _, j = fwd_jac(x[rows[sl]], np.full(len(rows[sl]), c, dtype="i4"))
-            out[sl] = np.asarray(j, dtype="f4")
-        jac = out
+
+    # Chunked: a catalog can contribute millions of rows and the Jacobian is dense.
+    n_dim = x.shape[1]
+    chunk = 65_536
+    jac = np.empty((len(rows), n_dim, n_dim), dtype="f4")
+    y = np.empty((len(rows), n_dim), dtype="f4")
+    for lo in range(0, len(rows), chunk):
+        sl = slice(lo, min(lo + chunk, len(rows)))
+        y_hat, j = fwd_jac(x[rows[sl]], np.full(len(rows[sl]), index, dtype="i4"))
+        jac[sl] = np.asarray(j, dtype="f4")
+        y[sl] = np.asarray(y_hat, dtype="f4")
+    m = measured[rows]
+    # An unmeasured axis carries no value: the map said something there, but nothing
+    # measured it, so it is the placeholder 0 -- the same encoding apply writes.
     return dict(
         id=ids[rows],
         x=x[rows],
@@ -138,56 +147,34 @@ def _catalog_entries(est, table, key: str, fwd_jac=None, index: Optional[int] = 
         ls=np.log(np.where(measured, np.maximum(sig, 1e-30), 1.0)).astype("f4"),
         sig=sig[rows].astype("f4"),
         sig0=np.where(measured, sigma, 0.0)[rows].astype("f4"),
-        J=None if jac is None else jac.astype("f4"),  # already the selected rows
-        y=est.y[rows].astype("f4"),
-        m=est.measured[rows],
+        J=jac,
+        y=np.where(m, y, 0.0),
+        m=m,
     )
 
 
 def build_star_table(run_dir, cache_dir: Optional[Path] = None) -> Tuple[StarTable, Sequence[str]]:
-    """Build the star table for a trained run; returns ``(stars, catalog_keys)``."""
-    from ..apply import load_cached
+    """Build the star table for a trained run; returns ``(stars, catalog_keys)``.
+
+    ``cache_dir`` is accepted and ignored: the table no longer reads ``apply``'s
+    transform cache (see :func:`_catalog_entries`), so the only state it needs is
+    the prepared tables and the run's bijector.
+    """
+    from ..apply import make_forward_and_jacobian
+    from ..model import load_bijector
+    from ..model.io import enable_memory_growth
     from ..training_data import load_tables
 
     run_dir = Path(run_dir)
     keys = registry.run_keys(run_dir)
-    # ``apply`` caches catalog ``i`` under its *registry* index, and only runs on runs
-    # whose catalogs are a prefix of the registry (it checks). Reading the cache by
-    # position instead would silently take another catalog's harmonized values for a
-    # run whose catalog list is not that prefix, so insist on it here too.
-    if tuple(registry.keys()[: len(keys)]) != tuple(keys):
-        raise RuntimeError(
-            "The registry order no longer matches the run's catalog list "
-            f"({list(keys)}); the transformation cache is indexed by registry position."
-        )
-    cache_dir = Path(cache_dir) if cache_dir else run_dir / "harmonized" / "transform_cache_none"
-    if not cache_dir.exists():
-        raise FileNotFoundError(
-            f"{cache_dir} does not exist. Run `astrotune-apply --run-dir {run_dir}` first "
-            "(it caches the transformed estimates)."
-        )
     tables = load_tables(keys, dedupe="none")
-
-    # The Jacobian at each entry's own parameters: 16 floats per entry, which is what
-    # lets the delta model work in the catalogs' units (see delta/covariance.py). It is
-    # recomputed here rather than stored in the transform cache, so that cache stays
-    # exactly what `apply` needs.
-    from ..apply import make_forward_and_jacobian
-    from ..model import load_bijector
-    from ..model.io import enable_memory_growth
 
     enable_memory_growth()
     fwd_jac = make_forward_and_jacobian(load_bijector(run_dir))
 
     cats = []
     for key, t in zip(keys, tables):
-        est = load_cached(cache_dir, registry.category_index(key), np.asarray(t["id"]), t)
-        if est is None:
-            raise FileNotFoundError(
-                f"No usable cached transformation for {key} in {cache_dir} (missing, or made from a "
-                f"different x or sigma_x): run `astrotune-apply --run-dir {run_dir}` (again)."
-            )
-        cats.append(_catalog_entries(est, t, key, fwd_jac, registry.category_index(key)))
+        cats.append(_catalog_entries(t, key, fwd_jac, registry.category_index(key)))
         log.info("%s: %d stars (first row per id)", key, len(cats[-1]["id"]))
     del tables
 

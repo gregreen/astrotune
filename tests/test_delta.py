@@ -325,22 +325,23 @@ def test_build_star_table_groups_entries_by_star(tmp_path, monkeypatch):
     def fake_jac(bij):
         def f(xx, cc):
             n = int(len(xx))
-            return np.zeros((n, 4), "f4"), np.broadcast_to(
-                np.eye(4, dtype="f4"), (n, 4, 4)).copy()
+            # tag the harmonized value with the catalog index, as the real table would
+            # carry the catalog's own value there
+            y = np.repeat(np.asarray(cc, "f4")[:, None] + 1.0, 4, axis=1)
+            return y, np.broadcast_to(np.eye(4, dtype="f4"), (n, 4, 4)).copy()
 
         return f
 
-    def fake_cached(cache_dir, index, ids, table=None):
-        n = len(ids)
-        y = np.full((n, 4), index + 1.0, "f4")  # tagged with the catalog index
-        cov = np.broadcast_to(np.eye(4, dtype="f4"), (n, 4, 4)).copy()
-        return Estimates(index, ids, y, cov, np.ones((n, 4), bool))
-
     monkeypatch.setattr(td, "load_tables", fake_tables)
-    monkeypatch.setattr(ap, "load_cached", fake_cached)
     monkeypatch.setattr(ap, "make_forward_and_jacobian", fake_jac)
     # the real bijector loader needs a trained model; the fake ignores it
     monkeypatch.setattr("astrotune.model.load_bijector", lambda *a, **k: None)
+    # and the transform cache must not be consulted at all: the star table is a
+    # function of the prepared tables and the bijector (see _catalog_entries)
+    monkeypatch.setattr(
+        ap, "load_cached",
+        lambda *a, **k: pytest.fail("build_star_table must not read apply's cache"),
+    )
 
     stars, out_keys = st.build_star_table(tmp_path / "run", cache)
     assert tuple(out_keys) == tuple(keys)
@@ -350,3 +351,144 @@ def test_build_star_table_groups_entries_by_star(tmp_path, monkeypatch):
     assert np.array_equal(stars["seg"], [0, 0, 0, 1, 1])
     assert np.array_equal(stars["c"], [0, 1, 2, 0, 2])  # star-major, catalog ascending
     assert np.allclose(stars["y"][:, 0], [1, 2, 3, 1, 3])  # rows follow their catalog
+
+
+def test_training_history_plot_survives_partial_histories(tmp_path):
+    """The three fits record different things; the figure must handle each."""
+    from astrotune.delta.train import plot_training_history
+
+    # a const arm: no nu, no shared term, no validation set
+    const = [dict(epoch=e, train_nll=1.0 / e, loss=1.0 / e, prior=0.0, l2=0.0,
+                  nu_prior=0.0, shared_prior=0.0, control=0.0, grad_norm=10.0 / e)
+             for e in range(1, 4)]
+    # a full arm: everything, including the per-group nu vector
+    net = [dict(epoch=e, train_nll=1.0 / e, val_nll=1.1 / e, loss=1.2 / e,
+                data=1.0 / e, prior=0.1 / e, l2=0.1 / e, nu_prior=0.01 / e,
+                shared_prior=0.001 / e, control=0.0001 / e, grad_norm=5.0 / e,
+                nu=[5.0 + e, 8.0 - e], nu_median=6.5, nu_min=5.0 + e,
+                nu_max=8.0 - e, shared_sigma_median=1e-3 / e,
+                shared_sigma_max=2e-3 / e)
+           for e in range(1, 4)]
+    path = plot_training_history({"const add": const, "network": net},
+                                 tmp_path / "history.png", title="test")
+    assert path.exists() and path.stat().st_size > 10000
+    # an empty history is not an error either (a fit that was skipped)
+    assert plot_training_history({}, tmp_path / "empty.png") == tmp_path / "empty.png"
+
+
+def test_nu_prior_density_is_normalised(tmp_path):
+    """p(nu) is the prior on raw moved to nu, so it must integrate to one."""
+    from astrotune.delta.train import nu_prior_curve, plot_nu_prior
+
+    # A geometric grid: the Jacobian diverges at nu = 2, so uniform sampling there
+    # would both miss the mass and cost a fortune.
+    nu = 2.0 + np.logspace(-12, 4, 400_000)
+    for mean, sd in ((6.0, 2.0), (14.0, 6.0), (30.0, 16.0)):
+        dens = nu_prior_curve(nu, mean, sd)
+        assert np.all(dens >= 0)
+        assert np.isclose(np.trapz(dens, nu), 1.0, atol=5e-3)
+        # the far tail has to die away, or the curve would not be plottable
+        assert dens[-1] < 1e-8 * dens.max()
+
+        # The nu-space prior is the same statement made directly: a Gaussian cut off
+        # at 2, so it stays small there instead of piling up at the boundary.
+        flat = np.linspace(2.0, 60.0, 400_000)
+        gauss = nu_prior_curve(flat, 8.0, 2.0, "nu")
+        assert gauss[0] < 0.05 * gauss.max()
+        assert np.isclose(np.trapz(gauss, flat), 1.0, atol=5e-3)
+        # ... whereas the raw-space prior rises towards nu = 2, above its own peak
+        raw_near_two = nu_prior_curve(np.array([2.001, 2.01, 2.1]), 14.0, 6.0)
+        interior = nu_prior_curve(flat[flat > 6.0], 14.0, 6.0).max()
+        assert raw_near_two[0] > interior
+        assert raw_near_two[0] > raw_near_two[-1]
+
+    keys = ("apogee_dr17", "sdssv_aspcap", "galah_dr4")
+    nu_values = np.array([7.0, 7.0, 9.5])  # the first two share a group
+    path = plot_nu_prior(nu_values, keys, 8.0, 2.0, tmp_path / "nu_prior.png", space="nu")
+    assert path.exists() and path.stat().st_size > 10000
+
+
+def test_the_volume_change_is_reported_per_parameter(tmp_path):
+    """A catalog reporting three parameters must not look smaller than one with four.
+
+    Same scale, same additive floor, so the only difference between the catalogs is
+    how many parameters they measure. Divided by that number, the two agree.
+    """
+    from astrotune.delta.model import ADD_MIN_SIGMA, ConstScaleAdd
+    from astrotune.delta.train import catalog_summary, plot_nu_det_c
+
+    s = _synthetic_stars(n_star=500, n_cat=3)
+    s["m"] = np.array(s["m"], copy=True)
+    s["m"][s["c"] == 2, 3] = False  # catalog 2 does not measure the fourth parameter
+    out = catalog_summary(ConstScaleAdd(3), s, ("a", "b", "c"))
+    assert np.isfinite(out["det"]).all()
+    assert np.allclose(out["det"][2], out["det"][0], rtol=1e-3)
+    # and the change is the floor's, per parameter: ln(1 + add^2 / C)
+    expected = np.log1p(float(ADD_MIN_SIGMA) ** 2 / 0.03 ** 2)
+    assert np.allclose(out["det"], expected, rtol=0.05)
+
+    path = plot_nu_det_c(out, tmp_path / "nu_det_c.png")
+    assert path.exists() and path.stat().st_size > 10000
+
+
+def test_label_positions_leave_the_dots_and_each_other_clear():
+    """The layout of the point labels: no overlaps, leaders on the box edges."""
+    from astrotune.delta.train import _label_positions
+
+    pts = np.array([[0.5, 0.5], [0.7, 0.4], [1.4, 1.1], [1.8, 0.6]])
+    sizes = np.tile([0.9, 0.12], (len(pts), 1))  # 11 characters or so, at 6.5pt
+    centres, ends = _label_positions(pts, sizes, (0.0, 2.5, 0.0, 1.5))
+    assert np.all(np.isfinite(centres)) and np.all(np.isfinite(ends))
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            # boxes are disjoint in at least one direction
+            dx = abs(centres[i, 0] - centres[j, 0]) - (sizes[i, 0] + sizes[j, 0]) / 2
+            dy = abs(centres[i, 1] - centres[j, 1]) - (sizes[i, 1] + sizes[j, 1]) / 2
+            assert dx > 0 or dy > 0
+        # no label sits on any dot
+        for p in pts:
+            assert (abs(p[0] - centres[i, 0]) > sizes[i, 0] / 2
+                    or abs(p[1] - centres[i, 1]) > sizes[i, 1] / 2)
+        # the leader stops on the label's boundary
+        assert np.allclose(ends[i], np.clip(pts[i],
+                                            centres[i] - sizes[i] / 2,
+                                            centres[i] + sizes[i] / 2))
+
+
+def test_nu_prior_in_nu_space_is_quadratic_in_nu():
+    """The penalty is a Gaussian in nu, not in the unconstrained coordinate."""
+    from astrotune.delta.model import TailWeight
+    from astrotune.delta.train import DeltaConfig
+
+    cfg = DeltaConfig(nu_prior_space="nu", nu_prior_mean=16.0, nu_prior_sd=4.0)
+    assert cfg.nu_prior_space == "nu"
+    t = TailWeight(3)
+    t.raw.assign(np.array([np.log(np.expm1(16.0 - 2.0))] * 3, dtype="f4"))  # nu = 16
+    at_mean = float(t.prior_penalty(cfg.nu_prior_mean, cfg.nu_prior_sd, "nu"))
+    assert at_mean == pytest.approx(0.0, abs=1e-5)
+    assert float(t().numpy()[0]) == pytest.approx(16.0, rel=1e-4)
+    # one prior sd away in nu is a penalty of 0.5, whatever nu it is
+    t.raw.assign(np.array([np.log(np.expm1(12.0 - 2.0))] * 3, dtype="f4"))  # nu = 12
+    assert float(t.prior_penalty(16.0, 4.0, "nu")) == pytest.approx(0.5, rel=1e-3)
+    with pytest.raises(ValueError):
+        t.prior_penalty(16.0, 4.0, "nope")
+
+
+def test_a_fit_starts_its_tail_weight_at_the_prior_mean():
+    """Not at the arbitrary nu = 8 TailWeight is built with, whatever the prior."""
+    from astrotune.delta.model import TailWeight
+    from astrotune.delta.train import DeltaConfig, nu_init
+
+    for space, mean, expected in (("nu", 25.0, 25.0), ("nu", 4.0, 4.0),
+                                  ("raw", 6.0, 8.0), ("raw", 30.0, 32.0)):
+        nu0, raw0 = nu_init(DeltaConfig(nu_prior_space=space, nu_prior_mean=mean))
+        # in raw space the prior mean is a softplus away from the mean of nu
+        assert nu0 == pytest.approx(expected, rel=1e-3)
+        t = TailWeight(2)
+        t.raw.assign(np.full(2, raw0, dtype="f4"))
+        # the raw value is the exact inverse of nu = 2 + softplus(raw)
+        assert np.allclose(t().numpy(), nu0, rtol=1e-5)
+        # and it is the prior's own minimum, so the fit starts unpenalised
+        assert float(t.prior_penalty(mean, 3.0, space)) == pytest.approx(0.0, abs=1e-6)
+
+

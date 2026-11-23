@@ -8,11 +8,27 @@ vector ``y`` per star and fits
 
     L_data = mean over observations of rho( sum_p (x_p - f_c^-1(y)_p)^2 / sigma_p^2 ),
 
-with ``rho`` the softened chi^2 of the pair loss. Every observation of a star is
-compared with the *same* ``y``, so no catalog is regressed onto another and the
-inverse-variance weighting cannot shrink a map. A parameter that a catalog does
-not measure carries ``sigma = 1e9``, so it drops out of the chi^2 without a
-mask.
+with ``rho`` the deviation of a Student's t,
+
+    rho(chi2) = (nu_c + d) log(1 + chi2 / nu_c) ,
+
+for an observation of catalog ``c`` that measures ``d`` parameters, and with the
+softened chi^2 of the pair loss, ``S * arcsinh(chi2 / S)``, as the alternative
+``--data-term softened``. The t is the default because it is a likelihood rather
+than a robustifier: minus twice its log density is the data term, so the ``y``
+step and the map descend the same likelihood, and its tail index is the ``nu`` a
+delta model fits to the same measurements. ``nu -> inf`` recovers the Gaussian
+chi^2 the pipeline was built around, so the change is to the tail and not to the
+calibration. It costs no iteration -- the curvature weight
+``(nu + d) / (nu + chi2)`` is one line, and the derivation is in
+``notes/gauss_newton_with_students_t.tex``. ``nu`` is a per-catalog constant:
+``--nu`` sets it, and observations built from a delta model's calibrated sigmas
+carry the values that model fitted (:func:`resolve_nu`).
+
+Every observation of a star is compared with the *same* ``y``, so no catalog is
+regressed onto another and the inverse-variance weighting cannot shrink a map. A
+parameter that a catalog does not measure carries ``sigma = 1e9``, so it drops
+out of the chi^2 without a mask.
 
 ``y`` starts at the precision-weighted mean of the star's observations. Each step
 then fits it by solving the star's Gauss-Newton normal equations with the
@@ -76,6 +92,7 @@ from tensorflow import keras
 from tqdm.auto import tqdm
 
 from . import config, registry
+from . import profile
 from .evaluate import (
     PARAM_SHORT,
     evaluate_bijector,
@@ -85,7 +102,7 @@ from .evaluate import (
 )
 from .model import ODEBijector
 from .model.io import enable_memory_growth
-from .train import arcsinh_of_exp
+from .profile import DATA_TERMS, MISSING
 from .training_data import load_observations, read_attrs
 from .training_plots import (
     catalog_colors,
@@ -96,9 +113,6 @@ from .training_plots import (
 
 log = logging.getLogger(__name__)
 
-#: ``sigma_x`` above this marks a parameter that the catalog does not measure
-MISSING = 1e6
-
 #: Penalty metrics drawn by the progress figure
 LATENT_PENALTIES = (
     ("penalty_obs", "penalty (obs)"),
@@ -107,10 +121,20 @@ LATENT_PENALTIES = (
     ("penalty_l2", "penalty (l2)"),
 )
 
+#: Shapes the learning rate can follow; see
+#: :attr:`LatentTrainConfig.lr_schedule`.
+LR_SCHEDULES = ("cosine", "discrete")
+
 #: Per-step metrics recorded by the training loop
 METRIC_KEYS = (
     "loss",
     "chi2",
+    # The mean raw chi^2 of an observation, i.e. the Mahalanobis residual
+    # squared. ``chi2`` above is the *data term* the loss averages, which since
+    # the Student's t is written as a distortion of chi^2 -- the two agree in the
+    # bulk and part company in the tail, so this is the one number that can be
+    # compared across the two loss definitions.
+    "chi2_raw",
     "penalty_obs",
     "penalty_ctrl",
     "penalty_div",
@@ -159,8 +183,12 @@ class LatentTrainConfig:
     ode_atol: float = 1e-5
 
     # Optimization
-    batch_size: int = 16384  # observations per batch
-    n_epochs: int = 16
+    #: Observations per batch: 2**16, the size every production run has used. The
+    #: batch is what one Gauss-Newton solve and one optimizer step see, so it sets
+    #: the noise on the step (a batch of 16384 makes ~4x as many, noisier steps) as
+    #: well as the memory; with the current sample it is 83 steps per epoch.
+    batch_size: int = 65536
+    n_epochs: int = 256
     #: Independent block permutations concatenated into one epoch. The data of an
     #: epoch are ``block_shuffles`` passes over the training set, so with
     #: ``drop_remainder`` the rows lost at the end of an epoch are those of one
@@ -171,13 +199,33 @@ class LatentTrainConfig:
     #: shape) or kept (no row is ever skipped).
     drop_remainder: bool = False
     val_frac: float = 1 / 8  # fraction of *stars* held out
-    learning_rate: float = 1e-3
-    #: Number of piecewise-constant segments the rate is spread over; the rate
-    #: is halved from one segment to the next, so it covers a factor
+    #: Peak learning rate. Adam's step is roughly ``lr`` per coordinate whatever
+    #: the gradient does, so this number sets how far the map can travel per step:
+    #: an order of magnitude too large and a run walks into a distorted region that
+    #: it then punishes itself for. 1e-4 is the rate every production run has used.
+    learning_rate: float = 1e-4
+    #: Shape of the rate schedule.
+    #:
+    #: ``cosine``
+    #:     ``lr * (1 + cos(pi t / T)) / 2``: flat at the start -- zero slope, so the
+    #:     early steps are as gentle as a constant rate -- and rolling down to zero
+    #:     over the last epochs. The default, because a rate that decays early leaves
+    #:     the final epochs doing nothing: with the eight-segment schedule below, the
+    #:     last segment ran at ``lr / 128`` for an eighth of the run, and continuing
+    #:     a finished run at ``1e-4`` still found a lower loss.
+    #:
+    #: ``discrete``
+    #:     ``lr_schedule_phases`` equal segments with the rate halved at each
+    #:     boundary. Kept because every run made before this option existed used it,
+    #:     and because a constant rate is what an lr comparison wants (``phases = 1``).
+    lr_schedule: str = "cosine"
+    #: Number of piecewise-constant segments for ``lr_schedule="discrete"``; the
+    #: rate is halved from one segment to the next, so it covers a factor
     #: ``2 ** (lr_schedule_phases - 1)``. The segments are equal fractions of
     #: the run, which with ``n_epochs`` fixed is also equal fractions of its
     #: data, so the schedule is comparable across batch sizes. Set it to 1 for
-    #: a constant rate, which is what an lr comparison wants.
+    #: a constant rate, which is what an lr comparison wants. Unused by the
+    #: cosine schedule.
     lr_schedule_phases: int = 8
     #: Fraction of the run over which the rate ramps linearly from
     #: ``learning_rate / warmup_steps`` up to ``learning_rate`` before the decay
@@ -260,6 +308,45 @@ class LatentTrainConfig:
     pretrain_steps: int = 0
 
     # Observation loss
+    #: Which data term the loss averages over the observations: ``"student_t"``
+    #: (the default) or ``"softened"``.
+    #:
+    #: ``student_t`` gives each observation a multivariate Student's t with
+    #: ``nu_c`` degrees of freedom, scale ``diag(sigma^2)`` and ``d`` measured
+    #: dimensions, and keeps the ``y``-dependent part of ``-2 ln p``:
+    #:
+    #:     rho = (nu + d) ln(1 + chi2 / nu) .
+    #:
+    #: The exact deviance is half that; the factor two is deliberate, because
+    #: then ``nu -> inf`` gives ``rho -> chi2`` (the quantity the pair loss
+    #: averages), so the control-point penalties keep the strength they were
+    #: tuned with. Its curvature, ``(nu + d) / (nu + chi2)``, is what the
+    #: Gauss-Newton step weights by, which is the weight derived in
+    #: ``notes/gauss_newton_with_students_t.tex``.
+    #:
+    #: ``softened`` is the pair loss's ``S * arcsinh(chi2 / S)`` with
+    #: ``S = chi2_turnover``, kept so that runs made before the t existed can
+    #: still be reproduced and resumed.
+    data_term: str = "student_t"
+    #: Degrees of freedom, for every catalog that does not bring its own -- see
+    #: :func:`resolve_nu`. The default is 25, which caps the influence of an
+    #: observation at ``chi2 ~ 25``: the Gauss-Newton weight
+    #: ``(nu + d) / (nu + chi2)`` is then half its small-residual value at
+    #: ``chi2 = 25`` and falls as ``1/chi2`` beyond, so ~5-sigma outliers are
+    #: suppressed while everything below 4-sigma is fitted as in the Gaussian case
+    #: (weight 0.97 at ``chi2 = 1``). It also stays clear of the ``nu = 2`` limit,
+    #: where the t is nearly Cauchy and no catalog in the survey asks for it.
+    #: ``nu = chi2_turnover = 50`` was the earlier default: the value at which the
+    #: t and the softened chi^2 agree to first order. Lower ``--nu`` for a stricter
+    #: robustifier.
+    nu: float = 25.0
+    #: Read ``nu`` per catalog from the observations file when the file records
+    #: it, which ``astrotune-observations --sigma-source delta`` arranges: that
+    #: file's sigma come from a delta model, and the ``nu`` written with them is
+    #: the one the same delta model fitted to those sigmas. A file built from the
+    #: floored sigma has no such attribute and every catalog gets ``nu`` above.
+    nu_from_observations: bool = True
+    #: Turnover of the softened chi^2. Only used by ``data_term="softened"``.
     chi2_turnover: float = 50.0
     #: Whether the path length of the observations' inverse map enters the loss
     #: (the pair trainer's ``pair_path_in_loss``, off by default there too).
@@ -346,6 +433,53 @@ def initial_y(obs_dict) -> np.ndarray:
         num.append(np.bincount(star, weights=w[:, p] * x[:, p], minlength=n_stars))
         den.append(np.bincount(star, weights=w[:, p], minlength=n_stars))
     return (np.stack(num, axis=1) / np.maximum(np.stack(den, axis=1), 1e-30)).astype("f4")
+
+
+def resolve_nu(
+    attrs: Optional[dict], n_cat: int, cfg: LatentTrainConfig
+) -> np.ndarray:
+    """The degrees of freedom of every catalog, ``(n_cat,)``.
+
+    ``cfg.nu`` is the default for all of them. A file made with
+    ``astrotune-observations --sigma-source delta`` carries a ``nu`` attribute
+    instead -- the delta model's fitted per-group ``nu``, expanded to one value
+    per catalog -- and those are used, so that the tail and the scale of a
+    measurement come from the same fit. That is what "the delta model calibrated
+    these sigmas" has to mean: the shape of their error distribution is part of
+    the calibration, and a sigma that was inflated to survive outliers should
+    not then be read by a nearly Gaussian likelihood.
+
+    The attribute is a comma-separated list in ``catalogs`` order, both written
+    by :mod:`astrotune.training_data`. A file whose catalog list is not this
+    run's prefix is refused rather than silently mis-indexed by position: the
+    observations index their catalog by position, so a mismatch would attach one
+    catalog's tail to another's measurements.
+    """
+    nu = float(cfg.nu)
+    if not nu > 0:
+        raise ValueError(f"nu must be positive, not {cfg.nu!r}")
+    if not cfg.nu_from_observations or not attrs or "nu" not in attrs:
+        return np.full(n_cat, nu, dtype="f4")
+
+    values = attrs["nu"]
+    if isinstance(values, bytes):
+        values = values.decode()
+    try:
+        nus = np.array([float(v) for v in str(values).split(",")], dtype="f8")
+    except ValueError as exc:
+        raise ValueError(f"the observations' nu attribute is not a list of numbers: {values!r}") from exc
+
+    keys = str(attrs.get("catalogs", "")).split(",")
+    expected = list(registry.keys()[:n_cat])
+    if list(keys[:n_cat]) != expected or len(nus) < n_cat:
+        raise ValueError(
+            f"the observations file records nu for {len(nus)} catalogs ({keys[:n_cat]}) "
+            f"but this run uses {n_cat} ({expected}); rebuild the observations or "
+            "pass --no-nu-from-observations to use --nu for every catalog"
+        )
+    if np.any(nus[:n_cat] <= 0):
+        raise ValueError(f"the observations' nu must be positive, not {nus[:n_cat]}")
+    return nus[:n_cat].astype("f4")
 
 
 def held_out_stars(n_stars: int, val_frac: float, seed: int) -> np.ndarray:
@@ -455,6 +589,36 @@ def _warmup_and_decay(decay, peak: float, warmup_steps: int):
     return _WarmupAndDecay(decay, peak, warmup_steps)
 
 
+def lr_schedule(cfg: "LatentTrainConfig", n_steps: int):
+    """The learning-rate schedule of a run, as a Keras schedule over ``n_steps``.
+
+    See :attr:`LatentTrainConfig.lr_schedule` for the two shapes. Both start at
+    ``cfg.learning_rate`` and end near zero; they differ in how much of the run is
+    spent at a useful rate. The cosine is flat at the start (zero slope) and rolls
+    down through the whole run, so no part of it is wasted; the discrete one holds
+    each segment flat and halves at the boundaries, which spends its last segment at
+    ``lr / 2 ** (phases - 1)`` -- an eighth of the run at ``lr / 128`` with the old
+    default of eight phases.
+    """
+    if cfg.lr_schedule not in LR_SCHEDULES:
+        raise ValueError(
+            f"lr_schedule must be one of {', '.join(LR_SCHEDULES)}, "
+            f"not {cfg.lr_schedule!r}"
+        )
+    n = max(8, int(n_steps))
+    if cfg.lr_schedule == "cosine":
+        return keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=cfg.learning_rate, decay_steps=n, alpha=0.0
+        )
+    k = max(1, min(int(cfg.lr_schedule_phases), n))
+    if k == 1:  # a constant rate; the decay needs one boundary to exist
+        boundaries, values = [n], [cfg.learning_rate, cfg.learning_rate]
+    else:
+        boundaries = [i * n // k for i in range(1, k)]
+        values = [cfg.learning_rate / 2**i for i in range(k)]
+    return keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
+
+
 def checkpoints_to_keep(steps, n_steps, every, recent=8, milestones=32):
     """Which of the saved checkpoints to keep: a recent band plus milestones.
 
@@ -503,14 +667,36 @@ def _make_ctrl_dataset(arrays, batch_size: int, seed: int, n_repeat: Optional[in
 class LatentTrainer:
     """Holds the bijector, the free harmonized parameters and the data pipelines."""
 
-    def __init__(self, obs_dict, ctrl_dict, cfg: LatentTrainConfig):
+    def __init__(
+        self, obs_dict, ctrl_dict, cfg: LatentTrainConfig, attrs: Optional[dict] = None
+    ):
         if cfg.y_solver not in ("gauss_newton", "gradient"):
             raise ValueError(
                 f"y_solver must be 'gauss_newton' or 'gradient', not {cfg.y_solver!r}"
             )
+        if cfg.data_term not in DATA_TERMS:
+            raise ValueError(
+                f"data_term must be one of {DATA_TERMS}, not {cfg.data_term!r}"
+            )
         self.cfg = cfg
         self.n_dim = obs_dict["x"].shape[1]
         self.n_cat = int(ctrl_dict["c_control"].max()) + 1
+
+        # The tail weight of every catalog, ``(n_cat,)``: from the observations
+        # file when a delta model calibrated its sigmas, else ``cfg.nu``.
+        nu_cat = resolve_nu(attrs, self.n_cat, cfg)
+        self.nu_cat = tf.constant(nu_cat, dtype=tf.float32)
+        if cfg.data_term == "student_t":
+            if np.allclose(nu_cat, nu_cat[0]):
+                log.info("Data term: Student's t, nu = %.4g for every catalog", nu_cat[0])
+            else:
+                log.info(
+                    "Data term: Student's t, nu per catalog: %s",
+                    ", ".join(
+                        f"{registry.get_spec(k).label} {v:.2f}"
+                        for k, v in zip(registry.keys()[: self.n_cat], nu_cat)
+                    ),
+                )
 
         tf.random.set_seed(cfg.seed)
 
@@ -572,15 +758,10 @@ class LatentTrainer:
         # The learning-rate budget is set by the number of steps, so the data
         # pipeline must be built first.
         n = max(8, self.n_steps)
-        k = max(1, min(int(cfg.lr_schedule_phases), n))
-        if k == 1:  # a constant rate; the decay needs one boundary to exist
-            boundaries, values = [n], [cfg.learning_rate, cfg.learning_rate]
-        else:
-            boundaries = [i * n // k for i in range(1, k)]
-            values = [cfg.learning_rate / 2**i for i in range(k)]
-        decay = keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
+        decay = lr_schedule(cfg, n)
         warmup_steps = int(cfg.lr_warmup_frac * n)
         self.learning_rate = _warmup_and_decay(decay, cfg.learning_rate, warmup_steps)
+        log.info("Learning-rate schedule: %s", cfg.lr_schedule)
         if warmup_steps:
             log.info(
                 "Learning rate ramps to %.3g over the first %d steps (%d%% of the run).",
@@ -784,83 +965,62 @@ class LatentTrainer:
     # an error in the maths here. None of these helpers has data-dependent Python
     # control flow, so autograph has nothing to do for them in the first place.
     @tf.autograph.experimental.do_not_convert
-    def _normal_equations(self, x, xs, x_pred, jac, chi2_obs, star):
-        """Per-star ``(A, b)`` of the Gauss-Newton step in ``y``.
+    def _loss_inputs(self, x, xs, x_pred, c):
+        """``(chi2, d, nu)`` of every observation of the batch.
 
-        With ``C = diag(sigma^2)`` diagonal, the normal equations of one
-        observation are ``J^T W J`` and ``J^T W (x - x_pred)``, ``W =
-        w / sigma^2`` elementwise. The weight ``w`` is the curvature of the
-        softened chi^2 the loss actually uses: the loss is
-        ``S * arcsinh(chi2 / S)``, whose derivative with respect to ``chi2`` is
-        ``1 / sqrt(1 + (chi2 / S)^2)``, so weighting by it makes the step the
-        exact minimiser of that loss and not merely of a quadratic stand-in.
-
-        Returns the summed matrices of shape ``(n_star, n_dim, n_dim)`` and
-        vectors of shape ``(n_star, n_dim)``, and the ``tf.unique`` of the star
-        index.
+        See :func:`astrotune.profile.loss_inputs`; this is the trainer's thin wrapper,
+        which supplies the per-catalog degrees of freedom it resolved at startup.
         """
-        cfg = self.cfg
-        weight = (1.0 / tf.sqrt(1.0 + (chi2_obs / cfg.chi2_turnover) ** 2))[:, None]
-        weight = weight / xs**2
-        dx = x - x_pred
-        A = tf.einsum("npa,np,npb->nab", jac, weight, jac)
-        b = tf.einsum("npa,np,np->na", jac, weight, dx)
-        uniq, inv = tf.unique(star)
-        n = tf.size(uniq)
-        return (
-            tf.math.unsorted_segment_sum(A, inv, n),
-            tf.math.unsorted_segment_sum(b, inv, n),
-            uniq,
+        return profile.loss_inputs(x, xs, x_pred, c, self.nu_cat)
+
+    @tf.autograph.experimental.do_not_convert
+    def _data_term(self, chi2_obs, d_obs, nu_obs):
+        """The per-observation data term the loss averages.
+
+        See :func:`astrotune.profile.data_term`; ``cfg.data_term`` picks the Student's
+        t (default) or the softened chi^2.
+        """
+        return profile.data_term(
+            chi2_obs, d_obs, nu_obs,
+            data_term=self.cfg.data_term, chi2_turnover=self.cfg.chi2_turnover,
         )
 
     @tf.autograph.experimental.do_not_convert
-    def _solve_y(self, A, b, return_scale=False):
-        """Solve the per-star normal equations, with a ridge for flat directions.
+    def _data_weight(self, chi2_obs, d_obs, nu_obs):
+        """``d rho / d chi2``, the curvature the Gauss-Newton step weights by.
 
-        A parameter that none of a star's catalogs measures has ``sigma = 1e9``,
-        so its row and column of ``A`` are ~1e-18 and the system is singular; the
-        ridge makes the step in that direction ~0 instead of undefined, which is
-        the same outcome the ``den > 1e-6`` test gives the gradient solver. It is
-        diagonal on purpose: an off-diagonal term would leak the other
-        components' steps into a direction they say nothing about. It also damps
-        the nearly-flat directions, where the full step is hundreds of sigma.
-
-        The result is then passed through the trust region, and the fraction of
-        the step that radii allowed is returned as well when ``return_scale``.
+        See :func:`astrotune.profile.data_weight`.
         """
-        n_dim = tf.shape(b)[-1]
-        scale = tf.reduce_mean(tf.linalg.diag_part(A), axis=1)[:, None, None]
-        ridge = (self.cfg.y_ridge * scale + 1e-8) * tf.eye(n_dim, dtype=A.dtype)
-        step = tf.linalg.solve(A + ridge, b[:, :, None])[:, :, 0]
-        step, allowed = self._trust_region(step)
-        return (step, allowed) if return_scale else step
+        return profile.data_weight(
+            chi2_obs, d_obs, nu_obs,
+            data_term=self.cfg.data_term, chi2_turnover=self.cfg.chi2_turnover,
+        )
 
     @tf.autograph.experimental.do_not_convert
-    def _trust_region(self, step):
-        """Scale whole steps down to the trust radius; returns ``(step, allowed)``.
+    def _normal_equations(self, x, xs, x_pred, jac, weight, star):
+        """Per-star ``(A, b)`` of the Gauss-Newton step in ``y``.
 
-        A Gauss-Newton step is a full Newton step, and where a star's normal
-        matrix is nearly singular it can be arbitrarily large. A star flung like
-        that is a star whose `y` is being fitted against a map that has just
-        changed under it; the next sweep of the map then trains on the flung
-        value, and the two can push each other away over a few steps.
-        ``latent_gn_5h`` went from chi^2 4.1 to 105 in fifteen steps, which is too
-        large for one star to cause (the loss is a mean over 65k observations and
-        the arcsinh softening caps a single star's contribution), but not too
-        large for a self-feeding ``y``-map loop.
-
-        So no star may move by more than ``y_trust_abs`` in any one parameter. The
-        step is *scaled*, never clipped component by component: every component
-        keeps its share, so the scaled step is still the exact minimiser of the
-        quadratic along that line, and the normal-equation solve is untouched in
-        the (overwhelmingly common) case where nothing binds.
+        See :func:`astrotune.profile.normal_equations`; the merge calls the same
+        function, so "the merged ``y``" and "the trained ``y``" are one estimator.
         """
-        cfg = self.cfg
-        if not cfg.y_trust_abs:
-            return step, tf.ones_like(step[:, 0])
-        biggest = tf.reduce_max(tf.abs(step), axis=1)
-        allowed = tf.minimum(1.0, cfg.y_trust_abs / tf.maximum(biggest, 1e-12))
-        return step * allowed[:, None], allowed
+        return profile.normal_equations(x, xs, x_pred, jac, weight, star)
+
+    @tf.autograph.experimental.do_not_convert
+    def _solve_y(self, A, b, return_scale=False):
+        """Solve the per-star normal equations, then apply the trust region.
+
+        See :func:`astrotune.profile.solve`: the ridge handles the directions a star
+        says nothing about (``sigma = 1e9``), and the trust region caps how far one
+        star may move in one sweep. That cap is not decoration: a nearly singular
+        ``A`` admits steps of hundreds of sigma, the map then trains on the flung
+        value, and the two can push each other away -- ``latent_gn_5h`` went from
+        chi^2 4.1 to 105 in fifteen steps before it was added. The step is *scaled*,
+        never clipped component by component, so its direction survives.
+        """
+        return profile.solve(
+            A, b, ridge=self.cfg.y_ridge, trust=self.cfg.y_trust_abs or 0.0,
+            return_scale=return_scale,
+        )
 
     def _fit_y_val(self, x, xs, c, star) -> tf.Tensor:
         """One Gauss-Newton sweep of the held-out stars' ``y``, kept between calls.
@@ -882,8 +1042,9 @@ class LatentTrainer:
         x_pred, _, jac = self.bij.inverse_with_s_and_jac(
             tf.gather(self.y_val, star), c=c
         )
-        chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
-        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, chi2_obs, star)
+        chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c)
+        weight = self._data_weight(chi2_obs, d_obs, nu_obs)
+        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, weight, star)
         step = self._solve_y(A, b)
         if cfg.y_learning_rate:
             self.y_val.scatter_nd_add(
@@ -892,7 +1053,7 @@ class LatentTrainer:
         return tf.gather(self.y_val, star)
 
     def _gauss_newton_y(self, x, xs, c, star):
-        """Move ``y`` to the Gauss-Newton optimum of the batch's chi^2.
+        """Move ``y`` to the Gauss-Newton optimum of the batch's data term.
 
         Called before the map's gradient step, so the map trains against the
         harmonized values it will actually be scored with. The batch holds the
@@ -900,7 +1061,10 @@ class LatentTrainer:
         shuffled in star blocks), so one step is the full profile optimum for
         those stars rather than a partial one; the measurement on a finished run
         showed that a second step moves the mean softened chi^2 by only 2%,
-        hence one step here.
+        hence one step here. Under the Student's t the same holds a fortiori: the
+        weight is recomputed from the residual each sweep, so a second sweep
+        corrects for the weight having moved, which is a smaller effect than the
+        step itself.
 
         Returns the statistics of the step, which are recorded as metrics: the
         mean fraction the trust region allowed, the fraction of stars it capped,
@@ -912,8 +1076,9 @@ class LatentTrainer:
         if not cfg.y_learning_rate:
             return 1.0, 0.0, 0.0
         x_pred, _, jac = self.bij.inverse_with_s_and_jac(tf.gather(self.y, star), c=c)
-        chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
-        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, chi2_obs, star)
+        chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c)
+        weight = self._data_weight(chi2_obs, d_obs, nu_obs)
+        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, weight, star)
         step, allowed = self._solve_y(A, b, return_scale=True)
         self.y.scatter_nd_add(tf.expand_dims(uniq, 1), cfg.y_learning_rate * step)
         return (
@@ -1141,13 +1306,13 @@ class LatentTrainer:
             # Map every observation's harmonized value back into its catalog
             x_pred, s = bij.inverse_with_s(y, c=c)
 
-            # chi^2 of each observation. An unmeasured parameter has sigma = 1e9
-            # and contributes ~1e-18, so no mask is needed.
-            chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
-            chi2 = cfg.chi2_turnover * arcsinh_of_exp(
-                tf.math.log(chi2_obs + 1e-30) - tf.math.log(cfg.chi2_turnover)
-            )
-            chi2 = tf.reduce_mean(chi2)
+            # The data term of every observation. An unmeasured parameter has
+            # sigma = 1e9 and contributes ~1e-18 to chi^2, so no mask is needed;
+            # it does leave the t's dimension, which is why ``d`` counts the
+            # measured parameters rather than the width of the vector.
+            chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c)
+            chi2 = tf.reduce_mean(self._data_term(chi2_obs, d_obs, nu_obs))
+            chi2_raw = tf.reduce_mean(chi2_obs)
 
             # Path-length penalty of the observation transformations
             penalty_obs = cfg.l1_path * tf.reduce_mean(tf.abs(s)) + cfg.l2_path * tf.reduce_mean(
@@ -1188,6 +1353,7 @@ class LatentTrainer:
         res = {
             "loss": loss,
             "chi2": chi2,
+            "chi2_raw": chi2_raw,
             "penalty_obs": penalty_obs,
             "penalty_ctrl": penalty_ctrl,
             "penalty_div": penalty_div,
@@ -1616,6 +1782,14 @@ def _config_from_json(d: dict) -> dict:
     d = dict(d)
     if "freeze_vars" in d:
         d["freeze_vars"] = tuple(d["freeze_vars"])
+    # Runs started before the Student's t existed were trained and will be
+    # resumed with the softened chi^2, so that is what a missing ``data_term``
+    # means. Without this the new field's default would be filled in and a
+    # resume would silently change the objective halfway through a run.
+    d.setdefault("data_term", "softened")
+    # Likewise a run that saved ``lr_schedule_phases`` and no ``lr_schedule`` spent
+    # its life on the discrete schedule, whatever the default is now.
+    d.setdefault("lr_schedule", "discrete" if "lr_schedule_phases" in d else "cosine")
     return d
 
 
@@ -1659,6 +1833,13 @@ def run_training(
         n_stars=int(obs_dict["n_stars"]),
         n_control=len(ctrl_dict["x_control"]),
     )
+    # Which degrees of freedom the run actually uses: ``cfg.nu`` for every
+    # catalog, or the per-catalog values that came with the sigmas. Recorded so
+    # that a resume cannot quietly train a different objective, and so that the
+    # run states the tail it was fitted with.
+    n_cat = int(ctrl_dict["c_control"].max()) + 1
+    obs_attrs = read_attrs(observations_path)
+    nu_values = resolve_nu(obs_attrs, n_cat, cfg)
     if resume:
         with open(cfg_path) as f:
             snapshot = json.load(f)
@@ -1669,6 +1850,13 @@ def run_training(
                     f"with ({key}: {snapshot.get(key)} -> {value})."
                 )
         _check_resumable(snapshot, cfg)
+        saved_nu = snapshot.get("nu_values")
+        if saved_nu is not None and not np.allclose(np.asarray(saved_nu), nu_values):
+            raise ValueError(
+                "The observations file's per-catalog nu differs from the one the run "
+                f"was started with ({saved_nu} -> {nu_values.tolist()})."
+            )
+        snapshot["nu_values"] = [float(v) for v in nu_values]
         snapshot["config"] = dataclasses.asdict(cfg)
         snapshot.setdefault("resumed", []).append(
             datetime.now().isoformat(timespec="seconds")
@@ -1678,16 +1866,17 @@ def run_training(
             "config": dataclasses.asdict(cfg),
             "loss": "latent_y",
             "observations_path": str(observations_path or config.OBSERVATIONS_PATH),
-            "observations_attrs": read_attrs(observations_path),
+            "observations_attrs": obs_attrs,
+            "nu_values": [float(v) for v in nu_values],
             **sizes,
-            "catalogs": list(registry.keys()[: int(ctrl_dict["c_control"].max()) + 1]),
+            "catalogs": list(registry.keys()[:n_cat]),
             "tensorflow": tf.__version__,
             "started": datetime.now().isoformat(timespec="seconds"),
         }
     with open(cfg_path, "w") as f:
         json.dump(snapshot, f, indent=2)
 
-    trainer = LatentTrainer(obs_dict, ctrl_dict, cfg)
+    trainer = LatentTrainer(obs_dict, ctrl_dict, cfg, attrs=obs_attrs)
     metrics = trainer.train(run_dir, resume=resume)
     trainer.save(run_dir, metrics)
     log.info("Saved model to %s", run_dir)

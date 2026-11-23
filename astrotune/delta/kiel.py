@@ -132,18 +132,14 @@ def _entries(run_dir: Path, sample: str, keys: Sequence[str], out_dir: Optional[
             sel = np.flatnonzero(c == k)
             yield k, {name: stars[name][sel] for name in fields}
         return
-    from ..apply import load_cached, make_forward_and_jacobian
+    from ..apply import make_forward_and_jacobian
     from ..model import load_bijector
 
-    cache_dir = Path(run_dir) / "harmonized" / "transform_cache_none"
     fwd_jac = make_forward_and_jacobian(load_bijector(run_dir))
     for k, key in enumerate(keys):
         t = load_catalog(key)
         index = registry.category_index(key) if key in registry.keys() else k
-        est = load_cached(cache_dir, index, np.asarray(t["id"]), t)
-        if est is None:
-            raise FileNotFoundError(f"No usable cached transformation for {key} in {cache_dir}.")
-        c = _catalog_entries(est, t, key, fwd_jac, index)
+        c = _catalog_entries(t, key, fwd_jac, index)
         yield k, {name: c[name] for name in fields}
 
 

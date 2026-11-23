@@ -109,3 +109,37 @@ def test_calibrated_sigma_reproduces_the_prepared_one_when_the_model_says_nothin
     assert got.shape == sig_raw.shape
     assert np.allclose(got, want, rtol=2e-3)
     assert np.all(got >= ADD_MIN_SIGMA * 0.99)
+
+
+def test_calibrated_sigma_handles_a_three_parameter_catalog():
+    """A catalog without [alpha/Fe] has a ``(n, 3)`` quoted sigma, not ``(n, 4)``.
+
+    The model always emits four columns, so the reconstruction has to pad the
+    quoted one: without that the product fails with
+    ``operands could not be broadcast together with shapes (n,4) (n,3)``, which
+    is how the second-iteration observations were first built.
+    """
+    import tempfile
+    from pathlib import Path
+
+    import astrotune.delta.feed as feed
+    from astrotune.delta.model import ADD_MIN_SIGMA, ConstScaleAdd
+
+    rng = np.random.default_rng(2)
+    n = 120
+    sig_raw = np.exp(rng.normal(np.log(0.08), 0.3, size=(n, 3))).astype("f4")
+    floor = np.array([0.01, 0.01, 0.04])
+    table = Table({"id": np.arange(1, n + 1, dtype="i8"),
+                   "x": np.zeros((n, 3), "f4"),
+                   "sigma_x": np.hypot(sig_raw, floor).astype("f4"),
+                   "sigma_x_raw": sig_raw})
+
+    model = ConstScaleAdd(1)
+    with tempfile.TemporaryDirectory() as tmp, pytest.MonkeyPatch.context() as mp:
+        mp.setattr("astrotune.prep.io.load_catalog", lambda key: table)
+        got = feed.calibrated_sigma(".", keys=("fake",), out_dir=Path(tmp),
+                                    model=model)["fake"]
+
+    assert got.shape == sig_raw.shape  # three columns, as the table has
+    assert np.allclose(got, np.hypot(sig_raw, ADD_MIN_SIGMA), rtol=2e-3)
+    assert np.all(np.isfinite(got))

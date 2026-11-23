@@ -78,8 +78,22 @@ class DeltaConfig:
     pair_chi2_max: Optional[int] = 2_000_000
     #: Learn a per-catalog degrees of freedom for a Student's t (False: Gaussian)
     learn_nu: bool = True
-    nu_prior_mean: float = 6.0  # in the unconstrained coordinate: nu = 2 + softplus(6) = 8
-    nu_prior_sd: float = 2.0  # 95 % of the prior mass on nu in [4.1, 12.0]
+    #: Where the prior on nu is Gaussian: in ``raw`` (``nu = 2 + softplus(raw)``, so
+    #: ``p(nu)`` rises towards ``nu = 2``) or in ``nu`` itself (a half-Gaussian on
+    #: ``nu >= 2``, which vanishes at 2). The mean and sd are read in that space.
+    #: ``nu`` is the default: the prior is then a statement about the tail weight
+    #: rather than about an unconstrained coordinate.
+    nu_prior_space: str = "nu"
+    #: Default prior ``nu = 25 +- 10``. Two reasons, both worth stating in a paper:
+    #: nu = 25 caps the influence of an observation at ``chi2 ~ 25`` (the GN weight
+    #: ``(nu + d)/(nu + chi2)`` is half its small-residual value there and falls as
+    #: ``1/chi2`` beyond), i.e. it suppresses ~5-sigma outliers and leaves the rest
+    #: of the distribution alone; and sd = 10 makes that weak -- every nu in the
+    #: range the data ask for (4 to 32 in our own tests) sits within 2 sigma, while
+    #: the Cauchy limit nu = 2 is 2.3 sigma away, so the fit can move nu where the
+    #: data want it but cannot wander to nu ~ 2.
+    nu_prior_mean: float = 25.0
+    nu_prior_sd: float = 10.0
     nu_prior_weight: float = 0.01
     #: Prior that pulls each group's shared variance down to the floor
     shared_prior_weight: float = 0.01
@@ -87,6 +101,20 @@ class DeltaConfig:
     uncertainty_plots: bool = True
     #: Fit one shared systematic per group of catalogs that run the same pipeline
     groups: bool = True
+
+
+def nu_init(cfg: "DeltaConfig") -> Tuple[float, float]:
+    """Where a fresh fit starts its tail weight: the prior mean, as ``(nu, raw)``.
+
+    ``TailWeight`` is built with an initial ``nu = 8``, which is a fallback and not a
+    statement about anything; a run should start where its prior says the answer is,
+    so that a wide prior centred at 32 does not spend its first epochs travelling
+    from 8. The raw value is the exact inverse of ``nu = 2 + softplus(raw)``.
+    """
+    nu = (float(cfg.nu_prior_mean) if cfg.nu_prior_space == "nu"
+          else 2.0 + float(np.logaddexp(0.0, float(cfg.nu_prior_mean))))
+    raw = float(np.log(np.expm1(max(nu - 2.0, 1e-6))))
+    return nu, raw
 
 
 def _spec(tf):
@@ -176,39 +204,297 @@ def fit(model, stars, cfg: DeltaConfig, epochs: int, lr: float, val=None,
             shared_t = model.shared.variance() if n_group is not None else None
             nll, params = star_nll(batch, model, nu=nu, n_group=n_group, shared=shared_t)
             data = tf.reduce_mean(nll)
-            prior = cfg.prior_weight * prior_penalty(batch, params)
-            loss = data + tf.cast(prior, tf.float64) + tf.cast(cfg.l2_weights * l2_penalty(model), tf.float64)
+            # Every term is kept separately: the history below plots them, and a
+            # prior that has quietly taken over the fit is only visible that way.
+            prior = tf.cast(cfg.prior_weight * prior_penalty(batch, params), tf.float64)
+            l2 = tf.cast(cfg.l2_weights * l2_penalty(model), tf.float64)
+            loss = data + prior + l2
+            zero = tf.constant(0.0, tf.float64)
+            nu_prior = zero
             if getattr(model, "tail", None) is not None:
-                # One Gaussian prior per catalog on the unconstrained dof coordinate
-                loss += tf.cast(cfg.nu_prior_weight * model.tail.prior_penalty(
-                    cfg.nu_prior_mean, cfg.nu_prior_sd), tf.float64)
+                # One Gaussian per catalog on the tail weight, in raw or in nu.
+                nu_prior = tf.cast(cfg.nu_prior_weight * model.tail.prior_penalty(
+                    cfg.nu_prior_mean, cfg.nu_prior_sd, cfg.nu_prior_space), tf.float64)
+                loss += nu_prior
+            shared_prior = zero
             if getattr(model, "shared", None) is not None:
                 # ... and one that pulls each group's shared variance down to the floor
-                loss += tf.cast(cfg.shared_prior_weight * model.shared.prior_penalty(),
-                                tf.float64)
+                shared_prior = tf.cast(cfg.shared_prior_weight * model.shared.prior_penalty(),
+                                       tf.float64)
+                loss += shared_prior
+            control_term = zero
             if control is not None and cfg.control_weight:
                 # Away from the data the model is pulled to scale 1, add 0: the same
                 # prior, evaluated on points the likelihood never sees.
-                loss += tf.cast(cfg.control_weight * control_penalty(control, model), tf.float64)
+                control_term = tf.cast(cfg.control_weight * control_penalty(control, model),
+                                       tf.float64)
+                loss += control_term
         grads = tape.gradient(loss, variables)
+        # Before clipping: once clipped, every step's norm is capped and the trace
+        # stops saying anything about the fit.
+        grad_norm = tf.linalg.global_norm(grads)
         grads, _ = tf.clip_by_global_norm(grads, cfg.clip_norm)
         opt.apply_gradients(zip(grads, variables))
-        return data
+        return dict(
+            data=data, prior=prior, l2=l2, nu_prior=nu_prior,
+            shared_prior=shared_prior, control=control_term, loss=loss,
+            grad_norm=tf.cast(grad_norm, tf.float64),
+        )
 
     history = []
     for epoch in range(epochs):
         perm = rng.permutation(n_star)
-        losses = []
+        parts: dict = {}
         for idx, seg, n in tqdm(block_indices(stars, perm, cfg.batch_size),
                                 total=steps, desc=f"{desc} {epoch + 1}/{epochs}", leave=False):
-            losses.append(float(step(make_batch(stars, idx, seg))))
-        rec = dict(epoch=epoch + 1, train_nll=float(np.mean(losses)))
+            for key, value in step(make_batch(stars, idx, seg)).items():
+                parts.setdefault(key, []).append(float(value))
+        rec = dict(epoch=epoch + 1, train_nll=float(np.mean(parts["data"])))
+        rec.update({k: float(np.mean(v)) for k, v in parts.items() if k != "data"})
         if val is not None:
             rec["val_nll"] = mean_star_nll(val, model, max_stars=cfg.val_max_stars)
+        # The learned parameters at the end of the epoch: where the tail weights and
+        # the shared systematics have got to, which the losses alone do not show.
+        tail = getattr(model, "tail", None)
+        if tail is not None:
+            nu_v = np.asarray(tail().numpy(), dtype="f8").ravel()
+            if nu_v.size:
+                rec["nu_median"] = float(np.median(nu_v))
+                rec["nu_min"] = float(nu_v.min())
+                rec["nu_max"] = float(nu_v.max())
+                rec["nu"] = [float(x) for x in nu_v]
+        shared_obj = getattr(model, "shared", None)
+        if shared_obj is not None:
+            var = np.asarray(shared_obj.variance().numpy(), dtype="f8")
+            if var.size:
+                sig = np.sqrt(np.maximum(var, 0.0))
+                rec["shared_sigma_median"] = float(np.median(sig))
+                rec["shared_sigma_max"] = float(sig.max())
         history.append(rec)
-        log.info("%s epoch %d/%d: %s", desc, epoch + 1, epochs,
-                 ", ".join(f"{k} {v:.4f}" for k, v in rec.items() if k != "epoch"))
+        log.info(
+            "%s epoch %d/%d: data %.4f%s  loss %.4f  |grad| %.3g",
+            desc, epoch + 1, epochs, rec["train_nll"],
+            "" if val is None else f", val {rec['val_nll']:.4f}",
+            rec["loss"], rec["grad_norm"],
+        )
     return history
+
+
+def plot_training_history(histories: dict, path: Path, title: str = "") -> Path:
+    """What each fit did, epoch by epoch: the data term, every prior, and nu.
+
+    ``histories`` maps an arm name (``"const add"``, ``"const scale+add"``,
+    ``"network"``) to the list of records :func:`fit` returns. Six panels:
+
+    * the NLL per star against epoch, every arm, with its validation curve dashed;
+    * the loss components of the last arm -- the data term against each prior, which
+      is how a prior that has quietly taken over the fit becomes visible;
+    * the gradient norm before clipping, so a fit that has stalled shows up;
+    * every group's ``nu`` per epoch, with the median, because the tail weights are
+      learned but the losses barely move once they are near their prior;
+    * the shared systematic's sigma per epoch, and
+    * the validation minus training NLL, the generalisation gap.
+    """
+    import matplotlib
+
+    if not os.environ.get("DISPLAY"):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    arms = [(name, hist) for name, hist in histories.items() if hist]
+    if not arms:
+        return path
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7.5), layout="constrained")
+    main, comp, grad, tail, shared, gap = axes.flat
+
+    for name, hist in arms:
+        epoch = [r["epoch"] for r in hist]
+        main.plot(epoch, [r["train_nll"] for r in hist], label=name)
+        val = [(r["epoch"], r["val_nll"]) for r in hist if "val_nll" in r]
+        if val:
+            main.plot(*zip(*val), ls="--", lw=1.0, color=main.lines[-1].get_color())
+    main.set(xlabel="epoch", ylabel="NLL per star",
+             title="data term (solid) and validation (dashed)")
+    main.legend(fontsize=7)
+
+    name, hist = arms[-1]
+    epoch = np.asarray([r["epoch"] for r in hist], dtype="f8")
+    for key, label in (("loss", "total"), ("data", "data term"), ("prior", "prior"),
+                       ("l2", "weight decay"), ("nu_prior", "prior on nu"),
+                       ("shared_prior", "prior on the shared term"),
+                       ("control", "control points")):
+        values = np.asarray([r.get(key, 0.0) for r in hist], dtype="f8")
+        if np.any(np.abs(values) > 0):
+            comp.semilogy(epoch, np.maximum(np.abs(values), 1e-12), label=label, lw=1.2)
+    comp.set(xlabel="epoch", ylabel="mean |term|", title=f"{name}: loss components")
+    comp.legend(fontsize=7)
+
+    for name, hist in arms:
+        grad.plot([r["epoch"] for r in hist],
+                  [max(r.get("grad_norm", 0.0), 1e-12) for r in hist], label=name)
+    grad.set(xlabel="epoch", ylabel="|grad| before clipping", title="gradient norm", yscale="log")
+    grad.legend(fontsize=7)
+
+    nu_rows = [r for r in hist if "nu" in r]
+    if nu_rows:
+        nu = np.asarray([r["nu"] for r in nu_rows], dtype="f8")  # (epochs, n_group)
+        e = np.asarray([r["epoch"] for r in nu_rows], dtype="f8")
+        tail.plot(e, nu, color="0.7", lw=0.7)
+        tail.plot(e, np.median(nu, axis=1), color="C0", lw=2.0, label="median")
+        tail.plot(e, nu.min(axis=1), color="C3", lw=1.0, ls=":", label="min")
+        tail.plot(e, nu.max(axis=1), color="C3", lw=1.0, ls=":", label="max")
+        tail.axhline(2.0, color="0.4", ls="--", lw=0.8)  # the floor: nu = 2 + softplus
+        tail.set(xlabel="epoch", ylabel="nu", title="tail weight per group (learned)")
+        tail.legend(fontsize=7)
+    else:
+        tail.set_axis_off()
+
+    rows = [r for r in hist if "shared_sigma_median" in r]
+    if rows:
+        shared.plot([r["epoch"] for r in rows], [r["shared_sigma_median"] for r in rows],
+                    color="C2", label="median")
+        shared.plot([r["epoch"] for r in rows], [r["shared_sigma_max"] for r in rows],
+                    color="C2", lw=1.0, ls=":", label="max")
+        shared.set(xlabel="epoch", ylabel="shared sigma", title="shared systematic", yscale="log")
+        shared.legend(fontsize=7)
+    else:
+        shared.set_axis_off()
+
+    plotted = False
+    for name, hist in arms:
+        pairs = [(r["epoch"], r["val_nll"] - r["train_nll"]) for r in hist
+                 if "val_nll" in r and "train_nll" in r]
+        if pairs:
+            gap.plot(*zip(*pairs), label=name)
+            plotted = True
+    if plotted:
+        gap.axhline(0.0, color="0.5", lw=0.8)
+        gap.set(xlabel="epoch", ylabel="validation - training NLL",
+                title="generalisation gap")
+        gap.legend(fontsize=7)
+    else:
+        gap.set_axis_off()
+
+    if title:
+        fig.suptitle(title, fontsize=10)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
+
+
+def nu_prior_curve(nu, mean: float, sd: float, space: str = "raw"):
+    """``p(nu)`` for the prior used on the tail weight.
+
+    With ``space="raw"`` the prior is Gaussian in the unconstrained coordinate and
+
+        p(nu) = N(raw(nu); mean, sd) * |d raw / d nu|,
+
+    with ``raw(nu) = log(exp(nu - 2) - 1)`` and ``d raw / d nu = 1 / (1 -
+    exp(-(nu - 2)))``. The Jacobian is what the figure is for: it makes ``p(nu)``
+    diverge as ``nu -> 2``, because the softplus squeezes an ever longer stretch of
+    ``raw`` into a shrinking ``d nu`` there.
+
+    With ``space="nu"`` the prior is the half-Gaussian
+
+        p(nu) ~ exp(-(nu - mean)^2 / 2 sd^2)   on nu >= 2,  0 below,
+
+    which has no such spike: it vanishes at ``nu = 2`` and is a plain Gaussian
+    above it.
+    """
+    nu = np.atleast_1d(np.asarray(nu, dtype="f8"))
+    t = np.maximum(nu - 2.0, 1e-12)  # nu - 2, the softplus output
+    if space == "nu":
+        dens = np.exp(-0.5 * ((nu - mean) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
+        return np.where(t > 0.0, dens, 0.0)
+    if space != "raw":
+        raise ValueError(f"unknown nu prior space {space!r}; use 'raw' or 'nu'")
+    raw = np.log(np.expm1(np.minimum(t, 700.0)))  # inverse softplus
+    dens = np.exp(-0.5 * ((raw - mean) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
+    return dens / (1.0 - np.exp(-t))  # the Jacobian d raw / d nu
+
+
+def plot_nu_prior(nu_values, keys: Sequence[str], prior_mean: float, prior_sd: float,
+                  path: Path, title: str = "", space: str = "raw") -> Path:
+    """The prior on ``nu``, with each group's learned ``nu`` marked on it.
+
+    The point of the figure is to show in one glance how much of each group's
+    ``nu`` is the prior: a dot near the peak is a parameter the prior set, a dot
+    out on the flank is one the data moved. The curves differ only in width and
+    centre, so runs with different priors can be compared page for page.
+    """
+    import matplotlib
+
+    if not os.environ.get("DISPLAY"):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from .. import registry
+
+    nu_values = np.asarray(nu_values, dtype="f8").ravel()
+    # One label per group, in registry-key form; a group of two catalogs is named
+    # for both, since they share the value.
+    gidx = registry.group_index(keys)
+    labels = []
+    for g in range(len(nu_values)):
+        members = [k for k, gi in zip(keys, gidx) if gi == g]
+        labels.append("+".join(members) if members else str(g))
+
+    prior_nu = (float(prior_mean) if space == "nu"
+                else 2.0 + float(np.logaddexp(0.0, prior_mean)))  # nu at the prior mean
+    # p(nu) diverges at nu = 2 under the raw-space prior (integrably), so the curve is
+    # cut where it is still small in every prior we use rather than at the singularity.
+    lo, hi = 2.5, max(nu_values.max(), prior_nu + 3.5 * prior_sd, 10.0) * 1.08
+    grid = np.linspace(lo, hi, 1200)
+    curve = nu_prior_curve(grid, prior_mean, prior_sd, space)
+    peak = float(curve.max())
+
+    fig_h, fs = 9.0, 6.5
+    fig, ax = plt.subplots(figsize=(12, fig_h), layout="constrained")
+
+    # Nearly all the groups sit within a tenth of nu of the prior mean, so their
+    # labels cannot stand side by side above their own dots. They are instead
+    # spread rightwards into a row (never leftwards, so the order still reads off
+    # the axis) and drawn from one common baseline, each with a leader line back to
+    # its dot.
+    gap = (fs / 72.0) / (12.0 * 0.85) * (hi - lo) * 1.25  # a label's width, in nu
+    label_x = {}
+    last = -np.inf
+    for i in np.argsort(nu_values):
+        x = max(nu_values[i], last + gap)
+        label_x[i] = x
+        last = x
+    # Height of the tallest label as a fraction of the axes, from its point size.
+    hf = (max(len(s) for s in labels) * 0.62 + 1.0) * fs / 72.0 / (fig_h * 0.82)
+    base = peak * 1.05
+    top = base / (1.0 - hf)
+
+    ax.plot(grid, curve, color="C0", lw=1.6)
+    ax.fill_between(grid, 0.0, curve, color="C0", alpha=0.10)
+    ax.axvline(prior_nu, color="C0", ls="--", lw=0.9, alpha=0.7)
+    ax.annotate(f"prior: $\\nu$ = {prior_nu:.1f} $\\pm$ {prior_sd:.1f}",
+                xy=(prior_nu, peak * 0.42), xytext=(-11, 0),
+                textcoords="offset points", fontsize=8, color="C3", rotation=90,
+                va="center")
+
+    for i in np.argsort(nu_values):
+        x = nu_values[i]
+        y = float(nu_prior_curve(x, prior_mean, prior_sd, space)[0])
+        ax.plot([x, label_x[i]], [y, base], color="0.6", lw=0.5, zorder=1)
+        ax.plot([x], [y], marker="o", ms=4.5, color="C3", zorder=3)
+        ax.text(label_x[i], base, labels[i], rotation=90, fontsize=fs,
+                ha="center", va="bottom", zorder=4)
+
+    ax.set(xlabel=r"$\nu$ (degrees of freedom)", ylabel=r"$p(\nu)$",
+           xlim=(lo, max(hi, last + 2 * gap)), ylim=(0.0, top),
+           title=title or "prior on nu")
+    ax.grid(alpha=0.2)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
 
 
 def plot_learned_delta(model, stars, labels: Sequence[str], path: Path) -> Path:
@@ -325,17 +611,29 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     ref = as_prepared(val)
     models = {"quoted (as prepared)": fixed_delta(0.0)}
     tables_for = {"quoted (as prepared)": ref}
-    const_add = ConstDelta(n_group, multiplicity)
+    # Every arm starts its tail weight at the prior mean of nu, in whichever space the
+    # prior is stated: the arbitrary nu = 8 that TailWeight is built with is only a
+    # fallback, and starting a 32 +- 16 fit at 8 spends the first epochs travelling.
+    nu0, raw0 = nu_init(cfg)
+
+    def start_at_the_prior(m):
+        """Put the model's tail weight on the prior mean."""
+        m.tail.raw.assign(np.full(n_group, raw0, dtype="f4"))
+        return m
+
+    log.info("nu starts at %.2f (the prior mean)", nu0)
+    const_add = start_at_the_prior(ConstDelta(n_group, multiplicity))
     hist_const = fit(const_add, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
                      desc="const add", control=ctrl)
     models["constant add"] = const_add
 
-    const = ConstScaleAdd(n_group, multiplicity)
+    const = start_at_the_prior(ConstScaleAdd(n_group, multiplicity))
     hist_const_sa = fit(const, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
                         desc="const scale+add", control=ctrl)
     models["constant scale+add"] = const
 
-    net = ScaleAddNetwork(n_group, cfg.hidden_size, cfg.n_hidden, multiplicity)
+    net = start_at_the_prior(ScaleAddNetwork(n_group, cfg.hidden_size, cfg.n_hidden,
+                                             multiplicity))
     hist = fit(net, train, cfg, cfg.epochs, cfg.learning_rate, val, desc="network", control=ctrl)
     models["network scale+add"] = net
 
@@ -343,7 +641,15 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         n_cat=n_group, hidden_size=cfg.hidden_size, n_hidden=cfg.n_hidden, keys=list(keys),
         multiplicity=list(multiplicity), group_labels=list(group_labels),
         model_type="scale_add", config=dataclasses.asdict(cfg), val_history=hist,
+        nu_init=nu0,
     ))
+    # Before the diagnostics, so the training traces survive a failure in them.
+    plot_training_history(
+        {"const add": hist_const, "const scale+add": hist_const_sa, "network": hist},
+        ev_dir / "training_history.png",
+        title=f"{run_dir.name}: delta model training",
+    )
+    log.info("wrote %s", ev_dir / "training_history.png")
 
     nll, results, nus, shareds = {}, {}, {}, {}
     for name, fn in models.items():
@@ -378,6 +684,10 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     cat_table = per_catalog_table(net, val, keys)
     log.info("\n%s", cat_table)
     (ev_dir / "per_catalog.txt").write_text(cat_table + "\n")
+    # The same numbers as a picture: does the group that asks for heavy tails also
+    # have its covariance inflated (or shrunk) most?
+    plot_nu_det_c(catalog_summary(net, val, keys), ev_dir / "nu_det_c.png",
+                  title=f"{run_dir.name}: nu against the volume of the corrected covariance")
     # The additive-only constant model is the maximum-likelihood three-cornered hat:
     # one excess variance per catalog and parameter that makes the entries agree.
     const_sigma = np.exp(0.5 * const_add.raw.numpy())
@@ -398,6 +708,15 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     plot_diagnostics(results["network scale+add"], labels, ev_dir, "_network")
     plot_diagnostics(results["quoted (as prepared)"], labels, ev_dir, "_none")
     plot_learned_delta(net, val, labels, ev_dir / "learned_delta.png")
+    # The prior on nu with every group's learned value on it: how much of each nu
+    # was the prior, and how much the data.
+    if nus.get("network scale+add") is not None:
+        plot_nu_prior(nus["network scale+add"], keys, cfg.nu_prior_mean, cfg.nu_prior_sd,
+                      ev_dir / "nu_prior.png",
+                      title=(f"{run_dir.name}: prior on nu "
+                             f"({cfg.nu_prior_mean:g} $\\pm$ {cfg.nu_prior_sd:g}"
+                             + (" in nu)" if cfg.nu_prior_space == "nu" else " in raw)")),
+                      space=cfg.nu_prior_space)
     if cfg.pair_chi2:
         # Two observations of one star: the difference's covariance is S_a + S_b with
         # nothing estimated in between, so the chi2 distribution is a direct test.
@@ -465,23 +784,17 @@ def format_nu(nus: Dict[str, Optional[np.ndarray]], labels: Sequence[str]) -> st
     return "\n".join(lines)
 
 
-def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) -> str:
-    """One row per catalog: size, the two learned terms, the tail weight, and the effect.
+def catalog_summary(model, stars, keys: Sequence[str], chunk: int = 65_536) -> dict:
+    """Per catalog: the size, the two learned terms, ``nu``, and the volume change.
 
-    The rows are the *validation* entries of each catalog (the sample every other
-    number in ``evaluation/`` is measured on). ``median scale`` is, per parameter, the
-    median of the sigma scale ``exp(ln_scale / 2)`` over those entries that measure it
-    (1 = the quoted error is left alone); ``median add*`` is the same for the additive
-    sigma *including the group's shared variance* (the floor is 0.003, so a value above
-    it is the systematic the catalog shares with the rest of its group); ``nu`` is the
-    group's degrees of freedom; and ``median dln det*`` is the median change in the log
-    determinant of the total entry covariance ``S + diag(tau^2)``, ``ln det - ln det
-    C_m`` over the measured submatrix -- how much volume the correction adds or
-    removes, the one number that combines all three terms (four parameters at scale
-    0.35 with nothing additive would be ``8 ln 0.35 = -8.4``). The starred columns are
-    the covariance the merge will use; the scale is the part that is independent
-    between the catalogs of a group. Parameters a catalog does not measure print as
-    ``nan``.
+    The numbers behind :func:`per_catalog_table` and the ``nu``-against-volume plot,
+    so the two cannot disagree. ``det`` is the median over the catalog's entries of
+    ``(ln det(S + diag(tau^2)) - ln det C_m) / n_measured`` -- the change in the log
+    determinant of the covariance the merge will use, per measured parameter. The
+    division is what makes a catalog that measures three parameters comparable with
+    one that measures four: the total volume change of a 4-parameter covariance is
+    four times the average per-parameter change, so leaving it out would rank the
+    catalogs by how many parameters they happen to report.
     """
     from .covariance import entry_cov_np
     from .model import model_nu, model_shared, numpy_delta_fn
@@ -518,33 +831,236 @@ def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) ->
                 continue
             dlndet[lo + np.flatnonzero(rows)] = (
                 np.linalg.slogdet(new[rows][:, mask][:, :, mask])[1]
-                - np.linalg.slogdet(old[rows][:, mask][:, :, mask])[1])
+                - np.linalg.slogdet(old[rows][:, mask][:, :, mask])[1]) / float(mask.sum())
 
+    count = np.zeros(n_cat, dtype="i8")
+    scale = np.full((n_cat, n_par), np.nan)
+    add = np.full((n_cat, n_par), np.nan)
+    det = np.full(n_cat, np.nan)
+    nu_cat = np.full(n_cat, np.nan)
+    for k in range(n_cat):
+        in_cat = stars["c"] == k
+        count[k] = int(in_cat.sum())
+        for p in range(n_par):
+            sel = in_cat & stars["m"][:, p]
+            if sel.any():
+                scale[k, p] = float(np.median(s_val[sel, p]))
+                add[k, p] = float(np.median(a_val[sel, p]))
+        de = dlndet[in_cat & np.isfinite(dlndet)]
+        if de.size:
+            det[k] = float(np.median(de))
+        if nu is not None and in_cat.any():
+            nu_cat[k] = float(nu[stars["g"][np.argmax(in_cat)]])
+    return dict(keys=tuple(keys), n=count, scale=scale, add=add, det=det, nu=nu_cat)
+
+
+def _label_positions(points, sizes, bounds, pad: float = 0.05, passes: int = 15):
+    """Place a horizontal label near each point by minimising a layout energy.
+
+    Everything is in inches, so distances mean the same thing in both directions.
+    ``points`` is ``(n, 2)``, ``sizes`` is ``(n, 2)`` of ``(width, height)``, and
+    ``bounds`` is ``(x0, x1, y0, y1)`` of the point cloud. The energy sums
+
+    * overlapping labels, weighted by the overlapping area;
+    * a label sitting on top of a point (any point, its own included);
+    * a label that leaves the box the points occupy;
+    * two leader lines crossing;
+    * and, weakly, the distance from a label to its own point, which is what keeps a
+      free label next to its dot instead of merely somewhere legal.
+
+    The labels are placed by coordinate descent over a fixed set of candidate
+    positions around each dot -- eight directions at three distances -- started from
+    a few different configurations, since the energy is not convex.
+    """
+    n = len(points)
+    half = sizes / 2.0
+    dirs = np.array([[0, 1], [1, 1], [1, 0], [1, -1],
+                     [0, -1], [-1, -1], [-1, 0], [-1, 1]], dtype="f8")
+    dirs /= np.linalg.norm(dirs, axis=1)[:, None]
+    gaps = np.array([0.05, 0.13, 0.24])
+    # Candidate box centres: just outside the dot in that direction, so the leader
+    # line leaves the dot and meets the near face of the box.
+    extent = (np.abs(dirs[:, 0])[None, :] * half[:, None, 0]
+              + np.abs(dirs[:, 1])[None, :] * half[:, None, 1])  # (n, n_dir)
+    cand = np.empty((n, len(dirs) * len(gaps), 2))
+    for gi, g in enumerate(gaps):
+        for di in range(len(dirs)):
+            col = gi * len(dirs) + di
+            cand[:, col] = points + dirs[di] * (g + extent[:, di])[:, None]
+    w, h = sizes[:, 0], sizes[:, 1]
+
+    def leader_ends(centres):
+        """Where each leader meets its label box (the nearest point on the box)."""
+        q = np.empty_like(centres)
+        q[:, 0] = np.clip(points[:, 0], centres[:, 0] - w / 2, centres[:, 0] + w / 2)
+        q[:, 1] = np.clip(points[:, 1], centres[:, 1] - h / 2, centres[:, 1] + h / 2)
+        return q
+
+    def energy(a):
+        cen = cand[np.arange(n), a]
+        dx = np.abs(cen[:, None, 0] - cen[None, :, 0]) - (w[:, None] + w[None, :]) / 2
+        dy = np.abs(cen[:, None, 1] - cen[None, :, 1]) - (h[:, None] + h[None, :]) / 2
+        overlap = np.clip(pad - dx, 0, None) * np.clip(pad - dy, 0, None)
+        e = 60.0 * np.triu(overlap, 1).sum()
+        # a label covering a dot: its own is excluded only when the box is clear of
+        # it, which the candidates already ensure
+        inx = np.abs(points[None, :, 0] - cen[:, None, 0]) < w[:, None] / 2 + 0.02
+        iny = np.abs(points[None, :, 1] - cen[:, None, 1]) < h[:, None] / 2 + 0.02
+        e += 40.0 * (inx & iny).sum()
+        outside = (np.clip(bounds[0] - (cen[:, 0] - w / 2), 0, None)
+                   + np.clip((cen[:, 0] + w / 2) - bounds[1], 0, None)
+                   + np.clip(bounds[2] - (cen[:, 1] - h / 2), 0, None)
+                   + np.clip((cen[:, 1] + h / 2) - bounds[3], 0, None))
+        e += 12.0 * outside.sum()
+        q = leader_ends(cen)
+        # Two segments cross when each has the other's endpoints on opposite sides of
+        # its own line; the transpose gives the second segment's test.
+        def cross(o, a1, b):
+            return ((a1[None, :, 0] - o[:, None, 0]) * (b[:, None, 1] - o[:, None, 1])
+                    - (a1[None, :, 1] - o[:, None, 1]) * (b[:, None, 0] - o[:, None, 0]))
+        straddle = (cross(points, q, points) * cross(points, q, q)) < 0
+        e += 4.0 * float((straddle & straddle.T).sum()) / 2.0
+        e += 1.0 * float(np.linalg.norm(cen - points, axis=1).sum())
+        return e
+
+    best_a, best_e = None, np.inf
+    for start in (0, 2, 4, 6):  # four of the eight directions
+        a = np.full(n, start * len(gaps) + 1)
+        e = energy(a)
+        for _ in range(passes):
+            moved = False
+            for i in range(n):
+                cur, best_i, best_e_i = a[i], a[i], e
+                for c in range(cand.shape[1]):
+                    if c == cur:
+                        continue
+                    a[i] = c
+                    ec = energy(a)
+                    if ec < best_e_i - 1e-9:
+                        best_i, best_e_i = c, ec
+                a[i] = best_i
+                moved |= best_i != cur
+                e = best_e_i
+            if not moved:
+                break
+        if e < best_e:
+            best_a, best_e = a.copy(), e
+    return cand[np.arange(n), best_a], leader_ends(cand[np.arange(n), best_a])
+
+
+def plot_nu_det_c(summary: dict, path: Path, title: str = "") -> Path:
+    """``nu`` against the volume of the corrected covariance, one dot per catalog.
+
+    ``nu`` is one number per group and ``dln det C`` is one per catalog, so the two
+    members of a group sit at the same ``nu``. The panel asks whether the catalogs
+    that ask for heavy tails are the ones whose covariance is being inflated or
+    shrunk most: they need not be related, since ``nu`` describes the shape of the
+    residual distribution and ``dln det C`` its width.
+    """
+    import matplotlib
+
+    if not os.environ.get("DISPLAY"):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x = np.asarray(summary["nu"], dtype="f8")
+    y = np.asarray(summary["det"], dtype="f8")
+    labels = [str(k) for k in summary["keys"]]
+    keep = np.flatnonzero(np.isfinite(x) & np.isfinite(y))
+    if not keep.size:
+        return path
+
+    fig_w, fig_h = 12.0, 8.0
+    fs = 6.5
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    left, right, bottom, top = 0.075, 0.995, 0.085, 0.935
+    fig.subplots_adjust(left=left, right=right, bottom=bottom, top=top)
+    ax_w, ax_h = fig_w * (right - left), fig_h * (top - bottom)
+
+    xr = float(x[keep].max() - x[keep].min()) or 1.0
+    yr = float(y[keep].max() - y[keep].min()) or 1.0
+    xlim = (float(x[keep].min()) - 0.06 * xr, float(x[keep].max()) + 0.10 * xr)
+    ylim = (float(y[keep].min()) - 0.15 * yr, float(y[keep].max()) + 0.15 * yr)
+    ax.set(xlim=xlim, ylim=ylim)
+
+    def to_inch(px, py):
+        return np.stack([(px - xlim[0]) / (xlim[1] - xlim[0]) * ax_w,
+                         (py - ylim[0]) / (ylim[1] - ylim[0]) * ax_h], axis=-1)
+
+    def to_data(ix, iy):
+        return ((ix / ax_w) * (xlim[1] - xlim[0]) + xlim[0],
+                (iy / ax_h) * (ylim[1] - ylim[0]) + ylim[0])
+
+    pts = to_inch(x[keep], y[keep])
+    # A label's footprint, from its point size; 0.58 em per character is right for
+    # DejaVu Sans at this size to within a few per cent.
+    sizes = np.stack([0.58 * fs * np.array([len(labels[j]) for j in keep]) / 72.0,
+                      np.full(len(keep), 1.35 * fs / 72.0)], axis=-1)
+    lo_pt = pts.min(axis=0)
+    hi_pt = pts.max(axis=0)
+    centres, ends = _label_positions(pts, sizes, (lo_pt[0], hi_pt[0], lo_pt[1], hi_pt[1]))
+
+    for k, j in enumerate(keep):
+        (lx, ly), (qx, qy) = to_data(centres[k, 0], centres[k, 1]), to_data(ends[k, 0],
+                                                                           ends[k, 1])
+        ax.plot([x[j], qx], [y[j], qy], color="0.6", lw=0.5, zorder=1)
+        ax.plot([x[j]], [y[j]], marker="o", ms=5, color="C3", zorder=3)
+        ax.text(lx, ly, labels[j], fontsize=fs, ha="center", va="center", zorder=4)
+
+    ax.axhline(0.0, color="0.5", lw=0.8)
+    ax.set(xlabel=r"$\nu$ (group's degrees of freedom)",
+           ylabel=r"$\Delta \ln \det C\,/\,n_{\rm measured}$ (median over the catalog)",
+           title=title or "nu against the volume of the corrected covariance")
+    ax.grid(alpha=0.2)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
+
+
+def per_catalog_table(model, stars, keys: Sequence[str], chunk: int = 65_536) -> str:
+    """One row per catalog: size, the two learned terms, the tail weight, and the effect.
+
+    The rows are the *validation* entries of each catalog (the sample every other
+    number in ``evaluation/`` is measured on). ``median scale`` is, per parameter, the
+    median of the sigma scale ``exp(ln_scale / 2)`` over those entries that measure it
+    (1 = the quoted error is left alone); ``median add*`` is the same for the additive
+    sigma *including the group's shared variance* (the floor is 0.003, so a value above
+    it is the systematic the catalog shares with the rest of its group); ``nu`` is the
+    group's degrees of freedom; and ``median dln det/p*`` is the median change in the
+    log determinant of the total entry covariance ``S + diag(tau^2)``,
+    ``(ln det - ln det C_m) / n_measured`` over the measured submatrix -- how much
+    volume the correction adds or removes *per parameter*, which is the one number
+    that combines all three terms and means the same thing for a catalog reporting
+    three parameters as for one reporting four (at scale 0.35 with nothing additive,
+    ``2 ln 0.35 = -2.1`` either way). The starred columns are
+    the covariance the merge will use; the scale is the part that is independent
+    between the catalogs of a group. Parameters a catalog does not measure print as
+    ``nan``.
+    """
+    from .model import model_shared
+
+    summary = catalog_summary(model, stars, keys, chunk)
+    shared = model_shared(model)
     lines = [f"{'catalog':24s}{'n':>9s}   median scale: "
              + " ".join(f"{n:>7s}" for n in PARAM_NAMES)
              + "    median add*: "
              + " ".join(f"{n:>7s}" for n in PARAM_NAMES)
-             + f"{'nu':>7s}{'median dln det*':>17s}",
+             + f"{'nu':>7s}{'median dln det/p*':>17s}",
              "-" * 111]
-    for k, key in enumerate(keys):
+    for k, key in enumerate(summary["keys"]):
         label = registry.get_spec(key).label if key in registry.keys() else key
-        in_cat = stars["c"] == k
-        if not (in_cat[:, None] & stars["m"]).any():
-            continue
+        sc, ad = summary["scale"][k], summary["add"][k]
+        if not np.isfinite(np.r_[sc, ad]).any():
+            continue  # a catalog that measures nothing has nothing to report
         # Per parameter: a catalog that measures three parameters has three numbers,
         # and a parameter it does not measure is ``nan``.
-        sc, ad = [], []
-        for p in range(N_PARAMS):
-            sel = in_cat & stars["m"][:, p]
-            sc.append(float(np.median(s_val[sel, p])) if sel.any() else np.nan)
-            ad.append(float(np.median(a_val[sel, p])) if sel.any() else np.nan)
-        de = dlndet[in_cat & np.isfinite(dlndet)]
-        nu_k = "-" if nu is None else f"{nu[stars['g'][np.argmax(in_cat)]]:.1f}"
-        det = np.median(de) if de.size else np.nan
-        lines.append(f"{label[:24]:24s}{int(in_cat.sum()):9,d}   "
+        nu_k = "-" if not np.isfinite(summary["nu"][k]) else f"{summary['nu'][k]:.1f}"
+        lines.append(f"{label[:24]:24s}{int(summary['n'][k]):9,d}   "
                      + " ".join(f"{v:7.2f}" for v in sc) + "    "
                      + " ".join(f"{v:7.4f}" for v in ad)
-                     + f"{nu_k:>7s}{det:17.2f}")
+                     + f"{nu_k:>7s}{summary['det'][k]:17.2f}")
     if shared is not None and np.any(np.asarray(shared) > 0):
         # Name the groups whose additive column carries a systematic, so the starred
         # numbers are not mistaken for a per-catalog property.

@@ -1,0 +1,108 @@
+\documentclass[11pt, a4paper]{article}
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\title{Gauss--Newton Optimization for Student's $t$-Distributed Measurement Uncertainties}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+Consider a measurement vector $\vec{x} \in \mathbb{R}^d$ related to an unknown parameter vector $\vec{y} \in \mathbb{R}^p$ through a smooth nonlinear mapping $\vec{y} = f(\vec{x})$, with inverse mapping $\vec{x}'(\vec{y}) \equiv f^{-1}(\vec{y})$. Under a flat prior $p(\vec{y}) \propto \text{const}$, maximizing the posterior $p(\vec{y} \mid \vec{x})$ is equivalent to maximizing the log-likelihood $\ln p(\vec{x} \mid \vec{y})$. Throughout, repeated Latin indices ($j, k, l, m, n$) follow the Einstein summation convention.
+
+\section{Likelihood and Exact Score Function}
+
+Suppose $\vec{x}$ follows a $d$-dimensional multivariate Student's $t$-distribution with $\nu > 0$ degrees of freedom, location vector $\vec{x}' \equiv f^{-1}(\vec{y})$, and symmetric positive-definite scale matrix $\Sigma_{\vec{x}} \in \mathbb{R}^{d \times d}$:
+\begin{equation}
+p(\vec{x} \mid \vec{y}) = \frac{\Gamma\!\left(\frac{\nu + d}{2}\right)}{\Gamma\!\left(\frac{\nu}{2}\right) (\nu \pi)^{d/2} |\Sigma_{\vec{x}}|^{1/2}} \left[ 1 + \frac{1}{\nu} (x_j - x'_j) (\Sigma_{\vec{x}}^{-1})_{jk} (x_k - x'_k) \right]^{-\frac{\nu + d}{2}}.
+\end{equation}
+
+\paragraph{Scale vs.\ covariance convention.}
+For $\nu > 2$, the covariance matrix $C_{\vec{x}}$ is related to the scale matrix $\Sigma_{\vec{x}}$ by $C_{\vec{x}} = \frac{\nu}{\nu - 2} \Sigma_{\vec{x}}$. If $C_{\vec{x}}$ denotes the physical covariance of $\vec{x}$, substitute $\Sigma_{\vec{x}}^{-1} = \frac{\nu}{\nu - 2} C_{\vec{x}}^{-1}$ in all expressions below. If $C_{\vec{x}}$ directly parameterizes the scale matrix ($\Sigma_{\vec{x}} = C_{\vec{x}}$), the equations hold for any $\nu > 0$, including heavy-tailed regimes ($\nu \le 2$) where the variance diverges.
+
+Defining the squared Mahalanobis residual
+\begin{equation}
+\delta^2(\vec{y}) \equiv (x_m - x'_m) (\Sigma_{\vec{x}}^{-1})_{mn} (x_n - x'_n),
+\end{equation}
+the log-likelihood up to an additive constant independent of $\vec{y}$ is
+\begin{equation}
+\ln p(\vec{x} \mid \vec{y}) = -\frac{\nu + d}{2} \ln\!\left( 1 + \frac{\delta^2(\vec{y})}{\nu} \right) + \text{const}.
+\end{equation}
+Differentiating with respect to $y_i$ and applying the symmetry $(\Sigma_{\vec{x}}^{-1})_{jk} = (\Sigma_{\vec{x}}^{-1})_{kj}$ as in the Gaussian derivation yields
+\begin{align}
+\frac{\partial \ln p(\vec{x} \mid \vec{y})}{\partial y_i} &= -\frac{\nu + d}{2} \cdot \frac{1}{1 + \delta^2(\vec{y})/\nu} \cdot \frac{1}{\nu} \frac{\partial \delta^2(\vec{y})}{\partial y_i} \nonumber \\
+&= -\frac{\nu + d}{2\left(\nu + \delta^2(\vec{y})\right)} \left[ -\frac{\partial x'_j}{\partial y_i} (\Sigma_{\vec{x}}^{-1})_{jk} (x_k - x'_k) - (x_j - x'_j) (\Sigma_{\vec{x}}^{-1})_{jk} \frac{\partial x'_k}{\partial y_i} \right] \nonumber \\
+&= \underbrace{\frac{\nu + d}{\nu + \delta^2(\vec{y})}}_{\equiv\, w(\vec{y})} (x_j - x'_j) (\Sigma_{\vec{x}}^{-1})_{jk} \frac{\partial x'_k}{\partial y_i}.
+\end{align}
+In the Gaussian limit $\nu \to \infty$, we have $w(\vec{y}) \to 1$ and $\Sigma_{\vec{x}} \to C_{\vec{x}}$, recovering the standard Gaussian score function. An informative Gaussian or Student's $t$ prior on $\vec{y}$ simply contributes an additive term of identical structure.
+
+\section{Linearization and the IRLS--Gauss--Newton Update}
+
+Expanding $\vec{x}'(\vec{y})$ to first order around the current iterate $\vec{y}_0$,
+\begin{equation}
+x'_j(\vec{y}) = x'_{0,j} + J_{jl} \Delta y_l + \mathcal{O}(\Delta y^2),
+\end{equation}
+we define the initial residual, parameter step, Jacobian, and frozen scalar weight at $\vec{y}_0$:
+\begin{equation}
+x'_{0,j} \equiv x'_j(\vec{y}_0), \quad \Delta x_j \equiv x_j - x'_{0,j}, \quad \Delta y_l \equiv y_l - y_{0,l}, \quad J_{ki} \equiv \left.\frac{\partial x'_k}{\partial y_i}\right|_{\vec{y}_0},
+\end{equation}
+\begin{equation}
+w_0 \equiv w(\vec{y}_0) = \frac{\nu + d}{\nu + \Delta x_m (\Sigma_{\vec{x}}^{-1})_{mn} \Delta x_n}.
+\end{equation}
+Substituting this linearization into the score and setting $\partial \ln p / \partial y_i \approx 0$ gives the linearized stationarity condition:
+\begin{equation}
+w_0 \Delta x_j (\Sigma_{\vec{x}}^{-1})_{jk} J_{ki} - w_0 J_{jl} \Delta y_l (\Sigma_{\vec{x}}^{-1})_{jk} J_{ki} = 0.
+\end{equation}
+Two distinct regimes arise from this system:
+\begin{enumerate}
+\item \textbf{Single measurement ($\vec{x}$):} Because $w_0 > 0$ is a single overall scalar factor, it cancels out of the linear system, yielding the exact same Gauss--Newton step as the Gaussian case (with $\Sigma_{\vec{x}}$ replacing $C_{\vec{x}}$). Geometrically, $-\frac{\nu + d}{2}\ln(1 + \delta^2/\nu)$ is strictly monotonically decreasing in $\delta^2(\vec{y})$, so its level sets and stationary points coincide identically with those of $\delta^2(\vec{y})$.
+\item \textbf{Multiple independent measurements ($\{\vec{x}^{(n)}\}_{n=1}^N$):} When combining $N$ independent observations (and optionally a prior) to estimate a shared vector $\vec{y}$, the joint log-likelihood sums over $n = 1, \dots, N$, and each term carries its own adaptive weight $w_0^{(n)}$:
+\begin{equation}
+\left[ \sum_{n=1}^N w_0^{(n)} J_{jl}^{(n)} \left(\Sigma^{(n)-1}\right)_{jk} J_{ki}^{(n)} \right] \Delta y_l = \sum_{n=1}^N w_0^{(n)} \Delta x_j^{(n)} \left(\Sigma^{(n)-1}\right)_{jk} J_{ki}^{(n)}.
+\end{equation}
+In matrix-vector form, the update step $\vec{y}_1 = \vec{y}_0 + \Delta \vec{y}$ solves
+\begin{equation}
+\left( \sum_{n=1}^N w_0^{(n)} J^{(n)T} \Sigma^{(n)-1} J^{(n)} \right) \Delta \vec{y} = \sum_{n=1}^N w_0^{(n)} J^{(n)T} \Sigma^{(n)-1} \Delta \vec{x}^{(n)},
+\end{equation}
+where for each observation $n$,
+\begin{equation}
+w_0^{(n)} = \frac{\nu_n + d_n}{\nu_n + \Delta \vec{x}^{(n)T} \Sigma^{(n)-1} \Delta \vec{x}^{(n)}}, \qquad \Delta \vec{x}^{(n)} \equiv \vec{x}^{(n)} - f_n^{-1}(\vec{y}_0), \qquad J^{(n)} \equiv \left.\frac{\partial f_n^{-1}(\vec{y})}{\partial \vec{y}}\right|_{\vec{y}_0}.
+\end{equation}
+\end{enumerate}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Quantity} & \textbf{Gaussian Model} & \textbf{Student's $t$ IRLS Model} \\
+\midrule
+Log-likelihood term & $-\frac{1}{2} \delta_n^2(\vec{y})$ & $-\frac{\nu_n + d_n}{2} \ln\!\left(1 + \delta_n^2(\vec{y}) / \nu_n\right)$ \\[0.35em]
+Iteration weight $w_0^{(n)}$ & $1$ & $\dfrac{\nu_n + d_n}{\nu_n + \delta_n^2(\vec{y}_0)}$ \\[0.75em]
+Normal matrix & $\sum_{n=1}^N J^{(n)T} C^{(n)-1} J^{(n)}$ & $\sum_{n=1}^N w_0^{(n)} J^{(n)T} \Sigma^{(n)-1} J^{(n)}$ \\[0.5em]
+Right-hand side & $\sum_{n=1}^N J^{(n)T} C^{(n)-1} \Delta \vec{x}^{(n)}$ & $\sum_{n=1}^N w_0^{(n)} J^{(n)T} \Sigma^{(n)-1} \Delta \vec{x}^{(n)}$ \\[0.5em]
+Outlier behavior ($\delta_n^2 \gg \nu_n$) & Constant precision & Downweighted as $w_0^{(n)} \propto \delta_n^{-2}$ \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of the Gauss--Newton normal equations for Gaussian and Student's $t$ likelihoods.}
+\end{table}
+
+\section{Stability and Freezing $w_0$ Within Each Step}
+
+In the IRLS update above, $w(\vec{y})$ is evaluated at $\vec{y}_0$ and held constant during the linear solve for $\Delta \vec{y}$. One might ask what happens if $w(\vec{y})$ is also expanded to first order around $\vec{y}_0$ inside the score (while still dropping second derivatives $\partial J_{ki} / \partial y_l$). Differentiating $w(\vec{y})$ at $\vec{y}_0$ gives
+\begin{equation}
+\left.\frac{\partial w(\vec{y})}{\partial y_l}\right|_{\vec{y}_0} = -\frac{\nu + d}{\left(\nu + \delta_0^2\right)^2} \left( -2 \Delta x_j (\Sigma_{\vec{x}}^{-1})_{jk} J_{kl} \right) = \frac{2 w_0^2}{\nu + d} v_{0,l},
+\end{equation}
+where $\delta_0^2 \equiv \Delta \vec{x}^T \Sigma_{\vec{x}}^{-1} \Delta \vec{x}$ and $\vec{v}_0 \equiv J^T \Sigma_{\vec{x}}^{-1} \Delta \vec{x}$. Linearizing both factors in $w(\vec{y}) \, J^T \Sigma_{\vec{x}}^{-1} (\vec{x} - \vec{x}'(\vec{y}))$ produces a per-measurement normal matrix of the form
+\begin{equation}
+H_{\text{lin}} = w_0 J^T \Sigma_{\vec{x}}^{-1} J - \frac{2 w_0^2}{\nu + d} \vec{v}_0 \vec{v}_0^T.
+\end{equation}
+Because the Student's $t$ log-likelihood is non-convex in the residual outside its central core, the subtracted rank-1 term causes $H_{\text{lin}}$ to lose positive definiteness whenever $\delta_0^2 > \nu$ (beyond the inflection point of $\ln(1 + \delta^2/\nu)$), which can send steps away from the mode.
+
+By contrast, freezing $w_0$ within each iteration keeps the left-hand matrix $\sum_{n=1}^N w_0^{(n)} J^{(n)T} \Sigma^{(n)-1} J^{(n)}$ symmetric positive semi-definite everywhere. Under the Gamma--Gaussian scale-mixture representation of the Student's $t$-distribution, updating $w_0^{(n)}$ corresponds to the exact E-step for the latent precision weights, while solving the reweighted Gauss--Newton system performs the M-step, guaranteeing ascent on a global quadratic minorizer and convergence to a stationary point $\nabla_{\vec{y}} \ln p = \vec{0}$.
+
+\end{document}

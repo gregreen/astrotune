@@ -138,6 +138,14 @@ class TailWeight(snt.Module):
     property of the pipeline (blends, bad matches, unmodelled binaries), not of the
     star. The prior is Gaussian on ``raw``, which keeps ``nu > 2`` without a clamp and
     lets a catalog go to effectively Gaussian tails if the data ask for it.
+
+    ``prior_penalty`` also takes a prior that is Gaussian in ``nu`` itself
+    (``space="nu"``). Because ``nu = 2 + softplus(raw)`` is bounded below by 2, that
+    prior is the half-Gaussian ``p(nu) ~ exp(-(nu - nu0)^2 / 2 sd^2)`` on ``nu >= 2``
+    and zero below. It is the better-behaved of the two: a Gaussian in ``raw`` pushes
+    ``p(nu)`` *up* as ``nu -> 2`` from above, because a shrinking stretch of ``raw``
+    maps to each ``d nu`` there, so it puts a divergent spike of prior mass on
+    almost-Cauchy tails that no catalog is ever shown to want.
     """
 
     def __init__(self, n_cat: int, raw_init: float = NU_INIT_RAW, name=None):
@@ -147,8 +155,15 @@ class TailWeight(snt.Module):
     def __call__(self):
         return NU_MIN + tf.math.softplus(self.raw)
 
-    def prior_penalty(self, mean: float = NU_PRIOR_MEAN, sd: float = NU_PRIOR_SD):
-        """Mean over catalogs of ``0.5 ((raw - mean) / sd)^2``."""
+    def prior_penalty(self, mean: float = NU_PRIOR_MEAN, sd: float = NU_PRIOR_SD,
+                      space: str = "raw"):
+        """Mean over catalogs of ``0.5 ((x - mean) / sd)^2``, ``x`` = raw or nu."""
+        if space == "nu":
+            # The prior is on nu, and softplus already enforces nu > 2, so this is
+            # the truncated Gaussian without any extra bookkeeping.
+            return 0.5 * tf.reduce_mean(((self() - mean) / sd) ** 2)
+        if space != "raw":
+            raise ValueError(f"unknown nu prior space {space!r}; use 'raw' or 'nu'")
         return 0.5 * tf.reduce_mean(((self.raw - mean) / sd) ** 2)
 
 #: Per-entry batch arrays, plus the star each entry belongs to

@@ -148,17 +148,28 @@ and not by gradient descent (see the Gauss–Newton step below). This is the
 weighting cannot shrink one map towards one survey.
 
 **The data term.** With `σ_a` the per-observation uncertainty (see "two sigmas"
-below) and `ρ` the softened χ²,
+below) and `d_a` the number of parameters that observation actually measures,
 
     χ²_a = Σ_p ( x_{a,p} − [f_{c(a)}^{-1}(y_{s(a)})]_p )² / σ_{a,p}² ,
-    ρ(χ²) = S · asinh(χ² / S),      S = chi2_turnover = 50 ,
+    ρ(χ²) = (ν_c + d_a) · log(1 + χ²/ν_c)        ← Student's t, the default
+    ρ(χ²) = S · asinh(χ² / S),  S = 50           ← --data-term softened
     L_data = (1/N) Σ_a ρ(χ²_a) .
 
-`ρ` is quadratic in χ² for good points and logarithmic for bad ones, so one
-mismatched star cannot dominate a step; its derivative is the weight
-`w = [1 + (χ²/S)²]^{-1/2}` used by the solver. A parameter that a catalog does
-not measure carries `σ = 1e9`, so its term is ~1e-18 and it drops out of the
-sum without a mask.
+The t is the deviation of a multivariate t with scale matrix `diag(σ²)` and `ν_c`
+degrees of freedom, written as twice its exact deviance: that factor makes
+`ρ → χ²` as `ν → ∞`, so the penalties below keep the strength they were tuned
+with, and it lets `ν = chi2_turnover = 50` be the controlled comparison between
+the two forms. Both are quadratic in χ² for good points and logarithmic for bad
+ones, so one mismatched star cannot dominate a step; they differ in where the
+turnover sits. The weight the solver uses is the curvature, `w = dρ/dχ²`, which
+is `(ν_c + d_a)/(ν_c + χ²_a)` for the t and `[1 + (χ²/S)²]^{-1/2}` for the
+softened form; the derivation is in `notes/gauss_newton_with_students_t.tex`.
+`ν_c` is a per-catalog constant: `--nu` sets it, and observations built from a
+delta model's calibrated sigmas carry the values that model fitted for them,
+which is what makes an iteration use one consistent error model at both stages.
+A parameter that a catalog does not measure carries `σ = 1e9`, so its term is
+~1e-18 and it drops out of the sum without a mask — and it leaves `d` as well,
+since the marginal of a t over an axis known exactly is a t of the same `ν`.
 
 **The penalties.** A likelihood alone is degenerate where the data are thin —
 nothing constrains a map in a corner no star occupies. Each catalog is therefore
@@ -262,10 +273,15 @@ Decisions:
   wide Gaussian built from the union of all catalogs' 1–99 % boxes.
 * **`sigma_source`** chooses which σ the bijector sees: `floored` (the prepared
   `sigma_x`) or `delta` (the calibrated σ of a trained delta model, i.e. the
-  iteration of stage 5).
+  iteration of stage 5). With `delta` the file also records **`nu`**: the
+  per-catalog degrees of freedom the same delta model fitted to those same
+  sigmas, expanded from its groups. A sigma that was inflated to survive
+  outliers must not then be read by a nearly Gaussian likelihood, so the scale
+  and the tail travel together. `astrotune-train-latent` picks the attribute up
+  by itself (`--no-nu-from-observations` to ignore it and use `--nu`).
 * The file records what made it (`catalogs`, `seed`, `dedupe`,
-  `dispersed_xerr`, `sigma_source`, `error_floors`, `n_stars`), and the trainer
-  copies those attributes into its `config.json`.
+  `dispersed_xerr`, `sigma_source`, `error_floors`, `n_stars`, and `nu` when
+  there is one), and the trainer copies those attributes into its `config.json`.
 
 ## Stage 3 — train the latent model
 
@@ -302,6 +318,20 @@ With `J_a = ∂f_{c(a)}^{-1}/∂y` at `y_s` (transported through the ODE) and
 
 Defaults: `λ = y_ridge = 1e-3`, `τ = y_learning_rate = 1`, `y_trust_abs = 0.5`.
 
+Under the default Student's t the weight is `w_a = (ν_c + d_a)/(ν_c + χ²_a)`, and
+it is *frozen* at the current `y` for the whole solve. That is not a
+simplification: the exact Hessian of the t carries a subtracted rank-one term,
+
+    H_lin = w JᵀΣ⁻¹J − (2w²/(ν+d)) v vᵀ ,      v = JᵀΣ⁻¹Δx ,
+
+which turns the system indefinite once `χ² > ν` — beyond the inflection point of
+`log(1 + χ²/ν)` — and a step off an indefinite matrix runs away from the mode.
+Freezing `w` leaves `Σ_a w_a JᵀΣ⁻¹J` positive semi-definite everywhere, and it is
+the exact E-step of the t's Gamma scale mixture, so the iteration is a minorise–
+maximise scheme and still converges to `∇_y log p = 0`. The same weight is read
+by the training and the validation solve, so `y_val` is one sweep of the same
+estimator rather than of a different one.
+
 * The ridge is diagonal on purpose. A parameter that none of the star's
   catalogs measures has `σ = 1e9`, so that row of `A_s` is ~1e-18 and the system
   is singular; the ridge drives the step in that direction to ~0 instead of
@@ -328,10 +358,35 @@ Defaults: `λ = y_ridge = 1e-3`, `τ = y_learning_rate = 1`, `y_trust_abs = 0.5`
 * **Validation by star**: ~1/8 of the stars, chosen by a hash of the id, so the
   split is identical across runs and cannot leak a star's other measurements.
 * **Hyperparameters** (`LatentTrainConfig`; every field is a CLI flag): 64 units,
-  3 hidden layers, batch 65536 observations, 250 epochs, Adam with `beta_2=0.99`
-  and AMSGrad, 8 cosine phases with 5 % warmup, global-norm clip 100,
-  `chi2_turnover = 50`, ODE `rtol = atol = 1e-5`. The defaults are the reference
-  notebook's.
+  3 hidden layers, Adam with `beta_2=0.99` and AMSGrad, global-norm clip 100,
+  `data_term = student_t`, `nu = 25`, ODE `rtol = atol = 1e-5`. The defaults are
+  the reference notebook's apart from the three below.
+  * `learning_rate = 1e-4`, `n_epochs = 256`, batch 65536 (2¹⁶, ~83 steps per
+    epoch on the current sample).
+    Adam's step is roughly `lr` per coordinate whatever the gradient does, so the
+    rate is what bounds how far a step can travel; 1e-3 was an order of
+    magnitude too large and let early runs walk into a distorted region.
+  * `lr_schedule = "cosine"` is the default: `lr * (1 + cos(πt/T))/2`, flat at the
+    start and rolling down to zero over the last epochs, with a 5 % linear warmup
+    in front of it. `lr_schedule = "discrete"` keeps the older shape — 8 equal
+    segments halving at each boundary — and `lr_schedule_phases = 1` any of them
+    makes it constant, which is what an lr comparison wants. The cosine is the
+    default because the discrete one spends its last eighth of the run at
+    `lr/128`, where nothing happens: continuing a finished 250-epoch run at
+    `lr = 1e-4` for 32 more epochs still lowered the loss monotonically.
+  * `nu = 25` is chosen so that the Gauss-Newton weight `(ν + d)/(ν + χ²)` is half
+    its small-residual value at `χ² = 25` and falls as `1/χ²` beyond: an
+    observation more than ~5σ from the fitted value then stops being able to pull
+    the solution, while everything inside 4σ is fitted as in the Gaussian case
+    (weight 0.97 at `χ² = 1`). (The earlier default, 50, was the value at which
+    the t and the softened χ² agree to first order.) Lower `--nu` for a stricter
+    robustifier.
+* **Which ν a run used is recorded, not assumed.** `config.json` carries
+  `nu_values` (one per catalog) next to the hyperparameters, because the default
+  path — `--nu` for everything vs. the per-catalog values that came with the
+  sigmas — is the difference between two objectives. A resume that would resolve
+  a different `nu` is refused, and a `config.json` from before the t existed is
+  read as `--data-term softened`, the objective it was actually trained with.
 * **Frozen axes**: `--freeze-vars embedding film` (the reference config),
   or `--freeze-after-frac F` to freeze them after a fraction `F` of the run.
 * **Validation losses are only comparable within one loss definition.** The
@@ -458,6 +513,19 @@ and `evaluation/shared.txt` (the fitted `G_g` per group and parameter). Weights
 are fitted with Adam against the star likelihood plus weak priors that say what
 the correction should be where the data are silent (nothing added, no shared term),
 imposed both on the data and on control points.
+
+**The prior on ν** is `ν = 25 ± 10`, stated in ν rather than in the unconstrained
+coordinate (`--nu-prior-space nu`), so that `p(ν)` is a Gaussian cut off at ν = 2
+that vanishes there instead of piling up against the Cauchy limit. Both numbers
+have a reason that fits in a sentence: ν = 25 puts the turnover of the
+Gauss-Newton weight `(ν + d)/(ν + χ²)` at χ² = 25, i.e. it suppresses the pull of
+~5σ outliers and leaves everything inside 4σ essentially untouched (weight 0.97
+at χ² = 1); and σ_ν = 10 makes it weak — the whole range the catalogs ask for
+(4 to 32 in our own tests) is inside 2σ, while ν ~ 2 is 2.3σ away, so it is
+excluded without being forbidden. The weakness has a cost worth stating: for the
+catalogs that do not measure ν, the fitted value is mostly the prior's, which is
+why `nu.txt` should be read together with `evaluation/nu_det_c.png` (how much the
+covariance actually moved) rather than on its own.
 
 Three degeneracies to know when reading the numbers: scale and additive term are
 separated only by the *spread* of quoted uncertainties within a group; inside a

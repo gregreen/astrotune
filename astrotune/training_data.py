@@ -148,6 +148,35 @@ def ids_in_several_catalogs(tables) -> np.ndarray:
     return ids[n_catalogs >= 2]
 
 
+def delta_nu(
+    run_dir, keys: Optional[Sequence[str]] = None, out_dir: Optional[Path] = None
+) -> Dict[str, float]:
+    """``{catalog key: nu}`` from a trained delta model, expanded over its groups.
+
+    The delta model fits one tail weight per *group* of catalogs that run the
+    same pipeline on the same spectra (see :data:`astrotune.registry.GROUPS`), so
+    the two members of a group necessarily get the same value. Empty when the
+    model was fitted with Gaussian errors, which is what an empty attribute tells
+    :func:`astrotune.train_latent.resolve_nu` to fall back to ``--nu`` for.
+
+    This is the other half of what "these sigmas were calibrated" means. The
+    sigma of an entry is ``sqrt(scale * sigma_raw^2 + add)`` and was fitted
+    together with ``nu``: the scale describes how far the bulk is off, the tail
+    how often a measurement is far off. Reading the scale without the tail would
+    apply the delta model's correction through a nearly Gaussian likelihood.
+    """
+    from .delta.model import load_delta_model, model_nu
+
+    run_dir = Path(run_dir)
+    keys = tuple(keys) if keys is not None else registry.keys()
+    delta_dir = Path(out_dir) if out_dir else run_dir / "delta"
+    nu = model_nu(load_delta_model(delta_dir, keys=keys))
+    if nu is None:
+        return {}
+    g = registry.group_index(keys)
+    return {k: float(nu[i]) for k, i in zip(keys, g)}
+
+
 def extract_observations(table, c: int, ids: np.ndarray) -> Dict[str, np.ndarray]:
     """The rows of ``table`` (catalog ``c``) whose star is in ``ids``.
 
@@ -516,17 +545,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         n_stars,
         len(ctrl_dict["x_control"]),
     )
-    save_observations(
-        obs_dict, ctrl_dict, args.output,
-        attrs=dict(
-            seed=args.seed, dedupe=args.dedupe, dispersed_xerr=args.dispersed_xerr,
-            sigma_source=args.sigma_source,
-            delta_dir=str(args.delta_dir) if args.delta_dir else "",
-            catalogs=",".join(registry.keys()),
-            error_floors=",".join(f"{v:g}" for v in config.ERROR_FLOORS),
-            n_stars=n_stars,
-        ),
+    attrs = dict(
+        seed=args.seed, dedupe=args.dedupe, dispersed_xerr=args.dispersed_xerr,
+        sigma_source=args.sigma_source,
+        delta_dir=str(args.delta_dir) if args.delta_dir else "",
+        catalogs=",".join(registry.keys()),
+        error_floors=",".join(f"{v:g}" for v in config.ERROR_FLOORS),
+        n_stars=n_stars,
     )
+    if args.sigma_source == "delta":
+        # The tail that was fitted together with the sigma, so that the latent
+        # stage reads the calibrated sigmas through the likelihood they were
+        # calibrated under (see ``astrotune.train_latent.resolve_nu``).
+        nus = delta_nu(args.delta_dir, keys=registry.keys())
+        if nus:
+            attrs["nu"] = ",".join(f"{nus[k]:.6g}" for k in registry.keys())
+            log.info(
+                "nu per catalog from %s: %s",
+                args.delta_dir,
+                ", ".join(f"{k} {nus[k]:.2f}" for k in registry.keys()),
+            )
+        else:
+            log.warning(
+                "%s was fitted with Gaussian errors (no nu); the latent run will "
+                "use its own --nu", args.delta_dir,
+            )
+    save_observations(obs_dict, ctrl_dict, args.output, attrs=attrs)
     return 0
 
 

@@ -484,3 +484,81 @@ def test_validation_curve_is_plotted_against_its_own_steps():
     assert x.max() > 1.0
     train_x = np.asarray(ax.get_lines()[0].get_xdata())
     assert x.min() >= train_x.min()
+
+
+def test_the_default_schedule_is_a_cosine_from_1e_4():
+    """Flat at the start, rolling to zero over the last epochs."""
+    from astrotune.train_latent import LatentTrainConfig, lr_schedule
+
+    cfg = LatentTrainConfig()
+    assert cfg.lr_schedule == "cosine"
+    assert cfg.learning_rate == pytest.approx(1e-4)
+    assert cfg.n_epochs == 256
+
+    n, lr = 1000, cfg.learning_rate
+    s = lr_schedule(cfg, n)
+    assert float(s(0)) == pytest.approx(lr, rel=1e-6)
+    assert float(s(10)) > 0.999 * lr  # zero slope: the start is as gentle as flat
+    assert float(s(n // 2)) == pytest.approx(lr / 2, rel=1e-3)
+    assert float(s(n)) == pytest.approx(0.0, abs=1e-12)
+    # decreasing throughout, so no part of the run is spent speeding up
+    vals = [float(s(t)) for t in range(0, n + 1, 25)]
+    assert np.all(np.diff(vals) <= 1e-12)
+
+
+def test_the_discrete_schedule_halves_at_its_boundaries():
+    from astrotune.train_latent import LatentTrainConfig, lr_schedule
+
+    cfg = LatentTrainConfig(lr_schedule="discrete", lr_schedule_phases=4,
+                            learning_rate=1e-4)
+    s = lr_schedule(cfg, 1000)
+    assert float(s(0)) == pytest.approx(1e-4)
+    # Keras switches on the step *after* the boundary, not on it
+    assert float(s(250)) == pytest.approx(1e-4)
+    assert float(s(251)) == pytest.approx(5e-5)
+    assert float(s(500)) == pytest.approx(5e-5)
+    assert float(s(501)) == pytest.approx(2.5e-5)
+    assert float(s(751)) == pytest.approx(1.25e-5)
+    assert float(s(1000)) == pytest.approx(1.25e-5)
+    # one phase is a constant rate, whatever the schedule is called
+    const = LatentTrainConfig(lr_schedule="discrete", lr_schedule_phases=1,
+                              learning_rate=1e-4)
+    assert float(lr_schedule(const, 1000)(999)) == pytest.approx(1e-4)
+
+
+def test_the_warmup_applies_to_either_schedule():
+    """``lr_warmup_frac`` ramps the rate in front of whatever schedule is chosen."""
+    from astrotune.train_latent import (LatentTrainConfig, _warmup_and_decay,
+                                        lr_schedule)
+
+    n = 20_000
+    for name in ("cosine", "discrete"):
+        cfg = LatentTrainConfig(lr_schedule=name, lr_warmup_frac=0.05,
+                                learning_rate=1e-4)
+        warmup = int(cfg.lr_warmup_frac * n)
+        s = _warmup_and_decay(lr_schedule(cfg, n), cfg.learning_rate, warmup)
+        # the first steps are the ramp, not the peak
+        assert float(s(0)) == pytest.approx(1e-4 / warmup, rel=1e-6)
+        # the ramp is ``peak * (step + 1) / warmup_steps``
+        assert float(s(warmup // 2)) == pytest.approx(1e-4 * (warmup // 2 + 1) / warmup,
+                                                      rel=1e-6)
+        # and the ramp never lifts the rate above the schedule's own value
+        for t in (0, warmup // 4, warmup // 2, warmup - 1, warmup, n // 2):
+            assert float(s(t)) <= float(lr_schedule(cfg, n)(t)) + 1e-15
+        # it reaches ~the peak at the end of the ramp
+        assert float(s(warmup - 1)) > 0.99 * 1e-4
+    # no warmup means the schedule starts at the peak
+    none = LatentTrainConfig(lr_warmup_frac=0.0, learning_rate=1e-4)
+    s = _warmup_and_decay(lr_schedule(none, 1000), 1e-4, 0)
+    assert float(s(0)) == pytest.approx(1e-4)
+
+
+def test_an_unknown_schedule_and_a_legacy_config():
+    from astrotune.train_latent import (LatentTrainConfig, _config_from_json,
+                                        lr_schedule)
+
+    with pytest.raises(ValueError):
+        lr_schedule(LatentTrainConfig(lr_schedule="cubic"), 100)
+    # a run that saved lr_schedule_phases but no lr_schedule used the discrete one
+    assert _config_from_json({"lr_schedule_phases": 8})["lr_schedule"] == "discrete"
+    assert _config_from_json({})["lr_schedule"] == "cosine"

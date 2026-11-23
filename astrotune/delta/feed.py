@@ -29,6 +29,7 @@ from typing import Dict, Optional, Sequence
 import numpy as np
 
 from .. import registry
+from ..config import N_PARAMS
 
 log = logging.getLogger(__name__)
 
@@ -81,8 +82,14 @@ def calibrated_sigma(run_dir, keys: Optional[Sequence[str]] = None,
         t = load_catalog(key)
         x, sigma_prep, measured = padded_inputs(t)
         raw = raw_sigma(t, key)
-        d = np.asarray(t["sigma_x"]).shape[1]
-        ls = np.log(np.where(measured, np.pad(raw, ((0, 0), (0, 4 - raw.shape[1]))), 1.0))
+        # A three-parameter catalog (no [alpha/Fe], or no logg) has a ``(n, 3)``
+        # quoted-sigma table, while the model always emits four columns: pad with
+        # a neutral 1.0 so the squares line up. The padded axes are unmeasured,
+        # so the ``where`` below drops them again either way, but the product
+        # cannot be formed without them.
+        d = raw.shape[1]
+        raw = np.pad(raw, ((0, 0), (0, N_PARAMS - d)), constant_values=1.0)
+        ls = np.log(np.where(measured, raw, 1.0))
         ln_scale, ln_add = fn(x, ls.astype("f4"),
                               np.full(len(x), group_of[k], dtype="i4"))
         sig = np.sqrt(np.exp(ln_scale.astype("f8")) * raw.astype("f8") ** 2

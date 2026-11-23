@@ -69,23 +69,16 @@ def _entries(run_dir: Path, sample: str, keys: Sequence[str],
     if sample != "all":
         raise ValueError(f"unknown sample {sample!r}: use 'train' or 'all'")
 
-    from ..apply import load_cached, make_forward_and_jacobian
+    from ..apply import make_forward_and_jacobian
     from ..model import load_bijector
     from ..training_data import load_tables
     from .stars import _catalog_entries
 
     run_dir = Path(run_dir)
-    cache_dir = run_dir / "harmonized" / "transform_cache_none"
-    if not cache_dir.exists():
-        raise FileNotFoundError(
-            f"{cache_dir} does not exist; run `astrotune-apply --run-dir {run_dir}` first.")
     tables = load_tables(keys, dedupe="none")
     fwd_jac = make_forward_and_jacobian(load_bijector(run_dir))
     for k, (key, t) in enumerate(tqdm(list(zip(keys, tables)), desc="uncertainties (all)")):
-        est = load_cached(cache_dir, registry.category_index(key), np.asarray(t["id"]), t)
-        if est is None:
-            raise FileNotFoundError(f"No usable cached transformation for {key} in {cache_dir}.")
-        c = _catalog_entries(est, t, key, fwd_jac, k)
+        c = _catalog_entries(t, key, fwd_jac, registry.category_index(key))
         yield k, {name: c[name] for name in _FIELDS}
 
 
