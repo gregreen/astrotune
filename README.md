@@ -361,8 +361,8 @@ estimator rather than of a different one.
   3 hidden layers, Adam with `beta_2=0.99` and AMSGrad, global-norm clip 100,
   `data_term = student_t`, `nu = 25`, ODE `rtol = atol = 1e-5`. The defaults are
   the reference notebook's apart from the three below.
-  * `learning_rate = 1e-4`, `n_epochs = 256`, batch 16384 (the production runs
-    pass `--batch-size 65536` and take ~83 steps per epoch instead of ~130).
+  * `learning_rate = 1e-4`, `n_epochs = 256`, batch 65536 (2¹⁶, ~83 steps per
+    epoch on the current sample).
     Adam's step is roughly `lr` per coordinate whatever the gradient does, so the
     rate is what bounds how far a step can travel; 1e-3 was an order of
     magnitude too large and let early runs walk into a distorted region.

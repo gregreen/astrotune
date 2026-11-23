@@ -183,7 +183,11 @@ class LatentTrainConfig:
     ode_atol: float = 1e-5
 
     # Optimization
-    batch_size: int = 16384  # observations per batch
+    #: Observations per batch: 2**16, the size every production run has used. The
+    #: batch is what one Gauss-Newton solve and one optimizer step see, so it sets
+    #: the noise on the step (a batch of 16384 makes ~4x as many, noisier steps) as
+    #: well as the memory; with the current sample it is 83 steps per epoch.
+    batch_size: int = 65536
     n_epochs: int = 256
     #: Independent block permutations concatenated into one epoch. The data of an
     #: epoch are ``block_shuffles`` passes over the training set, so with
