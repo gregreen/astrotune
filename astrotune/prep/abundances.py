@@ -20,6 +20,28 @@ def _render_fmt(fmt: str, element: str) -> str:
     return eval(f"f'''{fmt}'''", {}, {"x": element, "X": element})
 
 
+def as_x_fe(abundances: Table, fe_h: np.ndarray) -> Table:
+    """Convert ``[X/H]`` columns to ``[X/Fe]`` by subtracting the star's ``[Fe/H]``.
+
+    :func:`calc_alpha_Fe_from_abundances` averages whatever it is given, so for a
+    catalog whose element columns are ``[X/H]`` the per-element table it returns
+    is also ``[X/H]``. :func:`~astrotune.prep.plots.plot_alpha_abundances` labels
+    every panel ``[X/Fe]``, which is only true for the catalogs that store
+    ``[X/Fe]`` directly (APOGEE, GALAH, DESI, LAMOST MRS/DDP). Catalogs that store
+    ``[X/H]`` must convert first: ``[X/H]`` scatters by ~0.12 dex from star to star
+    and almost all of that is the ``[Fe/H]`` trend that is *subtracted out* of
+    ``[alpha/Fe]``, so plotting ``[X/H]`` against ``[alpha/Fe]`` gives a
+    near-uncorrelated cloud even when the elements agree perfectly.
+    """
+    fe_h = np.asarray(fe_h, dtype="f8")
+    return Table(
+        {
+            name: np.asarray(abundances[name], dtype="f8") - fe_h
+            for name in abundances.colnames
+        }
+    )
+
+
 def calc_alpha_Fe_from_abundances(
     t: Table,
     X_Fe_fmt: str,

@@ -25,7 +25,7 @@ from astropy.io import fits
 from astropy.table import Table
 
 from ..prep import plots
-from ..prep.abundances import calc_alpha_Fe_from_abundances
+from ..prep.abundances import as_x_fe, calc_alpha_Fe_from_abundances
 from ..prep.download import download as download_file
 from ..prep.transforms import unmask
 
@@ -77,7 +77,8 @@ def prepare_columns(t: Table, ctx) -> Table:
 
     t["alpha_fe"] = alpha_h - fe_h
     t["alpha_fe_err"] = np.sqrt(alpha_h_err**2 + fe_h_err**2)
-    ctx.extra["abundances"] = abundances
+    # The VAC stores [X/H]; the shared diagnostic labels its panels [X/Fe].
+    ctx.extra["abundances"] = as_x_fe(abundances, fe_h)
     return t
 
 
