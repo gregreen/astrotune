@@ -8,7 +8,9 @@ https://www.galah-survey.org/dr4/overview/
 Notes
 -----
 GALAH does not provide a single [alpha/Fe] column, so it is built from the
-individual alpha-element abundances (inverse-variance weighted mean).
+individual alpha-element abundances (inverse-variance weighted mean). [O/Fe]
+is excluded because it correlates poorly with the other alpha elements in
+the GALAH catalog.
 
 ``logg == 5`` is a placeholder used by GALAH and is removed, as are stars
 hotter than 7950 K, where the ASPCAP-like grid performs poorly.
@@ -39,6 +41,9 @@ PARAM_COLS = ("teff", "fe_h", "logg", "alpha_fe")
 UNC_COLS = ("e_teff", "e_fe_h", "e_logg", "e_alpha_fe")
 EXTRA_COLS = ("ra", "dec")
 
+#: Elements left out of the [alpha/Fe] mean; see the module docstring.
+EXCLUDED_ELEMENTS = ("O",)
+
 #: GALAH's placeholder surface gravity for stars without a reliable value.
 PLACEHOLDER_LOGG = 5.0
 #: Hot limit of the parameter grid.
@@ -62,6 +67,7 @@ def prepare_columns(t: Table, ctx) -> Table:
         "{x.lower()}_fe",
         "e_{x.lower()}_fe",
         flag_fmt="flag_{x.lower()}_fe",
+        exclude=EXCLUDED_ELEMENTS,
     )
     t["alpha_fe"] = alpha_fe
     t["e_alpha_fe"] = alpha_fe_err
