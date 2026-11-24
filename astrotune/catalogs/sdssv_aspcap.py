@@ -47,6 +47,14 @@ EXTRA_COLS = ("ra", "dec")
 
 #: Bit mask of the spectrum flags that disqualify a visit.
 SPECTRUM_FLAGS_REJECT = 2**0 | 2**2 | 2**19
+#: Bit mask of the result_flags that disqualify a star.
+RESULT_FLAGS_REJECT = (
+      2**0   # FERRE_FAIL
+    | 2**5   # TEFF_GRID_EDGE_WARN
+    | 2**7   # LOGG_GRID_EDGE_WARN
+    | 2**13  # M_H_ATM_GRID_EDGE_WARN
+    | 2**15  # ALPHA_M_ATM_GRID_EDGE_WARN
+)
 #: Fractional flux systematic, see the module docstring.
 RCHI2_SNR_COEFF = 1e-4
 #: Maximum chi^2_nu / (1 + c SNR^2).
@@ -68,11 +76,11 @@ def cuts(t: Table, ctx) -> dict:
     snr = unmask(t["snr"])
     rchi2 = unmask(t["rchi2"])
     spectrum_flags = unmask(t["spectrum_flags"]).astype("i8")
+    result_flags = unmask(t["result_flags"]).astype("i8")
 
     return {
-        "no warning/bad flags": ~(
-            unmask(t["flag_warn"]).astype(bool) | unmask(t["flag_bad"]).astype(bool)
-        ),
+        "flag_bad == false": ~unmask(t["flag_bad"]).astype(bool),
+        "result_flags clear": ~(result_flags & RESULT_FLAGS_REJECT).astype(bool),
         "parameters finite": finite_mask(t, PARAM_COLS),
         "[Fe/H] in range": (fe_h > -2.3) & (fe_h < 0.9),
         "SNR > 20": snr > 20.0,
