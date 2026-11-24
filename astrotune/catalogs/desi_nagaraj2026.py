@@ -75,7 +75,7 @@ EXTRA_COLS = ("RA", "DEC")
 #: Regularization errors: how far the transformation may move each parameter.
 #: A first guess, in transformed units (cf. the offsets of ~0.05-0.07 found
 #: against APOGEE); tune once the catalog is in the model.
-X_ERR = (0.1, 0.1, 0.1, 0.2)
+X_ERR = (0.1, 0.1, 0.1, 0.05)
 
 SNR_MIN = 20.0
 CHI2_FLAG_MAX = 3.0  # recommended by the paper

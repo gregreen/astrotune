@@ -76,7 +76,7 @@ def param_errs(t: Table, ctx) -> np.ndarray:
 
     n = len(t)
     return np.stack(
-        [hot, np.full(n, 0.1), np.full(n, 0.1), np.full(n, 0.1)], axis=1
+        [hot, np.full(n, 0.1), np.full(n, 0.1), np.full(n, 0.05)], axis=1
     ).astype("f4")
 
 

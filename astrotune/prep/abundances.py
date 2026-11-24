@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import numpy as np
 from astropy.table import Table
 
@@ -20,12 +22,35 @@ def _render_fmt(fmt: str, element: str) -> str:
     return eval(f"f'''{fmt}'''", {}, {"x": element, "X": element})
 
 
+def as_x_fe(abundances: Table, fe_h: np.ndarray) -> Table:
+    """Convert ``[X/H]`` columns to ``[X/Fe]`` by subtracting the star's ``[Fe/H]``.
+
+    :func:`calc_alpha_Fe_from_abundances` averages whatever it is given, so for a
+    catalog whose element columns are ``[X/H]`` the per-element table it returns
+    is also ``[X/H]``. :func:`~astrotune.prep.plots.plot_alpha_abundances` labels
+    every panel ``[X/Fe]``, which is only true for the catalogs that store
+    ``[X/Fe]`` directly (APOGEE, GALAH, DESI, LAMOST MRS/DDP). Catalogs that store
+    ``[X/H]`` must convert first: ``[X/H]`` scatters by ~0.12 dex from star to star
+    and almost all of that is the ``[Fe/H]`` trend that is *subtracted out* of
+    ``[alpha/Fe]``, so plotting ``[X/H]`` against ``[alpha/Fe]`` gives a
+    near-uncorrelated cloud even when the elements agree perfectly.
+    """
+    fe_h = np.asarray(fe_h, dtype="f8")
+    return Table(
+        {
+            name: np.asarray(abundances[name], dtype="f8") - fe_h
+            for name in abundances.colnames
+        }
+    )
+
+
 def calc_alpha_Fe_from_abundances(
     t: Table,
     X_Fe_fmt: str,
     X_Fe_err_fmt: str,
     flag_fmt: str | None = None,
     err_floor: float = 1e-2,
+    exclude: Sequence[str] = (),
 ):
     """Inverse-variance weighted mean of the available [X/Fe] abundances.
 
@@ -40,6 +65,12 @@ def calc_alpha_Fe_from_abundances(
         Optional format string for per-element flags; ``0`` means good.
     err_floor
         Floor added in quadrature to the abundance uncertainties.
+    exclude
+        Elements to leave out of the mean and of the returned per-element table,
+        for a catalog whose element does not follow the others (SDSS-V MDC's Ca
+        and Ti do not). Names are :data:`ALPHA_ELEMENTS` entries, so the
+        capitalisation matters: ``"Ca"``, not ``"CA"``. An unrecognised name is
+        an error rather than a silent no-op.
 
     Returns
     -------
@@ -47,11 +78,21 @@ def calc_alpha_Fe_from_abundances(
         Weighted mean abundance and its uncertainty. Stars with no valid
         abundance get ``nan``.
     abundances : astropy.table.Table
-        The individual abundances, for diagnostic plots.
+        The individual abundances that went into the mean, for diagnostic plots.
     """
+    excluded = set(exclude)
+    unknown = excluded.difference(ALPHA_ELEMENTS)
+    if unknown:
+        raise ValueError(
+            f"unknown element(s) {sorted(unknown)} to exclude; the alpha elements "
+            f"are {list(ALPHA_ELEMENTS)}"
+        )
+
     X_Fe, X_Fe_weight, X_Fe_bad, names = [], [], [], []
 
     for element in ALPHA_ELEMENTS:
+        if element in excluded:
+            continue
         key = _render_fmt(X_Fe_fmt, element)
         if key not in t.colnames:
             continue
@@ -74,6 +115,11 @@ def calc_alpha_Fe_from_abundances(
         X_Fe_weight.append(weight)
 
     if not X_Fe:
+        if excluded:
+            raise ValueError(
+                "No alpha-element abundance columns were found after excluding "
+                f"{sorted(excluded)}."
+            )
         raise ValueError("No alpha-element abundance columns were found.")
 
     weights = np.stack(X_Fe_weight, axis=1)

@@ -88,7 +88,7 @@ def param_errs(t: Table, ctx) -> np.ndarray:
             teff_err,
             np.full(n, 0.1),
             np.full(n, 0.1),
-            np.full(n, 0.05),
+            np.full(n, 0.02),
         ],
         axis=1,
     ).astype("f4")

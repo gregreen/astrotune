@@ -50,6 +50,9 @@ PARAM_COLS = ("TEFF", "FEH", "LOGG", "ALPHA_FE")
 UNC_COLS = ("TEFF_ERR", "FEH_ERR", "LOGG_ERR", "ALPHA_FE_ERR")
 EXTRA_COLS = ("ra_gdr3", "dec_gdr3")
 
+#: Regularization errors: how far the transformation may move each parameter.
+X_ERR = (0.1, 0.1, 0.1, 0.05)
+
 #: Photometric bands combined into the total SNR.
 SNR_BANDS = "UGRIZ"
 #: Elements whose sentinel abundances need to be flagged by hand.
@@ -66,6 +69,10 @@ CHISQ_FACTOR = 5.0
 
 def download(ctx) -> None:
     download_file(SOURCES[0], ctx.raw_dir / FILENAME)
+
+
+def param_errs(t: Table, ctx):
+    return X_ERR
 
 
 def total_snr(t: Table) -> np.ndarray:
