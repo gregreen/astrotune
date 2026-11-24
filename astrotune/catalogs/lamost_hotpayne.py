@@ -72,7 +72,7 @@ def prepare_columns(t: Table, ctx) -> Table:
 
     t["[alpha/Fe]"] = alpha_h - fe_h
     t["e_[alpha/Fe]"] = np.sqrt(alpha_h_err**2 + fe_h_err**2)
-    # The catalogue stores [X/H]; the shared diagnostic labels its panels [X/Fe].
+    # The catalog stores [X/H]; the shared diagnostic labels its panels [X/Fe].
     ctx.extra["abundances"] = as_x_fe(abundances, fe_h)
     return t
 

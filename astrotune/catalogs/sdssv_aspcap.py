@@ -103,7 +103,7 @@ def param_errs(t: Table, ctx) -> np.ndarray:
             hot,               # Teff
             hot,               # [Fe/H]: ASPCAP metallicities are less certain
             np.full(n, 0.1),   # logg
-            np.full(n, 0.05),  # [alpha/Fe]
+            np.full(n, 0.02),  # [alpha/Fe]
         ],
         axis=1,
     ).astype("f4")
