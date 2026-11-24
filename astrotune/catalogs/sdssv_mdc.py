@@ -16,6 +16,11 @@ dummy axis: the value is set to 0, its statistical uncertainty and its
 regularization error to 1e9, so the axis contributes nothing to the loss.
 
 The [alpha/H] abundances are converted to [alpha/Fe] by subtracting [Fe/H].
+
+Ca and Ti are left out of that mean: in this VAC they are the two elements that
+do not follow the others (Ti sits ~0.11 dex above them with the largest scatter,
+Ca is nearly flat), so they add an offset and noise rather than signal. The mean
+is therefore over O, Mg and Si.
 """
 
 from __future__ import annotations
@@ -49,6 +54,9 @@ EXTRA_COLS = ()
 #: The dummy logg axis is given an enormous regularization error.
 X_ERR = (0.2, 0.2, 1e9, 0.2)
 
+#: Elements left out of the [alpha/Fe] mean; see the module docstring.
+EXCLUDED_ELEMENTS = ("Ca", "Ti")
+
 #: Index of the dummy logg axis.
 LOGG_INDEX = 2
 DUMMY_SIGMA = 1e9
@@ -70,7 +78,10 @@ def load(ctx) -> Table:
 def prepare_columns(t: Table, ctx) -> Table:
     """Convert the mean [alpha/H] into [alpha/Fe]."""
     alpha_h, alpha_h_err, abundances = calc_alpha_Fe_from_abundances(
-        t, "{x.lower()}_h_cannon", "{x.lower()}_h_err"
+        t,
+        "{x.lower()}_h_cannon",
+        "{x.lower()}_h_err",
+        exclude=EXCLUDED_ELEMENTS,
     )
     fe_h = unmask(t["fe_h_cannon"], fill=np.nan)
     fe_h_err = unmask(t["fe_h_err"], fill=np.nan)

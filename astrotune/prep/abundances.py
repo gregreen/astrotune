@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import numpy as np
 from astropy.table import Table
 
@@ -48,6 +50,7 @@ def calc_alpha_Fe_from_abundances(
     X_Fe_err_fmt: str,
     flag_fmt: str | None = None,
     err_floor: float = 1e-2,
+    exclude: Sequence[str] = (),
 ):
     """Inverse-variance weighted mean of the available [X/Fe] abundances.
 
@@ -62,6 +65,12 @@ def calc_alpha_Fe_from_abundances(
         Optional format string for per-element flags; ``0`` means good.
     err_floor
         Floor added in quadrature to the abundance uncertainties.
+    exclude
+        Elements to leave out of the mean and of the returned per-element table,
+        for a catalog whose element does not follow the others (SDSS-V MDC's Ca
+        and Ti do not). Names are :data:`ALPHA_ELEMENTS` entries, so the
+        capitalisation matters: ``"Ca"``, not ``"CA"``. An unrecognised name is
+        an error rather than a silent no-op.
 
     Returns
     -------
@@ -69,11 +78,21 @@ def calc_alpha_Fe_from_abundances(
         Weighted mean abundance and its uncertainty. Stars with no valid
         abundance get ``nan``.
     abundances : astropy.table.Table
-        The individual abundances, for diagnostic plots.
+        The individual abundances that went into the mean, for diagnostic plots.
     """
+    excluded = set(exclude)
+    unknown = excluded.difference(ALPHA_ELEMENTS)
+    if unknown:
+        raise ValueError(
+            f"unknown element(s) {sorted(unknown)} to exclude; the alpha elements "
+            f"are {list(ALPHA_ELEMENTS)}"
+        )
+
     X_Fe, X_Fe_weight, X_Fe_bad, names = [], [], [], []
 
     for element in ALPHA_ELEMENTS:
+        if element in excluded:
+            continue
         key = _render_fmt(X_Fe_fmt, element)
         if key not in t.colnames:
             continue
@@ -96,6 +115,11 @@ def calc_alpha_Fe_from_abundances(
         X_Fe_weight.append(weight)
 
     if not X_Fe:
+        if excluded:
+            raise ValueError(
+                "No alpha-element abundance columns were found after excluding "
+                f"{sorted(excluded)}."
+            )
         raise ValueError("No alpha-element abundance columns were found.")
 
     weights = np.stack(X_Fe_weight, axis=1)

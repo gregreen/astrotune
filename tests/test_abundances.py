@@ -66,3 +66,29 @@ def test_as_x_fe_keeps_missing_values_missing():
     assert ratios["Mg"][0] == pytest.approx(0.1)
     assert np.isnan(ratios["Mg"][1])
     assert ratios["Si"][2] is np.nan or np.isnan(ratios["Si"][2])
+
+
+def test_excluded_elements_leave_the_mean_and_the_per_element_table():
+    rng = np.random.default_rng(5)
+    fe_h = rng.normal(-0.1, 0.2, 400)
+    x_fe = [np.full(400, 0.05), np.full(400, 0.30), np.full(400, -0.20)]
+    t = _catalog(fe_h, x_fe)  # Mg, Si, Ca
+
+    alpha_h, _, abundances = calc_alpha_Fe_from_abundances(
+        t, "{x}_H", "{x}_H_ERR", exclude=("Si", "Ca")
+    )
+
+    assert list(abundances.colnames) == ["Mg"]
+    assert np.allclose(alpha_h - fe_h, 0.05)
+    # nothing is left once every present element is excluded
+    with pytest.raises(ValueError, match="after excluding"):
+        calc_alpha_Fe_from_abundances(
+            t, "{x}_H", "{x}_H_ERR", exclude=("Mg", "Si", "Ca")
+        )
+
+
+def test_an_unknown_exclusion_is_an_error_not_a_silent_no_op():
+    t = _catalog(np.zeros(10), [np.zeros(10)] * 3)
+
+    with pytest.raises(ValueError, match="unknown element"):
+        calc_alpha_Fe_from_abundances(t, "{x}_H", "{x}_H_ERR", exclude=("CA",))
