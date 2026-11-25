@@ -1596,13 +1596,8 @@ class LatentTrainer:
             (ds, _make_ctrl_dataset(self._ctrl_train, cfg.batch_size, seed))
         ).prefetch(2)
 
-    def learning_rate(self, step):
-        """The scheduled rate, times whatever a backtrack has left of it."""
-        return self._base_learning_rate(step) * self.lr_scale
-
-    def learning_rate(self, step):
-        """The scheduled rate, times whatever a backtrack has left of it."""
-        return self._base_learning_rate(step) * self.lr_scale
+    # ``self.learning_rate`` is not a method: it is a ``_ScaledRate`` schedule
+    # bound in ``__init__`` (the base schedule times the backtrack factor).
 
     def snapshot_state(self, step: int) -> None:
         """Keep a copy of everything a rollback has to put back, in memory.
