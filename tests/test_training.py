@@ -562,3 +562,38 @@ def test_an_unknown_schedule_and_a_legacy_config():
     # a run that saved lr_schedule_phases but no lr_schedule used the discrete one
     assert _config_from_json({"lr_schedule_phases": 8})["lr_schedule"] == "discrete"
     assert _config_from_json({})["lr_schedule"] == "cosine"
+
+
+def test_the_legend_markers_are_opaque_while_the_scatter_stays_faint():
+    """The legend has to be readable; the clouds behind it must not be."""
+    from astrotune import training_plots as tp
+
+    rng = np.random.default_rng(2)
+    n = 40
+    x = rng.normal(size=(n, 4)).astype("f4")
+    ctrl = dict(
+        c_control=np.zeros(n, dtype="i4"),
+        from_catalog=np.ones(n, dtype=bool),
+        x_control=x,
+        missing_control=np.zeros((n, 4), dtype=bool),
+    )
+
+    class _Bij:
+        def return_path(self, x, c, n_frames):
+            import tensorflow as tf
+
+            return tf.stack([x, x + 0.1])
+
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure()
+    tp.plot_transformed_params(_Bij(), tp.catalog_samples(ctrl, 1), ["a"],
+                               [(0, 0, 1)], fig)
+    ax = fig.axes[0]
+    assert all(c.get_alpha() == pytest.approx(0.2) for c in ax.collections)
+    legend = ax.get_legend()
+    assert legend is not None and len(legend.legend_handles) == 1
+    assert all(h.get_alpha() == pytest.approx(1.0) for h in legend.legend_handles)
+    # the legend handles are proxies, not the scatter artists
+    assert not any(h in ax.collections for h in legend.legend_handles)
+    plt.close(fig)
