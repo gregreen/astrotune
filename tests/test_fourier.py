@@ -108,3 +108,21 @@ def test_the_bijector_with_features_is_still_invertible():
     back, _ = b.inverse_with_s(y, c=c)
     assert np.all(np.isfinite(back.numpy()))
     assert np.abs(back.numpy() - x.numpy()).max() < 1e-3
+
+
+def test_the_default_configuration_leaves_the_block_off():
+    """The two time harmonics were visible in the learned map, so they are opt-in.
+
+    Runs that saved ``fourier_n_modes``/``fourier_time_harmonics`` keep them on a
+    resume, whatever the default becomes; this only pins what a *new* run gets.
+    """
+    from astrotune.train_latent import LatentTrainConfig, fourier_kwargs
+
+    cfg = LatentTrainConfig()
+    assert (cfg.fourier_n_modes, cfg.fourier_time_harmonics) == (0, 0)
+    assert fourier_kwargs(cfg) is None
+
+    opted_in = LatentTrainConfig(fourier_n_modes=6, fourier_time_harmonics=2)
+    assert fourier_kwargs(opted_in) == dict(
+        n_modes=6, lam_min=0.25, lam_max=8.0, time_harmonics=2
+    )

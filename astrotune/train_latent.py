@@ -187,16 +187,25 @@ class LatentTrainConfig:
     # of the first dense layer. The modes are separable -- one ladder of wavelengths
     # per axis -- and fixed, so there is nothing to learn and nothing random. See
     # astrotune/model/fourier.py for why this is worth having.
+    #
+    # Off by default. Two harmonics of the flow parameter left a visible imprint on
+    # the map: in the videos of the step-6,648 checkpoint of
+    # latent_student_t_iter1_11m24d_lr1e4_bt, several catalogs swung through two
+    # full oscillations on the way to their fixed point, and nothing in the loss
+    # prefers a monotone path -- the data constrain where the flow ends, not how it
+    # gets there. The parameter ladders never showed anything like that, so the
+    # block is worth keeping as an option; it just should not be the default.
     #: Wavelengths per parameter axis, log-spaced from ``lam_max`` down to ``lam_min``
     #: in the units of that coordinate: six of them between 8 and 0.25 are exact
-    #: octaves. 0 turns the parameter axes off.
-    fourier_n_modes: int = 6
+    #: octaves. 0 turns the parameter axes off, which is the default.
+    fourier_n_modes: int = 0
     fourier_lam_min: float = 0.25
     fourier_lam_max: float = 8.0
     #: Harmonics of the flow parameter, with wavelengths ``1, 1/2, 1/4 ...``: a
     #: frequency along ``t`` is a frequency along the integration, which the solver
-    #: has to resolve, so it is capped rather than log-spaced. 0 leaves ``t`` out.
-    fourier_time_harmonics: int = 2
+    #: has to resolve, so it is capped rather than log-spaced. 0 leaves ``t`` out,
+    #: which is the default.
+    fourier_time_harmonics: int = 0
 
     # Optimization
     #: Observations per batch: 2**16, the size every production run has used. The

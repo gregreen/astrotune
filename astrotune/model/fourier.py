@@ -22,6 +22,11 @@ weights. Its wavelengths are therefore the first ``time_harmonics`` harmonics
 ``1, 1/2, 1/4 ...`` (in units of the flow parameter, which runs from 0 to 1)
 rather than the geometric ladder, and the default of two caps it at two
 oscillations over the whole flow.
+
+That default is this block's, not the trainer's: ``LatentTrainConfig`` starts
+with fourier_n_modes = fourier_time_harmonics = 0, because two oscillations along
+the flow turned out to be visible in the learned map (several catalogs swinging
+twice before settling) without improving the fit. Turn it on per run.
 """
 
 from __future__ import annotations
