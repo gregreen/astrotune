@@ -640,3 +640,26 @@ def test_fit_and_evaluate_writes_one_directory_per_model_type(tmp_path, monkeypa
     assert "scale" in comparison and "add_sigma" in comparison
     assert (root / "const_scale_add" / "evaluation" / "comparison.txt").exists()
     assert (root / "const_scale_add" / "evaluation" / "per_catalog.txt").exists()
+
+
+def test_the_nll_subsample_spans_the_whole_table_rather_than_its_first_rows():
+    """A cap on the cost must not turn the metric into a patch of sky.
+
+    The star table is sorted by Gaia id, whose leading digits are the HEALPix index,
+    so the first N rows are a region: on the 20-catalog table the per-star NLL runs
+    from -6.5 there to -4.4 in the last tenth, which made the capped validation NLL
+    look 0.7 nats better than the training one.
+    """
+    from astrotune.delta.train import _evenly_spaced_stars
+
+    s = _synthetic_stars(n_star=2000, n_cat=2)
+    small = _evenly_spaced_stars(s, 200)
+
+    ids = small["id"]
+    assert len(ids) == 200
+    assert ids.min() == s["id"].min()             # starts at the first row
+    assert ids.max() >= 0.99 * s["id"].max()      # and reaches the last
+    assert np.all(np.diff(ids) == 10 * 7)         # evenly spaced, not contiguous
+    # a table that already fits is returned untouched
+    assert _evenly_spaced_stars(s, 5000) is s
+    assert _evenly_spaced_stars(s, None) is s

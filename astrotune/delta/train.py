@@ -144,14 +144,17 @@ def _spec(tf):
 
 
 def mean_star_nll(stars, delta_fn, batch_size: int = 131072, max_stars: Optional[int] = None) -> float:
-    """Mean negative log likelihood per star over ``stars`` (a proper likelihood)."""
+    """Mean negative log likelihood per star over ``stars`` (a proper likelihood).
+
+    ``max_stars`` caps the cost by taking every k-th star rather than the first
+    ``max_stars`` rows -- see :func:`_evenly_spaced_stars`.
+    """
     import tensorflow as tf
 
     from .model import make_batch, star_nll
     from .stars import block_indices
 
-    if max_stars is not None and len(stars["id"]) > max_stars:
-        stars = _first_stars(stars, max_stars)
+    stars = _evenly_spaced_stars(stars, max_stars)
     n_group, shared = _group_state(delta_fn)
     total, n = 0.0, 0
     nu = delta_fn.nu() if hasattr(delta_fn, "nu") else None
@@ -180,9 +183,23 @@ def _group_state(model):
     return int(shared_mod.multi.shape[0]), shared_mod.variance()  # len == n_group
 
 
-def _first_stars(stars, n_star: int):
-    keep = np.zeros(len(stars["id"]), dtype=bool)
-    keep[:n_star] = True
+def _evenly_spaced_stars(stars, n_star: Optional[int]):
+    """At most ``n_star`` stars spread evenly through the table.
+
+    Taking the first ``n_star`` rows instead costs the same and is wrong: the star
+    table is sorted by Gaia id, whose leading digits are the HEALPix index, so a
+    contiguous slice is a patch of sky rather than a sample of the survey. In the
+    20-catalog table the mean per-star NLL runs from -6.5 in the first tenth of the
+    rows to -4.4 in the last, so a truncated validation set read about 0.7 nats
+    better than the training set it was supposed to be compared with. Every k-th
+    star keeps the subsample uniform in id, and therefore on the sky.
+    """
+    n = len(stars["id"])
+    if n_star is None or n <= n_star:
+        return stars
+    step = int(np.ceil(n / n_star))
+    keep = np.zeros(n, dtype=bool)
+    keep[::step] = True
     from .stars import subset
 
     return subset(stars, keep)
