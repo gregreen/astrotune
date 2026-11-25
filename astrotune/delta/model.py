@@ -1,16 +1,26 @@
-"""The delta model: extra (diagonal) variance for every catalog entry.
+"""The delta model: a correction to each catalog's own quoted uncertainties.
 
-``ln_delta_cov(x, ln_sigma_x, catalog) -> (4,)`` is the natural log of the
-variance added, in the *harmonized* space, to the propagated covariance of an
-entry. The inputs are the entry's own parameters (the catalog's coordinates,
-e.g. ``5 ln(Teff/5000 K)``), the log of its reported uncertainties, and its
-catalog (through FiLM, as in the bijector). The network is unchanged from the
-pair-based version: only the likelihood it is fitted with has changed.
+The correction lives in *catalog* space. For an entry whose catalog quotes
+``sigma`` (in our parameter units, before our rescaling and error floors) the
+model returns a log variance scale ``ln_scale`` and an additive variance
+``ln_add``, and :func:`astrotune.delta.covariance.entry_cov_tf` builds
+
+    v_p = exp(ln_scale_p) * sigma_p^2 + exp(ln_add_p),
+    S   = J diag(v) J^T,
+
+with ``J`` the bijector's Jacobian at the entry's own parameters -- the same
+sandwich ``astrotune.apply`` forms for the quoted errors, with a learned diagonal
+in place of ``sigma^2``. So ``exp(ln_scale / 2)`` is the factor by which the
+catalog's quoted error is wrong and ``exp(ln_add / 2)`` the part it does not
+report, both in the catalog's units. Three parameterisations are implemented
+(:data:`MODEL_TYPES`): one additive term per group and parameter (``const_add``),
+scale and additive per group and parameter (``const_scale_add``, the default),
+and a FiLM network of the stellar parameters (``network_scale_add``).
 
 The likelihood is the one of the latent-``y`` paradigm. A star has entries
 ``k = 1..K`` in different catalogs, all measurements of one unknown value ``z``:
 
-    y_k = z + e_k,   e_k ~ N(0, S_k),   S_k = C_k + diag(exp(ln_delta_k)),
+    y_k = z + e_k,   e_k ~ N(0, S_k),
 
 with the ``e_k`` independent given ``z``. Marginalising ``z`` with a flat prior
 gives, per star,
@@ -26,8 +36,15 @@ pair likelihood, constant included, since
 ``y_1 - y_2``; it differs for ``K >= 3``, where the pair version counted
 ``K (K-1) / 2`` correlated terms instead of one.
 
+Two extensions are used by the fit. Catalogs that run the same pipeline on the
+same spectra are grouped, and the group's value is a latent level between ``z``
+and its entries (:class:`SharedSystematic`), so their common mistake cancels in
+within-group differences; and a per-group tail weight ``nu`` makes the noise a
+multivariate Student's t (:class:`TailWeight`). :mod:`astrotune.delta.train` fits
+it and ``notes/error_calibration_model.tex`` states the model in full.
+
 A parameter that an entry does not measure carries a placeholder variance of
-``MISSING_VAR`` in ``C`` and a harmonized value of 0, so its row and column of
+``MISSING_VAR`` in ``S`` and a harmonized value of 0, so its row and column of
 ``S_k`` are ``1e9``: its precision ``1e-9`` contributes essentially nothing to
 ``A``, its residual is 0, and its ``ln det`` contribution is removed by the
 mask. A parameter that *no* entry of the star measures leaves ``A`` with a
@@ -230,7 +247,7 @@ class ScaleAddNetwork(snt.Module):
     error rather than adding a fixed amount to it.
 
     ``ln_scale`` is the log of a *variance* scale, soft-clamped to
-    ``[ln 1/16, ln 16]``; ``ln_add`` is floored at ``LN_MIN`` and starts there.
+    ``[ln 1/64, ln 64]``; ``ln_add`` is floored at ``LN_MIN`` and starts there.
     """
 
     def __init__(self, n_cat: int, hidden_size: int = 64, n_hidden: int = 3,

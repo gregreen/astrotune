@@ -27,16 +27,30 @@
 Each input catalog measures the same star, in its own units and with its own
 quoted uncertainties. After harmonization every measurement is a vector of four
 stellar parameters with a covariance. This note describes the model that then
-asks: \emph{are those covariances right, and if not, what is the correction?}
-It is fitted after the main model, on the stars that more than one catalog
-observes, and it is used to replace the covariances before the merge.
+asks: \emph{are the catalog's quoted uncertainties right, and if not, what is the
+correction?} It is fitted after the main model, on the stars that more than one
+catalog observes, and its output replaces the quoted errors before the next
+iteration of the bijector and before the merge.
+
+\noindent
+The correction is applied in \emph{catalog} space: the catalog's own quoted
+$\sigma$ -- in our parameter units, before any of our rescaling and floors -- is
+scaled and inflated, and only the corrected diagonal is propagated to the
+harmonized space with the bijector's Jacobian (Section~\ref{sec:cov}). That is
+the same sandwich \texttt{apply} already forms for the quoted errors, with a
+learned diagonal in place of $\sigma^2$, so the fit is a statement about the
+measurement rather than about the bijector: a scale learned here is a factor by
+which one catalog's quoted error is wrong, comparable across catalogs and across
+parameters.
 
 \noindent
 Sections~\ref{sec:gauss}--\ref{sec:cov} and \ref{sec:t}--\ref{sec:est} describe
 the model as implemented and fitted. Section~\ref{sec:groups} describes the
-grouping extension, which is also implemented and is what the fit now uses: a
-group of catalogs that run the same pipeline on the same spectra gets one shared
+grouping extension, which is also implemented and is what the fit uses: a group
+of catalogs that run the same pipeline on the same spectra gets one shared
 correction and one shared systematic, and the reason is spelled out there.
+Section~\ref{sec:ident} collects the degeneracies that make some of the fitted
+numbers harder to read than others.
 
 \section{Notation}
 
@@ -46,15 +60,17 @@ correction and one shared systematic, and the reason is spelled out there.
 symbol & meaning \\
 \midrule
 $d = 4$ & number of parameters: $5\ln(T_{\rm eff}/5000\,\mathrm{K})$, [Fe/H], $\log g$, [$\alpha$/Fe] \\
-$\bv\theta_a$ & the catalog's own parameters of entry $a$ (its own units, not harmonized) \\
+$\bv\theta_a \in \mathbb{R}^d$ & the catalog's own parameters of entry $a$ (its own units, not harmonized) \\
+$\bv\sigma_a \in \mathbb{R}^d_{>0}$ & the uncertainties the catalog quotes for them, in the same units, \\
+ & before our rescaling and error floors (\texttt{sigma\_x\_raw}) \\
+$\bM J_a = \partial\bv y/\partial\bv\theta$ & the Jacobian of the harmonization at $\bv\theta_a$ \\
 $\bv y_a \in \mathbb{R}^d$ & harmonized parameter values of entry $a$ \\
-$\bM C_a$ & covariance propagated to the harmonized space from the quoted errors, \\
-         & the transformation Jacobian and the error floors \\
+$\bv v_a \in \mathbb{R}^d_{>0}$ & the corrected variance of entry $a$, \emph{in catalog units} \\
+$\bM S_a = \bM J_a \diag(\bv v_a)\bM J_a\T$ & its covariance in the harmonized space \\
 $\bM m_a \in \{0,1\}^d$ & which of the $d$ parameters entry $a$ measures; $d_a = \bv 1\T \bM m_a$ \\
 $c(a)$ & catalog of entry $a$; \quad $g(a)$: its \emph{group} (Section~\ref{sec:groups}) \\
 $K$, $K_g$ & number of entries of the star, and of those in group $g$ \\
-$\bM S_a$ & corrected \emph{independent} covariance of entry $a$ \\
-$\bM G_g$ & \emph{shared} (pipeline-level) covariance of group $g$ \\
+$\bM G_g = \diag(\bv\tau_g^2)$ & \emph{shared} (pipeline-level) covariance of group $g$ \\
 $\bv z$ & the star's true parameters (latent) \\
 $\bv t_g$ & the value group $g$'s pipeline effectively reports (latent) \\
 $\bM A_g$, $\hat{\bv z}_g$, $\bM V_g$ & group precision sum, estimate and effective covariance \\
@@ -64,9 +80,10 @@ $\nu_g$ & degrees of freedom of the Student's $t$ of group $g$ \\
 \end{tabular}
 \end{center}
 
-A parameter an entry does not measure carries a placeholder variance of $10^9$
-in $\bM C_a$ and is masked out of every determinant and quadratic form, so the
-bookkeeping below is written as if every entry measured all $d$ parameters.
+A parameter an entry does not measure is masked out of every determinant and
+quadratic form, and its row and column of $\bM S_a$ is set to a placeholder
+variance of $10^9$, so the bookkeeping below is written as if every entry
+measured all $d$ parameters.
 
 \section{The independent Gaussian model}
 \label{sec:gauss}
@@ -105,30 +122,83 @@ $n_{\rm res}=d$; this identity is the cheapest unit test of any change to it.
 \section{The corrected covariance}
 \label{sec:cov}
 
-The model does not add an error to the diagonal and leave the rest alone. It
-rescales the whole propagated matrix and then adds a diagonal term,
+The model does not touch the harmonized covariance as such. It corrects the
+catalog's quoted variance, in the catalog's units, and propagates the result:
 \begin{equation}
-  \bM S_a = \bM M_a \bM C_a \bM M_a + \diag(\bv\alpha_a), \qquad
-  \bM M_a = \diag\!\left(e^{\bv\ell_a/2}\right),
+  v_{a,p} = e^{\ell_{a,p}}\,\sigma_{a,p}^2 + e^{\alpha_{a,p}},
+  \qquad
+  \bM S_a = \bM J_a \diag(\bv v_a)\bM J_a\T ,
   \label{eq:cov}
 \end{equation}
-with $\bv\ell_a$ the per-parameter \emph{log variance scale} and $\bv\alpha_a$
-the per-parameter \emph{additive variance}. The congruence
-$\bM M\bM C\bM M$ keeps $\bM S_a$ positive definite for any scale (it is a
-change of units), and $\bM M=\bM I$, $\bv\alpha\to\bv 0$ reproduce the quoted
-covariance exactly.
+with $\ell_{a,p}$ a \emph{log variance scale} and $\alpha_{a,p}$ an
+\emph{additive variance}, both in catalog units. So
+$s_{a,p} = e^{\ell_{a,p}/2}$ is the factor by which the catalog's quoted error
+is wrong and $a_{a,p} = e^{\alpha_{a,p}/2}$ the part of the error it does not
+report at all; the two are separated by the \emph{spread} of $\sigma_{a,p}$ over
+stars, since only the second is the same for a precise and a noisy measurement.
+\begin{itemize}
+  \item The sandwich in \eqref{eq:cov} is the one \texttt{apply} already uses for
+the quoted errors, $\bM J\diag(\bv\sigma^2)\bM J\T$; the delta model is the same
+construction with a learned diagonal. Its interpretation therefore does not
+depend on the bijector (beyond the local linearisation $\bM J_a$), and $\ell$ and
+$a$ are properties of the catalog.
+  \item The catalog's quoted covariance is taken to be \emph{diagonal} in
+catalog space, which is what a catalog reports: marginal errors, no correlations.
+All off-diagonal structure of $\bM S_a$ comes from $\bM J_a$ alone. This is a
+modelling choice worth stating; a catalog that published correlations could be
+carried through the same sandwich with a full quoted matrix.
+  \item $\bM S_a$ is positive definite for any $\ell$ and $\alpha$, since
+$\bv v_a > 0$.
+  \item $\ell = 0$, $\alpha \to 0$ reproduces the \emph{quoted} covariance
+propagated with $\bM J_a$ -- \emph{not} the covariance the pipeline currently
+propagates, which has the catalogs' own rescalings and our per-parameter error
+floors applied. Those are part of what the fit has to reproduce, which is why a
+fitted scale of 1 is not the same statement as "the prepared errors are right".
+\end{itemize}
 
-Both are outputs of a small neural network, $\bv\ell_a = f_\ell(\bv\theta_a, g(a))$
-and $\bv\alpha_a = f_\alpha(\bv\theta_a, g(a))$, so the correction varies over
-the stellar parameters and is shared by the catalogs of a group
-(Section~\ref{sec:groups}). Two smooth clamps keep it in a sane range:
+\paragraph{Which functions of $\bv\theta$.} Three variants are implemented; all of
+them keep the tail weight $\nu_g$ and the shared variance $\bv\tau_g^2$ of the
+sections below, and differ only in how $\ell$ and $\alpha$ are parameterised.
+\begin{enumerate}
+  \item \emph{Constant additive} (\texttt{const\_add}): $\ell_{a,p} = 0$ and
+  $\alpha_{a,p} = \alpha_{g(a),p}$ -- four numbers per group.
+  \item \emph{Constant scale and add} (\texttt{const\_scale\_add}, the default):
+  $\ell_{a,p} = \ell_{g(a),p}$, $\alpha_{a,p} = \alpha_{g(a),p}$ -- eight numbers
+  per group. The correction cannot absorb structure in the stellar parameters,
+  which makes it the safe choice for a first recalibration; it is also the arm
+  that answers whether the signal is multiplicative at all.
+  \item \emph{Network scale and add} (\texttt{network\_scale\_add}):
+  $\ell_{a,\cdot} = \bv f_\ell(\bv\theta_a, g(a))$ and
+  $\alpha_{a,\cdot} = \bv f_\alpha(\bv\theta_a, g(a))$, two FiLM-conditioned
+  multilayer perceptrons (three hidden layers of 64 units, SiLU, layer norm,
+  residual; the same architecture as the bijector's velocity field, with the
+  group as the categorical input). Note that $\bv\sigma_a$ is \emph{not} an input:
+  the model answers "what is wrong with this catalog here", not "what is wrong
+  with this measurement". The older additive-only network
+  (\texttt{network\_add}) is kept so that runs predating the scale term still
+  load, and it does take $\ln\bv\sigma_a$ as an input.
+\end{enumerate}
+Two soft clamps keep the correction in a sane range:
 \begin{equation}
-  \ell^{(p)} \in [\ln\!\tfrac{1}{64}, \ln 64] \quad\text{(so $\sigma$ within a factor 8),}
+  \ell_p \in [\ln\tfrac{1}{64}, \ln 64] \quad\text{($\sigma$ within a factor 8),}
   \qquad
-  \alpha^{(p)} \ge (3\times 10^{-3})^2 .
+  \alpha_p \ge \ln (3\times 10^{-3})^2 .
 \end{equation}
-The clamps are soft (a softplus tail outside the range), so gradients do not
-vanish at the boundaries.
+Both are smooth saturations rather than hard projections (a softplus tail outside
+the range), so gradients do not vanish at the boundaries. The additive term is
+initialised just below its floor and the scale at 1, i.e. the fit starts from "no
+correction".
+
+\paragraph{Applying it.} For the next iteration the correction is materialised per
+catalog as a new $\sigma$ in \emph{our} parameter units,
+\begin{equation}
+  \sigma^{\rm cal}_{p} = \sqrt{e^{\ell_{p}}\,\sigma^{\rm raw,2}_{p} + e^{\alpha_{p}}},
+\end{equation}
+written alongside the model, and the bijector then treats it exactly like a quoted
+error (it is propagated with its own Jacobian when the merge forms a covariance).
+The additive term is what makes the corrected error well behaved where a catalog
+is nearly noiseless; it is not the same thing as the merge's $0.03$ floor, which
+is applied separately.
 
 \section{Groups and the shared systematic}
 \label{sec:groups}
@@ -147,6 +217,13 @@ latent value between the star and the entries,
   \bv t_g = \bv z + \bv u_g, \quad \bv u_g \sim \N(\bv 0, \bM G_g); \qquad
   \bv y_a = \bv t_{g(a)} + \bv\varepsilon_a, \quad \bv\varepsilon_a \sim \N(\bv 0, \bM S_a).
 \end{equation}
+$\bM G_g$ is diagonal, $\bM G_g = \diag(\bv\tau_g^2)$, with
+$\tau^2_{g,p} \ge (3\times 10^{-3})^2$; a group of one catalog has
+$\bv\tau_g^2 = 0$ exactly, because a shared part is unidentifiable there and would
+only trade against that catalog's own additive term. (Unlike $\bM S_a$, which is a
+catalog-space diagonal pushed through $\bM J_a$, $\bM G_g$ lives in the harmonized
+space: it is a mistake the pipeline makes in the value it produces, not in the
+units it produces it in.)
 Entries of one group share $\bv u_g$ for a given star, so the shared error
 cancels in the differences \emph{within} a group but not \emph{between} groups:
 \begin{align}
@@ -223,7 +300,7 @@ comparisons with other groups). With $(\bM S_1,\bM S_2,\bM G_g)$ free that leave
 one flat direction, in which a larger shared term is traded against a more
 unequal split. The model therefore \emph{shares} the correction within a group
 --- one $\bv\ell_g$, one $\bv\alpha_g$ for all its catalogs, applied to each
-catalog's own $\bM C_a$ --- which fixes the split by construction, gives the
+catalog's own $\bv\sigma_a$ --- which fixes the split by construction, gives the
 observed ratio of quoted errors back, and leaves both observables determining one
 parameter each. The assumption is testable: it predicts the \emph{composition} of
 the within-group difference, not only its size.
@@ -272,35 +349,75 @@ $n_{\rm res}\ln(\nu\pi)+2\ln\Gamma(\nu/2)-2\ln\Gamma((\nu+n_{\rm res})/2)\to n_{
 so \eqref{eq:t} reduces to \eqref{eq:gauss} term for term.
 
 $\nu$ is one number per group, $\nu_g = 2+\mathrm{softplus}(\vartheta_g)$, so the
-tail weight is a property of the pipeline and $\nu>2$ is automatic. Under
-\eqref{eq:t} a quadratic form is no longer $\chi^2$: if the marginal is
-$t_\nu$ with scale $\bM W$ in $n_{\rm res}$ dimensions, then
-$q/n_{\rm res}\sim F(n_{\rm res},\nu)$, which is the reference distribution for
-the coverage and pair-consistency diagnostics.
+tail weight is a property of the pipeline and $\nu>2$ is automatic. A star whose
+entries span several groups has no single $\nu$, and the likelihood uses their
+mean over the star's entries --- the only choice that reduces to the global-$\nu$
+model when the groups agree. Per-\emph{entry} heavy tails are a different model:
+the product of $t$ densities has no closed-form marginal over $\bv z$ and would
+need data augmentation. Under \eqref{eq:t} a quadratic form is no longer
+$\chi^2$: if the marginal is $t_\nu$ with scale $\bM W$ in $n_{\rm res}$
+dimensions, then $q/n_{\rm res}\sim F(n_{\rm res},\nu)$, which is the reference
+distribution for the coverage and pair-consistency diagnostics.
 
 \section{Priors and estimation}
 \label{sec:est}
 
-The loss is the mean star log-likelihood plus weak penalties that say what the
-correction should be when the data are silent (the bar averages over entries and
-measured parameters):
+The loss is the mean star log-likelihood plus weak Gaussian penalties that say
+what the correction should be when the data are silent. Each enters the summed
+loss with the weight $0.01$; the bar averages $\bv\ell$ and $\bv\alpha$ over the
+parameters an entry measures, $\nu$ is one number per group, and $\bv\tau_g$ one
+per group and parameter:
 \begin{align}
   \bv\ell:\quad &\tfrac12\,\overline{(\bv\ell/\sigma_\ell)^2},
-  \quad \sigma_\ell=1 \ \ \text{(the quoted errors are right, $\bM M=\bM I$)} \\
-  \bv\alpha:\quad &\tfrac12\,\overline{\big((\ln\bv\alpha-\ln\bv\alpha_{\min})/\sigma_\alpha\big)^2},
-  \quad \sigma_\alpha=4 \ \ \text{(nothing is added unless the data lift it)} \\
-  \vartheta:\quad &\tfrac12\,\overline{\big((\vartheta-6)/2\big)^2},
-  \quad \nu_0 = 2+\mathrm{softplus}(6)=8 \ \ \text{(heavy enough to matter, harmless if not)} \\
-  \bv\tau:\quad &\tfrac12\,\overline{\big(\bv\tau/\sigma_\tau\big)^2},
-  \quad \sigma_\tau \ \text{small} \ \ \text{(no shared term unless needed)}
+  \quad \sigma_\ell=1
+  \quad\text{(the quoted errors are right)} \\
+  \bv\alpha:\quad &\tfrac12\,\overline{\big((\ln\bv\alpha-\ln\alpha_{\min})/\sigma_\alpha\big)^2},
+  \quad \sigma_\alpha=4
+  \quad\text{(nothing added unless the data lift it)} \\
+  \nu_g:\quad &\tfrac12\,\overline{\big((\nu_g-25)/10\big)^2}
+  \quad\text{(a half-Gaussian on $\nu\ge2$)} \\
+  \bv\tau_g:\quad &\tfrac12\,\overline{\big((\ln\bv\tau_g^2-\ln\alpha_{\min})/3\big)^2}
+  \quad\text{(no shared term unless needed)}
 \end{align}
-The same prior is also imposed away from the data at a fixed low-discrepancy set
-of $\bv\theta$ points (``control points'', masked to the parameters a group
-measures), which is what stops the network from inventing corrections where a
-group has no stars. All parameters are fitted jointly by Adam on the training
-stars (a hash of the source id puts $\approx 1/8$ of stars aside for validation),
-and the model is compared against nested baselines: no correction, the flat
-$0.03$ floor, and constant per-group scale and additive terms.
+with $\alpha_{\min} = (3\times10^{-3})^2$ the floor of the additive term.
+An $\ell^2$ penalty of $10^{-5}$ on the network's matrices and a global-norm clip
+of $10$ complete the loss.
+
+\paragraph{Why the tail weight is prior-dominated in the middle.} The prior on
+$\nu$ is stated in $\nu$ itself, not in the unconstrained $\vartheta$, because
+$\nu = 2+\mathrm{softplus}(\vartheta)$ squeezes a shrinking stretch of
+$\vartheta$ into each $\dd\nu$ near 2: a Gaussian in $\vartheta$ would put a
+divergent spike of prior mass on almost-Cauchy tails. $\nu = 25\pm10$ is a weak
+statement with two justifications: $\nu=25$ caps the influence of an observation
+at $q\sim25$, i.e.\ it suppresses $\sim5\sigma$ outliers and leaves the rest of
+the distribution alone; and $\pm10$ makes it weak, so the fit can move $\nu$ where
+the data ask for it ($4$--$32$ in our own tests) but cannot wander to $\nu\sim2$.
+
+\paragraph{Control points.} The same prior is imposed away from the data, at a
+fixed low-discrepancy (Sobol) set of $1024$ points per group drawn over the box
+spanned by the 1st to 99th percentile of the training stars, masked to the
+parameters a group measures. This is what stops a network from inventing
+corrections where a group has no stars; for the constant variants it is a
+redundant statement of the same prior.
+
+\paragraph{Fit.} All parameters are fitted jointly by Adam (cosine decay over the
+whole run to $1\%$ of the initial rate, blocks of $8192$ entries, twenty epochs;
+initial rate $0.1$ for the constant variants and $2\times10^{-3}$ for the
+network) on the training stars. A hash of the source id holds out $1/8$ of the
+\emph{stars} --- never a cut on sorted ids, which would be a cut on the sky, since
+a Gaia id begins with the HEALPix index --- and the reported validation NLL is
+averaged over an evenly spaced subsample of them when the validation set is
+large, for the same reason.
+
+\paragraph{What it is compared with.} The reference arm is the covariance the
+pipeline propagates today: each catalog's quoted $\sigma$, rescaled by the
+catalog's own \texttt{UNC\_SCALES} and floored at the per-parameter
+\texttt{ERROR\_FLOORS} ($0.01,0.01,0.04,0.02$), pushed through $\bM J_a$ --- the
+same table the next iteration starts from. The trained variants sit on top of it
+and nest: $\texttt{const\_add}\subset\texttt{const\_scale\_add}\subset
+\texttt{network\_scale\_add}$, so the difference in validation NLL measures what
+the extra freedom buys, and a network that does not beat the constant model is
+evidence that its dependence on $\bv\theta$ is not real.
 
 \section{What the data identify}
 \label{sec:ident}
