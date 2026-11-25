@@ -94,19 +94,28 @@ def main(argv=None) -> int:
                         help="finite-difference step in raw (nu moves about as much)")
     parser.add_argument("--validation", action="store_true",
                         help="use the validation stars (default: the training ones)")
+    parser.add_argument("--delta-model-type", default=None,
+                        help="which model to use when the delta directory holds "
+                        "several (const_add, const_scale_add, network_scale_add)")
     args = parser.parse_args(argv)
 
     import tensorflow as tf
 
+    from astrotune.delta.feed import resolve_delta_model_dir
     from astrotune.delta.model import load_delta_model
     from astrotune.delta.stars import load_star_table, split, with_groups
 
-    out_dir = Path(args.out_dir)
+    root = Path(args.out_dir)
+    out_dir = resolve_delta_model_dir(root, args.delta_model_type)
     with open(out_dir / "delta_model_config.json") as f:
         saved = json.load(f)
     cfg = saved["config"]
     model = load_delta_model(out_dir)
-    stars, keys = load_star_table(out_dir / "star_table.npz")
+    # The star table is shared by every model type, so it sits one level up.
+    table = out_dir / "star_table.npz"
+    if not table.exists():
+        table = root / "star_table.npz"
+    stars, keys = load_star_table(table)
     stars = with_groups(stars, keys)
     if args.validation:
         _, stars = split(stars)

@@ -591,8 +591,51 @@ def model_shared(model) -> Optional[np.ndarray]:
     return model.shared_variance().numpy().astype("f8")
 
 
-#: Which module a saved ``delta_model_config.json`` was written for
-MODEL_TYPES: Dict[str, type] = {"scale_add": ScaleAddNetwork, "add": DeltaNetwork}
+#: Which module a saved ``delta_model_config.json`` was written for.
+#:
+#: The ``const_`` models carry one scale and one additive term per group and
+#: parameter and ignore ``x`` entirely, so they cannot absorb structure in the
+#: stellar parameters; the ``network_`` ones take ``(x, ln sigma)`` and can.
+#: ``add`` and ``scale_add`` are the names earlier runs were written under, and are
+#: read back as the network forms they were.
+MODEL_TYPES: Dict[str, type] = {
+    "const_add": ConstDelta,
+    "const_scale_add": ConstScaleAdd,
+    "network_add": DeltaNetwork,
+    "network_scale_add": ScaleAddNetwork,
+}
+LEGACY_TYPE_ALIASES: Dict[str, str] = {"add": "network_add", "scale_add": "network_scale_add"}
+#: Every type that can be loaded or trained.
+MODEL_CHOICES = tuple(MODEL_TYPES)
+#: What ``--model-type all`` trains. ``network_add`` is loadable but not fitted by
+#: default: it is the additive-only network that predates the scale term.
+ALL_MODEL_TYPES = ("const_add", "const_scale_add", "network_scale_add")
+
+
+def canonical_model_type(name: str) -> str:
+    """The canonical name of a model type, accepting the legacy aliases."""
+    key = str(name).strip().lower()
+    key = LEGACY_TYPE_ALIASES.get(key, key)
+    if key not in MODEL_TYPES:
+        raise ValueError(
+            f"unknown delta model type {name!r}; choose from {MODEL_CHOICES} "
+            f"(or {sorted(LEGACY_TYPE_ALIASES)})"
+        )
+    return key
+
+
+def build_delta_model(model_type: str, n_cat: int, hidden_size: int = 64,
+                      n_hidden: int = 3, multiplicity=None):
+    """Construct the module recorded under ``model_type``.
+
+    The constant models take ``(n_cat, multiplicity)``; the networks also take the
+    width and depth. One entry point so the loader and the trainer cannot disagree
+    about how a type is built.
+    """
+    kind = canonical_model_type(model_type)
+    if kind in ("const_add", "const_scale_add"):
+        return MODEL_TYPES[kind](n_cat, multiplicity)
+    return MODEL_TYPES[kind](n_cat, hidden_size, n_hidden, multiplicity=multiplicity)
 
 
 def save_delta_model(out_dir: Path, model, config: dict) -> Path:
@@ -604,6 +647,17 @@ def save_delta_model(out_dir: Path, model, config: dict) -> Path:
     return Path(path)
 
 
+def saved_model_config(out_dir: Path) -> dict:
+    """The config a saved model was written with."""
+    with open(Path(out_dir) / "delta_model_config.json") as f:
+        return json.load(f)
+
+
+def delta_model_type(out_dir: Path) -> str:
+    """The canonical type name of the model saved in ``out_dir``."""
+    return canonical_model_type(saved_model_config(out_dir).get("model_type", "add"))
+
+
 def load_delta_model(out_dir: Path, keys=None):
     """Restore a model saved by :func:`save_delta_model`.
 
@@ -613,17 +667,14 @@ def load_delta_model(out_dir: Path, keys=None):
     the scale term existed carry no ``model_type`` and are read as additive-only.
     """
     out_dir = Path(out_dir)
-    with open(out_dir / "delta_model_config.json") as f:
-        cfg = json.load(f)
+    cfg = saved_model_config(out_dir)
     model_type = cfg.get("model_type", "add")
-    if model_type not in MODEL_TYPES:
-        raise ValueError(f"unknown delta model type {model_type!r} in {out_dir}")
     if keys is not None and tuple(cfg.get("keys", ())) != tuple(keys):
         raise ValueError(
             f"{out_dir}/delta_model was trained on {list(cfg.get('keys', ()))}, "
             f"not {list(keys)}; retrain it."
         )
-    model = MODEL_TYPES[model_type](cfg["n_cat"], cfg["hidden_size"], cfg["n_hidden"],
-                                    multiplicity=cfg.get("multiplicity"))
+    model = build_delta_model(model_type, cfg["n_cat"], cfg.get("hidden_size", 64),
+                              cfg.get("n_hidden", 3), cfg.get("multiplicity"))
     tf.train.Checkpoint(model=model).read(str(out_dir / "delta_model")).assert_existing_objects_matched()
     return model

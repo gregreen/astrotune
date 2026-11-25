@@ -31,6 +31,9 @@ def main(argv=None) -> int:
     parser.add_argument("--new", type=Path, required=True)
     parser.add_argument("--delta-dir", type=Path, default=None,
                         help="the delta model that supplied the sigmas and nu")
+    parser.add_argument("--delta-model-type", default=None,
+                        help="which model to use when that directory holds several "
+                        "(const_add, const_scale_add, network_scale_add)")
     parser.add_argument("--focus", default="sdssv_mdc")
     parser.add_argument("--param", type=int, default=3, choices=range(4))
     args = parser.parse_args(argv)
@@ -42,7 +45,9 @@ def main(argv=None) -> int:
 
     enable_memory_growth()
     p, dname = args.param, PARAMS[args.param]
-    stars, keys = load_star_table(args.old / "delta" / "star_table.npz")
+    # The star table is shared by every model type, so it sits at the delta root.
+    table = args.old / "delta" / "star_table.npz"
+    stars, keys = load_star_table(table)
     keys = tuple(keys)
     stars = with_groups(stars, keys)
     fwd = {name: make_forward_and_jacobian(load_bijector(d))
@@ -77,9 +82,11 @@ def main(argv=None) -> int:
     import json
 
     from astrotune import registry
+    from astrotune.delta.feed import resolve_delta_model_dir
     from astrotune.delta.model import load_delta_model, model_nu, numpy_delta_fn
 
-    model = load_delta_model(args.delta_dir)
+    model = load_delta_model(resolve_delta_model_dir(args.delta_dir,
+                                                    args.delta_model_type))
     fn = numpy_delta_fn(model)
     ln_scale, ln_add = fn(stars["x"], stars["ls"], stars["g"])
     sig = np.sqrt(np.exp(ln_scale.astype("f8")) * stars["sig"].astype("f8") ** 2

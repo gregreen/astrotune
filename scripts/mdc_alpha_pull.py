@@ -87,6 +87,9 @@ def main(argv=None) -> int:
     parser.add_argument("--delta-dir", type=Path, default=None,
                         help="the delta model whose sigmas this run was fitted with "
                              "(default: <run-dir>/delta)")
+    parser.add_argument("--delta-model-type", default=None,
+                        help="which model to use when that directory holds several "
+                        "(const_add, const_scale_add, network_scale_add)")
     parser.add_argument("--focus", default="sdssv_mdc")
     parser.add_argument("--param", type=int, default=3, choices=range(4))
     parser.add_argument("--validation", action="store_true",
@@ -96,16 +99,22 @@ def main(argv=None) -> int:
     parser.add_argument("--out", type=Path, default=None, help="figure path")
     args = parser.parse_args(argv)
 
+    from astrotune.delta.feed import resolve_delta_model_dir
     from astrotune.delta.model import load_delta_model, model_nu, numpy_delta_fn
     from astrotune.delta.stars import load_star_table, split, with_groups
 
     run_dir = Path(args.run_dir)
-    delta_dir = Path(args.delta_dir) if args.delta_dir else run_dir / "delta"
+    root = Path(args.delta_dir) if args.delta_dir else run_dir / "delta"
+    delta_dir = resolve_delta_model_dir(root, args.delta_model_type)
     p = args.param
     dname = PARAMS[p]
 
     model = load_delta_model(delta_dir)
-    stars, keys = load_star_table(run_dir / "delta" / "star_table.npz")
+    # The star table is shared by every model type, so it sits at the root.
+    table = delta_dir / "star_table.npz"
+    if not table.exists():
+        table = root / "star_table.npz"
+    stars, keys = load_star_table(table)
     stars = with_groups(stars, keys)
     keys = tuple(keys)
     if args.validation:

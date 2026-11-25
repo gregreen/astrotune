@@ -492,3 +492,151 @@ def test_a_fit_starts_its_tail_weight_at_the_prior_mean():
         assert float(t.prior_penalty(mean, 3.0, space)) == pytest.approx(0.0, abs=1e-6)
 
 
+
+
+@pytest.mark.parametrize("model_type", ["const_add", "const_scale_add",
+                                        "network_add", "network_scale_add"])
+def test_every_model_type_round_trips_through_save_and_load(tmp_path, model_type):
+    """Each type has its own constructor, so each needs its own dispatch on load."""
+    from astrotune.delta.model import (build_delta_model, delta_model_type,
+                                       load_delta_model, save_delta_model)
+
+    model = build_delta_model(model_type, n_cat=2, hidden_size=8, n_hidden=2,
+                              multiplicity=[2, 1])
+    save_delta_model(tmp_path, model, dict(n_cat=2, hidden_size=8, n_hidden=2,
+                                           keys=["a", "b"], model_type=model_type,
+                                           multiplicity=[2, 1], config={}))
+
+    assert delta_model_type(tmp_path) == model_type
+    back = load_delta_model(tmp_path, keys=["a", "b"])
+    assert type(back) is type(model)
+    # The same function values come back, which a wrong constructor would not give.
+    import tensorflow as tf
+
+    x = tf.zeros([3, 4])
+    ls = tf.fill([3, 4], -3.0)
+    c = tf.constant([0, 1, 0])
+    for a, b in zip(model(x, ls, c), back(x, ls, c)):
+        assert np.allclose(np.asarray(a), np.asarray(b))
+
+
+def test_the_legacy_type_names_are_read_as_the_networks_they_were(tmp_path):
+    """Configs written before the type directories name the network ``scale_add``."""
+    from astrotune.delta.model import (ScaleAddNetwork, canonical_model_type,
+                                       delta_model_type, save_delta_model)
+
+    assert canonical_model_type("scale_add") == "network_scale_add"
+    assert canonical_model_type("add") == "network_add"
+    with pytest.raises(ValueError, match="unknown delta model type"):
+        canonical_model_type("constant")
+
+    save_delta_model(tmp_path, ScaleAddNetwork(2),
+                     dict(n_cat=2, hidden_size=64, n_hidden=3, keys=["a", "b"],
+                          model_type="scale_add", config={}))
+    assert delta_model_type(tmp_path) == "network_scale_add"
+
+
+def test_parse_model_types_takes_all_a_list_and_the_old_names():
+    from astrotune.delta.train import parse_model_types
+
+    assert parse_model_types("all") == ("const_add", "const_scale_add",
+                                        "network_scale_add")
+    assert parse_model_types(None) == parse_model_types("all")
+    assert parse_model_types("const_scale_add") == ("const_scale_add",)
+    assert parse_model_types("const_add,network_scale_add") == ("const_add",
+                                                                "network_scale_add")
+    assert parse_model_types("scale_add") == ("network_scale_add",)
+    with pytest.raises(ValueError, match="unknown delta model type"):
+        parse_model_types("nope")
+
+
+def _save_typed(root, model_type, tmp_path, keys=("a", "b")):
+    from astrotune.delta.model import build_delta_model, save_delta_model
+
+    d = root / model_type
+    save_delta_model(d, build_delta_model(model_type, n_cat=len(keys), hidden_size=8,
+                                          n_hidden=2),
+                     dict(n_cat=len(keys), hidden_size=8, n_hidden=2, keys=list(keys),
+                          model_type=model_type, config={}))
+    return d
+
+
+def test_resolve_delta_model_dir_handles_every_layout(tmp_path):
+    from astrotune.delta.feed import installed_models, resolve_delta_model_dir
+
+    # a run directory whose delta/ holds one subdirectory per type
+    run = tmp_path / "run"
+    _save_typed(run / "delta", "const_scale_add", tmp_path)
+    _save_typed(run / "delta", "network_scale_add", tmp_path)
+    assert sorted(installed_models(run)) == ["const_scale_add", "network_scale_add"]
+    assert resolve_delta_model_dir(run, "network_scale_add") == \
+        run / "delta" / "network_scale_add"
+    # the same, addressed through the delta directory or the model directory
+    assert resolve_delta_model_dir(run / "delta", "const_scale_add") == \
+        run / "delta" / "const_scale_add"
+    assert resolve_delta_model_dir(run / "delta" / "const_scale_add") == \
+        run / "delta" / "const_scale_add"
+
+    # ambiguous: no type given, two models present
+    with pytest.raises(ValueError, match="holds several delta models"):
+        resolve_delta_model_dir(run)
+    # missing: the message says what is there and how to train it
+    with pytest.raises(ValueError, match="no const_add delta model"):
+        resolve_delta_model_dir(run, "const_add")
+
+
+def test_resolve_delta_model_dir_reads_the_older_flat_layout(tmp_path):
+    from astrotune.delta.feed import resolve_delta_model_dir
+    from astrotune.delta.model import ScaleAddNetwork, save_delta_model
+
+    save_delta_model(tmp_path / "delta", ScaleAddNetwork(2),
+                     dict(n_cat=2, hidden_size=64, n_hidden=3, keys=["a", "b"],
+                          model_type="scale_add", config={}))
+    # one model on disk resolves without being asked which one
+    assert resolve_delta_model_dir(tmp_path) == tmp_path / "delta"
+    assert resolve_delta_model_dir(tmp_path, "network_scale_add") == tmp_path / "delta"
+    with pytest.raises(ValueError, match="no const_scale_add delta model"):
+        resolve_delta_model_dir(tmp_path, "const_scale_add")
+
+
+def test_fit_and_evaluate_writes_one_directory_per_model_type(tmp_path, monkeypatch):
+    """The whole per-type pipeline: fit, save, and evaluate, with plots stubbed out.
+
+    The plots are the expensive part and are tested on their own; what this pins is
+    the layout (one subdirectory per model type) and that the saved config and the
+    evaluation agree on which type was fitted.
+    """
+    import json
+
+    from astrotune import registry
+    from astrotune.delta import train as tr
+
+    s = _synthetic_stars(n_star=1500, n_cat=3)
+    train, val = st.split(s)
+    keys = tuple(registry.keys()[:3])
+    for name in ("plot_training_history", "plot_diagnostics", "plot_learned_delta",
+                 "plot_nu_det_c", "plot_nu_prior"):
+        monkeypatch.setattr(tr, name, lambda *a, **k: None)
+
+    cfg = tr.DeltaConfig(epochs=1, const_epochs=1, batch_size=1024, n_control=0,
+                         val_max_stars=300, pair_chi2=False, kiel_sample="none",
+                         uncertainty_plots=False)
+    root = tmp_path / "run" / "delta"
+    shared = dict(cfg=cfg, run_dir=tmp_path / "run", delta_root=root, keys=keys,
+                  labels=list(keys), train=train, val=val, ref=tr.as_prepared(val),
+                  ctrl=None, n_cat=len(keys), n_group=len(keys),
+                  multiplicity=[1] * len(keys), group_labels=keys, min_entries=1)
+
+    out = tr.fit_and_evaluate("const_scale_add", shared)
+
+    assert out["model_type"] == "const_scale_add"
+    assert out["model_dir"] == root / "const_scale_add"
+    saved = json.loads((root / "const_scale_add" / "delta_model_config.json").read_text())
+    assert saved["model_type"] == "const_scale_add"
+    comparison = json.loads((root / "const_scale_add" / "evaluation" / "comparison.json").read_text())
+    assert comparison["model_type"] == "const_scale_add"
+    assert set(comparison["nll"]) == {"quoted (as prepared)", "const_scale_add"}
+    # the constant model's own numbers, saved for the merge
+    assert "scale" in comparison and "add_sigma" in comparison
+    assert (root / "const_scale_add" / "evaluation" / "comparison.txt").exists()
+    assert (root / "const_scale_add" / "evaluation" / "per_catalog.txt").exists()
