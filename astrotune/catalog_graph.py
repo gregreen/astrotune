@@ -326,6 +326,21 @@ SPREAD = 1.7
 DELTA_FAR = 1.0
 DELTA_BASE, DELTA_SIZE, DELTA_WEAK = 0.21, 1.1, 0.25
 
+#: The rim is pulled in before the circles are separated: radii beyond ``RIM_START`` of the
+#: largest shrink by ``1 - RIM_COMPRESS`` of their excess. A catalog with eleven thousand stars
+#: and three weak links (PIGS) otherwise sets the radius of the whole figure on its own, and the
+#: core -- which is where every edge is -- shrinks to fit it and the legend. Compressing only
+#: the outer part of the radius range leaves the distances inside the core as the stress
+#: majorization made them.
+RIM_START, RIM_COMPRESS = 0.7, 0.4
+
+
+def pull_in_rim(p: np.ndarray, start: float = RIM_START, compress: float = RIM_COMPRESS) -> np.ndarray:
+    """Scale radii beyond ``start`` of the largest towards it, keeping every direction."""
+    r = np.linalg.norm(p, axis=1, keepdims=True)
+    excess = np.maximum(r - start * r.max(), 0.0)
+    return p * (1.0 - (1.0 - compress) * excess / (r + 1e-12))
+
 
 def dissimilarity(n: int, edges: np.ndarray, strength: np.ndarray, radii: np.ndarray) -> np.ndarray:
     """Target distances: small for a strong edge between two small catalogs, large for a weak
@@ -379,6 +394,7 @@ def best_spring_layout(shared, radii, edges, strength, n_restarts, seed):
         p = smacof(delta, rng.normal(size=(len(shared), 2)))
         p = p - p.mean(0)
         p = SPREAD * p / np.abs(p).max()
+        p = pull_in_rim(p)
         p = remove_overlaps(p, radii)
         s = crossing_score(p, edges, strength)
         if s[1] < best_score[1]:
@@ -453,6 +469,11 @@ def edge_color(s):
 #: Width (pt) of the stroke around every node, and the length (pt) of the dashes of a hatched one
 STROKE_PT, HATCH_PT = 2.0, 3.0
 
+#: The colored ring that marks a parameter a catalog does not measure is this much thicker
+#: than the white gap around every node: the white gap is a separator, the ring has to be
+#: legible at a glance. It keeps the same inner edge, so the extra width goes outward.
+MARK_SCALE = 1.5
+
 #: Most lines a label may be folded onto to fit inside its circle.
 MAX_LABEL_LINES = 3
 
@@ -492,18 +513,24 @@ def node_strokes(data: dict) -> List[Tuple[Optional[str], str]]:
 def draw_stroke(ax, center, radius: float, width_pt: float, ppu: float, param: Optional[str], kind: str) -> None:
     """A stroke of ``width_pt`` *outside* the circle (so that it does not eat into small nodes):
     white, and on top of it the color of ``param``, solid for ``kind == "all"`` and as alternating
-    colored and white dashes (a whole number of them around the circle) for ``"some"``."""
+    colored and white dashes (a whole number of them around the circle) for ``"some"``.
+
+    The colored ring is ``MARK_SCALE`` times the white gap and shares its inner edge, so the
+    extra width goes outward.
+    """
     r = radius + 0.5 * width_pt / ppu
     ax.add_patch(Circle(center, r, fill=False, ec="white", lw=width_pt, zorder=3.1))
     if param is None:
         return
-    kw = dict(fill=False, ec=STROKE_COLORS[param], lw=width_pt, zorder=3.2)
+    w = MARK_SCALE * width_pt
+    r = radius + 0.5 * w / ppu
+    kw = dict(fill=False, ec=STROKE_COLORS[param], lw=w, zorder=3.2)
     if kind == "all":
         ax.add_patch(Circle(center, r, **kw))
         return
     circumference = 2 * np.pi * r * ppu
     n = max(4, int(round(circumference / (2 * HATCH_PT))))
-    seg = circumference / (2 * n) / width_pt  # matplotlib scales dash lengths by the line width
+    seg = circumference / (2 * n) / w  # matplotlib scales dash lengths by the line width
     ax.add_patch(Circle(center, r, ls=(0, (seg, seg)), **kw))
 
 
@@ -750,7 +777,7 @@ def plot_graph(data: dict, out_base: Path, min_shared: int = 1000, layout: str =
             ax.set_xlim(used_lo[0] - margin, used_hi[0] + margin + 0.15 + LEGEND_W)
             ax.set_ylim(min(used_lo[1] - margin, used_hi[1] + margin - LEGEND_H), used_hi[1] + margin)
             fig.tight_layout()
-            ring = radii + STROKE_PT / points_per_unit(ax)  # the strokes go outside the circles
+            ring = radii + MARK_SCALE * STROKE_PT / points_per_unit(ax)  # the strokes go outside the circles
             bbox_lo, bbox_hi = (pos - ring[:, None]).min(0), (pos + ring[:, None]).max(0)
             preferred = (bbox_lo[0], bbox_lo[1], bbox_hi[0], bbox_hi[1])
             limit = (bbox_lo[0] - 0.6, bbox_lo[1] - 0.6, bbox_hi[0] + 0.6, bbox_hi[1] + 0.6)
