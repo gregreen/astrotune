@@ -13,12 +13,16 @@ Notes
 -----
 The ``astra`` summary files keep the stellar parameters in HDU 1.
 
-BOSSNet provides no [alpha/Fe], so this catalog has three parameters. Since
-the parameters come from a neural-network fit to lower-resolution optical
-spectra, the regularization error is set to 0.3 on every axis.
+BOSSNet provides no [alpha/Fe], so this catalog has three parameters. The
+regularization error -- the width within which the map is held to the catalog's
+own values -- is 0.2 dex in log(g) and 0.1 dex in [Fe/H] and T_eff (a larger
+error is a weaker constraint). log(g) is the loose one because the Kiel diagram
+is where it disagrees most with the other catalogs; T_eff and [Fe/H] track them
+closely enough to justify the tighter prior. These are judgments from the
+per-catalog diagnostics, not fits.
 
 DR20 (astra 0.8.1) is the first release with southern-hemisphere BOSS spectra,
-so the catalogue grows by roughly the southern sky; see
+so the catalog grows by roughly the southern sky; see
 ``porting_project.md`` for what that did to the cuts.
 
 Caveat: SDSS warns that BOSSNet gives poor parameters for halo stars and that
@@ -54,8 +58,9 @@ PARAM_COLS = ("teff", "fe_h", "logg")
 UNC_COLS = ("e_teff", "e_fe_h", "e_logg")
 EXTRA_COLS = ("ra", "dec")
 
-#: Low confidence overall, so the transformation is weakly constrained.
-X_ERR = (0.3, 0.3, 0.3)
+#: Regularization error per parameter (T_eff, [Fe/H], log g); larger is a weaker
+#: constraint. log(g) is the loose one -- the Kiel diagram disagrees most there.
+X_ERR = (0.1, 0.1, 0.2)
 
 #: The legacy table reproduces DR19. This module now reads DR20, which re-reduces
 #: every DR19 spectrum and adds the southern hemisphere, so the sample itself

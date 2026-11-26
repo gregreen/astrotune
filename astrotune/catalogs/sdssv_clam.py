@@ -4,7 +4,7 @@ References
 ----------
 Medan, I., Casey, A. R., Ji, A. P., et al. 2026, "BOSS-CLAM: Utilizing a
 Constrained Linear Absorption Model to Infer Stellar Parameters from BOSS
-Spectra", arXiv:2607.22822
+Spectra", arXiv:2607.22822, https://scixplorer.org/abs/2026ApJS..287....5M/abstract
 VAC: https://www.sdss.org/dr20/data_access/value-added-catalogs/?vac_id=10036
 Data model: https://data.sdss.org/datamodel/files/MWM_STELLAR_PARAMS/boss_clam/boss_clam_lite.html
 
@@ -19,25 +19,29 @@ Notes
 * Uncertainties are the square roots of the diagonal of ``param_covariance``.
   **They are too small**: the paper's own wide-binary test gives
   sigma_[Fe/H] ~ 0.15 and sigma_[alpha/M] ~ 0.06 at SNR = 10, 3-4 times the
-  catalog values (0.04 and 0.019 at SNR 10-15), and the scatter against
-  APOGEE/GALAH/ASPCAP at SNR 10-30 is 5-8 times the quoted error (3-5 times once
-  the systematic floor measured at high SNR is subtracted). They are therefore
-  scaled by :data:`UNC_SCALES` before the error floors are added (this keeps the
-  SNR dependence). ``astrotune-error-scale sdssv_clam`` fits the scale and a
-  systematic plateau to the scatter against APOGEE, ASPCAP and GALAH; compared in the
-  harmonized space (``--run-dir``) the scale is about 3 for Teff, [Fe/H] and logg and
-  4-4.5 for [alpha/M]. The project owner chose a scale of 3 for all parameters and the
-  default error floors (2026-11-09): the plateau in the harmonized space differs between
-  partners (0.06-0.07 against APOGEE and ASPCAP, none against GALAH).
+  catalog values (0.04 and 0.019 at SNR 10-15). We conservatively scale the reported
+  uncertainties by a factor of 1.5 and apply standard floors; the factor that
+  remains is left to the re-calibration model, which fits one per catalog.
+  ``astrotune-error-scale sdssv_clam`` fits the scale and a systematic plateau
+  against APOGEE, ASPCAP and GALAH if the number is to be re-derived.
 * **Flags.** ``flag_bad`` (the catalog's own bad-fit flags, 43% of the rows)
   removes the star. ``flag_warn`` (``IN_OB`` or ``FE_H_ALPHA_SUSPECT``: every
-  star above 6500 K, plus stars of the OB target program at any Teff) means that
-  [alpha/M] should not be trusted: those stars are kept
-  but their [alpha/M] is treated as *not measured* (``x = 0``,
-  ``sigma_x = x_err = 1e9``), exactly like a missing parameter in a catalog
-  without [alpha/Fe]. The paper says [Fe/H] is not trustworthy for these stars
-  either; set :data:`WARN_IGNORES_FEH` to drop it as well (default: keep it, at
-  the project owner's request).
+  star above 6500 K -- all 30,982 of them in the prepared sample -- plus stars
+  of the OB target program at any Teff) means that [alpha/M] should not be
+  trusted, and the paper says the same of [Fe/H] for those stars. **Those rows
+  are removed**, so that the catalog is four-parameter for every star it
+  contributes (57,729 rows, 6.5%; see the note below).
+
+* **Why partial coverage cannot be kept.** A catalog in which only *some* stars
+  have [alpha/M] forces the learned map to be [alpha/Fe]-dependent, and the map
+  is then not invertible for the rest. The data term only constrains
+  ``f^-1(y)`` on the coordinates a row measures, so at inference ``x[alpha]`` is
+  an exact one-dimensional degeneracy of ``p(x | y)``, and evaluating the map at
+  the placeholder ``x[alpha] = 0`` gives a harmonized position that is *not* the
+  star's ``y`` -- measured at 0.2-0.3 dex in [Fe/H] for the rows dropped here,
+  against 0.02 dex for the ones kept. Dropping the 6.5% of rows costs ~2% of the
+  stars in the merged sample (those left with a single catalog) and makes CLAM
+  behave like the fifteen other four-parameter catalogs.
 
 Cuts (chosen by looking at the Kiel and [Fe/H]-[alpha/M] diagrams and at the
 stars shared with APOGEE, GALAH, ASPCAP and the cool-star catalogs):
@@ -46,6 +50,10 @@ stars shared with APOGEE, GALAH, ASPCAP and the cool-star catalogs):
   scatter against the references is flat above SNR ~ 30 and grows to ~1.7x at
   SNR 10-20; 20 would remove a third of the cool DESI anchors.
 * Finite, positive-variance uncertainties and loose upper limits on them.
+* **[Fe/H] and [alpha/M] measured for every kept row**: ``flag_warn`` clear, a
+  finite value and an uncertainty inside :data:`MAX_ERR`. The prepared table
+  therefore has no placeholder in either column, which is what makes the catalog
+  uniformly four-parameter.
 * Teff > 3400 K, a cut just inside the cool edge of the sample. Below ~3500 K
   the distribution drops steeply and the agreement with SLAM/MDC/DESI degrades
   toward it (the [alpha/M] offset grows from ~0 at 3600-3700 K to +0.11 below
@@ -53,15 +61,15 @@ stars shared with APOGEE, GALAH, ASPCAP and the cool-star catalogs):
   it is an edge/selection effect and the cut is a judgment call; 3400 K rather
   than 3500 K keeps ~530 SLAM anchors (3400-3500 K) and removes only the sparse
   tail (33 shared stars).
-* **No upper Teff cut**, at the project owner's request: ``flag_bad`` and
-  ``flag_warn`` handle the hot stars (every star above 6500 K has
-  ``flag_warn``, so its [alpha/M] is ignored). Be aware that above ~8000 K logg
-  is pinned near 4.1 (horizontal stripes in the Kiel diagram, see
-  ``sample_edges.png``) and the Teff and [Fe/H] offsets against other catalogs
-  are large (e.g. Teff +7-15%, [Fe/H] +0.6 against DESI and BOSSNet at
-  6500-8000 K), although part of that is the other catalogs. Those stars are
-  ~1% of the catalog (1,881 shared with BOSSNet, 476 with LAMOST HotPayne). If
-  they harm the hot end, restore an upper limit in :data:`TEFF_MAX`.
+* **No upper Teff cut.** None is needed now: ``flag_warn`` is set for every
+  star above 6500 K and those rows are removed, so the hot end leaves the sample
+  whatever :data:`TEFF_MAX` says (setting it to 8000 would cut nothing; only a
+  value below 6500 K would bite). The caveats recorded here before the warning
+  cut still describe the rows that are dropped, and ``sample_edges.png`` still
+  shows them: above ~8000 K (6,990 rows) logg is pinned near 4.1 (horizontal
+  stripes in the Kiel diagram) and the Teff and [Fe/H] offsets against other
+  catalogs are large (e.g. Teff +7-15%, [Fe/H] +0.6 against DESI and BOSSNet at
+  6500-8000 K), although part of that is the other catalogs.
 * Loose ranges in logg, [Fe/H] and [alpha/M] against extreme values.
 """
 
@@ -99,7 +107,9 @@ FLAG_NAMES = (
 SNR_MIN = 15.0
 
 TEFF_MIN = 3400.0
-TEFF_MAX = None  # no upper cut; set e.g. 8000.0 to restore one
+#: Moot while the warning cut removes everything above 6500 K; only a value below
+#: that would cut anything.
+TEFF_MAX = None
 LOGG_RANGE = (0.0, 5.3)
 FEH_RANGE = (-2.5, 0.8)
 ALPHA_RANGE = (-0.35, 0.75)
@@ -108,20 +118,15 @@ ALPHA_RANGE = (-0.35, 0.75)
 MAX_ERR = {"e_teff": 300.0, "e_logg": 0.4, "e_fe_h": 0.25, "e_alpha_m": 0.15}
 
 #: Factors applied to the catalog uncertainties before the error floors
-UNC_SCALES = (3.0, 3.0, 3.0, 3.0)
+UNC_SCALES = (1.5, 1.5, 1.5, 1.5)
 
-#: Regularization errors: a first guess, as for the other BOSS-based catalogs
-#: (SLAM 0.2, BOSSNet 0.3), larger for Teff and [Fe/H] above HOT_START, where
+#: Regularization errors: larger for Teff and [Fe/H] above HOT_START, where
 #: CLAM disagrees most with the other catalogs. Tune once it is in the model.
-X_ERR = (0.2, 0.2, 0.2, 0.2)
+#: With the warning cut the hot branch only covers 6000-6500 K, since every star
+#: above 6500 K is removed.
+X_ERR = (0.1, 0.1, 0.1, 0.1)
 HOT_START = 6000.0
 HOT_SLOPE = 0.2  # added per 1000 K above HOT_START
-
-#: Also treat [Fe/H] as not measured for ``flag_warn`` stars (see the notes)
-WARN_IGNORES_FEH = False
-
-MISSING = 1e9
-FEH_INDEX, ALPHA_INDEX = 1, 3
 
 
 def download(ctx) -> None:
@@ -167,10 +172,22 @@ def unc_transf(d: int):
     ]
 
 
-def _used(t: Table) -> tuple[np.ndarray, np.ndarray]:
-    """Which stars have a usable [Fe/H] and [alpha/M]."""
+def measured(t: Table) -> dict:
+    """Which rows carry a [Fe/H] and an [alpha/M] that may be used.
+
+    The catalog reports both for every row, but ``flag_warn`` marks the rows whose
+    [alpha/M] the paper says not to trust (and [Fe/H] with it). Those are the rows
+    that would make this catalog *partially* four-dimensional, which the map
+    cannot invert (see the module notes), so they are removed rather than kept
+    with a placeholder.
+    """
     warn = np.asarray(t["flag_warn"], dtype=bool)
-    return (~warn if WARN_IGNORES_FEH else np.ones(len(t), bool)), ~warn
+    feh = unmask(t["fe_h"]).astype("f8")
+    alpha = unmask(t["alpha_m"]).astype("f8")
+    return {
+        "[Fe/H] measured (no flag_warn)": ~warn & np.isfinite(feh),
+        "[alpha/M] measured (no flag_warn)": ~warn & np.isfinite(alpha),
+    }
 
 
 def cuts(t: Table, ctx) -> dict:
@@ -179,7 +196,6 @@ def cuts(t: Table, ctx) -> dict:
     feh = unmask(t["fe_h"])
     alpha = unmask(t["alpha_m"])
     err = {k: unmask(t[k]).astype("f8") for k in MAX_ERR}
-    feh_used, alpha_used = _used(t)
 
     def ok(values, limits):
         return (values > limits[0]) & (values < limits[1])
@@ -190,16 +206,17 @@ def cuts(t: Table, ctx) -> dict:
     named = {
         "Gaia source id": np.asarray(t[ID_COL]) > 0,
         "flag_bad clear": ~np.asarray(t["flag_bad"], dtype=bool),
+        **measured(t),
         f"SNR >= {SNR_MIN:g}": unmask(t["snr"]) >= SNR_MIN,
         "Teff inside the cool edge": teff > TEFF_MIN,
         "logg in range": ok(logg, LOGG_RANGE),
-        # Parameters that are ignored for a star cannot reject it
-        "[Fe/H] in range": ok(feh, FEH_RANGE) | ~feh_used,
-        "[alpha/M] in range": ok(alpha, ALPHA_RANGE) | ~alpha_used,
+        # Both are required for every kept row, so a NaN (an invalid variance in
+        # the catalog) fails here rather than being masked later.
+        "[Fe/H] in range": ok(feh, FEH_RANGE),
+        "[alpha/M] in range": ok(alpha, ALPHA_RANGE),
         "uncertainties finite and below limits": (
             small("e_teff") & small("e_logg")
-            & (small("e_fe_h") | ~feh_used)
-            & (small("e_alpha_m") | ~alpha_used)
+            & small("e_fe_h") & small("e_alpha_m")
         ),
     }
     if TEFF_MAX is not None:
@@ -216,19 +233,8 @@ def param_errs(t: Table, ctx) -> np.ndarray:
     return out.astype("f4")
 
 
-def finalize(table: Table, ctx) -> Table:
-    """Mark the parameters that are not to be used for ``flag_warn`` stars as missing."""
-    warn = np.asarray(table["flag_warn"], dtype=bool)
-    missing = [ALPHA_INDEX] + ([FEH_INDEX] if WARN_IGNORES_FEH else [])
-    for i in missing:
-        table["x"][warn, i] = 0.0
-        table["sigma_x"][warn, i] = MISSING
-        table["x_err"][warn, i] = MISSING
-    return table
-
-
 def diagnostics(t: Table, mask, table: Table, ctx):
-    """Flags, SNR, the edges of the sample, and [Fe/H]-[alpha/M] for warned stars."""
+    """Flags, SNR, the edges of the sample, and [Fe/H]-[alpha/M] for the warned rows."""
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
 
@@ -274,22 +280,26 @@ def diagnostics(t: Table, mask, table: Table, ctx):
         ax.set_yscale("log")
         ax.set_xlabel(f"Teff (K), {title}")
     axes[0].legend(fontsize=7)
-    hot = keep & (teff > 8000)
+    # Every row above 8000 K is removed by flag_warn, so this panel is drawn from
+    # all rows with an id: it documents what the warning cut takes out.
+    hot = has_id & (teff > 8000)
     axes[2].hist2d(
         teff[hot], unmask(t["logg"])[hot],
         bins=[np.linspace(8000, 20000, 100), np.linspace(1, 5.5, 90)], norm=LogNorm(), rasterized=True,
     )
-    axes[2].set_xlabel("Teff (K); selected stars above 8000 K")
+    axes[2].set_title(f"above 8000 K, all removed: {int(hot.sum()):,}", fontsize=8)
+    axes[2].set_xlabel("Teff (K); rows above 8000 K")
     axes[2].set_ylabel("logg (pinned near 4.1)")
-    axes[3].hist(unmask(t["alpha_m"])[keep & ~warn], bins=100, histtype="step", label="[alpha/M]")
+    axes[3].hist(unmask(t["alpha_m"])[keep], bins=100, histtype="step", label="[alpha/M]")
     axes[3].hist(unmask(t["fe_h"])[keep], bins=100, histtype="step", label="[Fe/H]")
     axes[3].set_yscale("log")
     axes[3].legend(fontsize=7)
     written.append(plots.save(fig, ctx.diagnostic_dir, "sample_edges"))
 
-    # [Fe/H]-[alpha/M] for stars with and without the warning flag
+    # [Fe/H]-[alpha/M] for the rows the sample keeps and the rows the warning cut
+    # removes; the latter are the only ones without a usable [alpha/M].
     fig, axes = plt.subplots(1, 2, figsize=(9, 4), layout="constrained")
-    for ax, sel, title in ((axes[0], keep & ~warn, "flag_warn clear"), (axes[1], keep & warn, "flag_warn set ([alpha/M] ignored)")):
+    for ax, sel, title in ((axes[0], keep, "kept"), (axes[1], has_id & warn, "flag_warn set (removed)")):
         ax.hist2d(
             unmask(t["fe_h"])[sel], unmask(t["alpha_m"])[sel],
             bins=[np.linspace(-2.6, 0.9, 100), np.linspace(-0.6, 1.0, 100)], norm=LogNorm(), rasterized=True,
