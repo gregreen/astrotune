@@ -562,3 +562,176 @@ def test_an_unknown_schedule_and_a_legacy_config():
     # a run that saved lr_schedule_phases but no lr_schedule used the discrete one
     assert _config_from_json({"lr_schedule_phases": 8})["lr_schedule"] == "discrete"
     assert _config_from_json({})["lr_schedule"] == "cosine"
+
+
+def test_the_legend_markers_are_opaque_while_the_scatter_stays_faint():
+    """The legend has to be readable; the clouds behind it must not be."""
+    from astrotune import training_plots as tp
+
+    rng = np.random.default_rng(2)
+    n = 40
+    x = rng.normal(size=(n, 4)).astype("f4")
+    ctrl = dict(
+        c_control=np.zeros(n, dtype="i4"),
+        from_catalog=np.ones(n, dtype=bool),
+        x_control=x,
+        missing_control=np.zeros((n, 4), dtype=bool),
+    )
+
+    class _Bij:
+        def return_path(self, x, c, n_frames):
+            import tensorflow as tf
+
+            return tf.stack([x, x + 0.1])
+
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure()
+    tp.plot_transformed_params(_Bij(), tp.catalog_samples(ctrl, 1), ["a"],
+                               [(0, 0, 1)], fig)
+    ax = fig.axes[0]
+    assert all(c.get_alpha() == pytest.approx(0.2) for c in ax.collections)
+    legend = ax.get_legend()
+    assert legend is not None and len(legend.legend_handles) == 1
+    assert all(h.get_alpha() == pytest.approx(1.0) for h in legend.legend_handles)
+    # the legend handles are proxies, not the scatter artists
+    assert not any(h in ax.collections for h in legend.legend_handles)
+    plt.close(fig)
+
+
+# --- backtracking on a spike -------------------------------------------------
+
+
+def _blow_up_history(n_flat=150, n_rise=6):
+    """A level, then a jump, then the new level: the shape of the real blow-ups."""
+    return list(np.linspace(6.0, 4.45, n_flat)) + list(np.linspace(4.45, 6.3, n_rise))
+
+
+def test_the_spike_monitor_fires_on_a_jump_but_not_on_a_descent():
+    pytest.importorskip("tensorflow")
+    from astrotune.train_latent import SpikeMonitor
+
+    descent = np.linspace(6.0, 4.0, 400)
+    monitor = SpikeMonitor(16, 0.1)
+    assert not any(monitor.update(descent[: i + 1]) for i in range(len(descent)))
+
+    loss = _blow_up_history()
+    flat = loss + [6.3] * 10
+    monitor = SpikeMonitor(16, 0.1)
+    fired = [i + 1 for i in range(len(flat)) if monitor.update(flat[: i + 1])]
+    assert fired, "a 40% jump over the best level must be caught"
+    # ... within a window of the start of the rise, not hours later
+    assert fired[0] <= len(loss) + 16
+
+
+def test_the_spike_monitor_ignores_a_single_bad_batch():
+    pytest.importorskip("tensorflow")
+    from astrotune.train_latent import SpikeMonitor
+
+    loss = list(np.full(40, 4.5))
+    loss[20] = 9.0  # one hard batch
+    monitor = SpikeMonitor(16, 0.1)
+    assert not any(monitor.update(loss[: i + 1]) for i in range(len(loss)))
+    # a run that steps down in plateaus is not a spike either
+    steps = list(np.repeat(np.linspace(6.0, 4.0, 20), 5))
+    monitor = SpikeMonitor(16, 0.1)
+    assert not any(monitor.update(steps[: i + 1]) for i in range(len(steps)))
+
+
+def test_the_spike_monitor_rejects_nonsense_and_primes_from_a_history():
+    pytest.importorskip("tensorflow")
+    from astrotune.train_latent import SpikeMonitor
+
+    with pytest.raises(ValueError):
+        SpikeMonitor(1, 0.1)
+    with pytest.raises(ValueError):
+        SpikeMonitor(16, 0.0)
+
+    # a resumed run primes on a history that already ends at the new level: the
+    # jump in it must not be reported as a fresh one
+    history = _blow_up_history() + [6.3] * 20
+    monitor = SpikeMonitor(16, 0.1)
+    monitor.prime(history)
+    assert not monitor.update(history)
+    # ... but a further rise on top of that level is
+    assert monitor.update(history + [6.3] * 15 + [8.0] * 20)
+
+
+def test_a_backtrack_restores_the_state_and_halves_the_rate(tmp_path, monkeypatch):
+    pytest.importorskip("tensorflow")
+    pytest.importorskip("sonnet")
+    from astrotune.train_latent import LatentTrainConfig, LatentTrainer, SpikeMonitor
+
+    tables = [_table(np.arange(1200), 4, i) for i in range(2)]
+    obs, ctrl = td.build_training_data(tables, seed=1)
+    cfg = LatentTrainConfig(
+        hidden_size=16, n_hidden=1, batch_size=256, n_epochs=2, max_steps=12,
+        plot_every_seconds=None, plot_every_steps=None,
+        checkpoint_every_steps=None, agreement_n_stars=256,
+        backtrack_sliding_window=2, backtrack_max_attempts=2,
+        backtrack_lr_factor=0.5,
+    )
+    tr = LatentTrainer(obs, ctrl, cfg)
+
+    # --- the pieces -------------------------------------------------------
+    rate0 = float(tr.learning_rate(0))
+    tr.snapshot_state(3)
+    bij0 = [np.array(v) for v in tr.bij.variables]
+    y0 = tr.y.numpy().copy()
+    tr.y.assign(tr.y + 1.0)
+    for v in tr.bij.variables:
+        if v.dtype.is_floating:  # the bijector keeps an int32 step counter
+            v.assign(v + 1.0)
+    assert tr.rollback(1) is None  # nothing old enough
+    snap = tr.rollback(3)
+    assert snap is not None and snap["step"] == 3
+    assert np.allclose(tr.y.numpy(), y0)
+    assert all(np.allclose(a, b) for a, b in zip(tr.bij.variables, bij0))
+    tr.lr_scale.assign(0.5)
+    assert float(tr.learning_rate(0)) == pytest.approx(rate0 * 0.5)
+    tr.lr_scale.assign(1.0)
+
+    # --- the loop ---------------------------------------------------------
+    # Everything inside the run counts as "spiked" from step 8 on, so the loop has
+    # to roll back, and again, and then give up and carry on to the end.
+    monkeypatch.setattr(
+        SpikeMonitor, "update", lambda self, losses: len(losses) >= 8
+    )
+    metrics = tr.train(tmp_path)
+
+    assert len(tr.backtracks) == cfg.backtrack_max_attempts
+    assert float(tr.lr_scale) == pytest.approx(0.5 ** len(tr.backtracks))
+    for b in tr.backtracks:
+        assert b["step"] >= b["restored"] + cfg.backtrack_sliding_window
+        assert b["lr_scale"] < 1.0
+    # the history was truncated to the restore point and refilled to the end
+    assert len(metrics["loss"]) == cfg.max_steps
+    assert all(len(metrics[k]) == cfg.max_steps for k in ("loss", "chi2"))
+    assert np.all(np.isfinite(metrics["loss"]))
+
+    # the record survives a restart, so a resumed run does not start over with
+    # a full learning rate and four fresh attempts
+    import json
+
+    state = sorted((tmp_path / "checkpoints").glob("state-*.npz"))[-1]
+    meta = json.loads(str(np.load(state, allow_pickle=True)["meta"]))
+    assert len(meta["backtracks"]) == len(tr.backtracks)
+    assert meta["lr_scale"] == pytest.approx(float(tr.lr_scale))
+
+
+def test_pruning_drops_only_the_checkpoints_after_the_rollback(tmp_path):
+    """A resume must not pick up a checkpoint written inside the spike."""
+    from astrotune.train_latent import prune_checkpoints
+
+    d = tmp_path / "checkpoints"
+    d.mkdir()
+    for s in (100, 200, 300):
+        (d / f"state-{s}.npz").write_bytes(b"")
+        (d / f"ckpt-{s}.index").write_bytes(b"")
+        (d / f"ckpt-{s}.data-00000-of-00001").write_bytes(b"")
+    assert prune_checkpoints(tmp_path, 200) == 1
+    assert {p.name for p in d.iterdir()} == {
+        "state-100.npz", "ckpt-100.index", "ckpt-100.data-00000-of-00001",
+        "state-200.npz", "ckpt-200.index", "ckpt-200.data-00000-of-00001",
+    }
+    assert prune_checkpoints(tmp_path, 200) == 0  # idempotent

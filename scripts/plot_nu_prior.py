@@ -19,12 +19,17 @@ def main(argv=None) -> int:
     parser.add_argument("out_dirs", nargs="+", type=Path)
     parser.add_argument("--name", default=None,
                         help="output file name inside evaluation/ (default nu_prior.png)")
+    parser.add_argument("--delta-model-type", default=None,
+                        help="which model to use when a run's delta directory holds "
+                        "several (const_add, const_scale_add, network_scale_add)")
     args = parser.parse_args(argv)
 
+    from astrotune.delta.feed import resolve_delta_model_dir
     from astrotune.delta.model import load_delta_model
     from astrotune.delta.train import plot_nu_prior
 
-    for out_dir in args.out_dirs:
+    for root in args.out_dirs:
+        out_dir = resolve_delta_model_dir(root, args.delta_model_type)
         with open(out_dir / "delta_model_config.json") as f:
             saved = json.load(f)
         cfg = saved["config"]

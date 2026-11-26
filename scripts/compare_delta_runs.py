@@ -24,7 +24,11 @@ from pathlib import Path
 
 import numpy as np
 
-ARMS = ("quoted (as prepared)", "constant add", "constant scale+add", "network scale+add")
+#: Rows in the order they get more freedom. Runs trained before the model type was
+#: recorded name the arms "constant add" / "network scale+add"; newer ones use the
+#: type directory names, and a run only carries the arms it actually trained.
+ARMS = ("quoted (as prepared)", "constant add", "constant scale+add", "network scale+add",
+        "const_add", "const_scale_add", "network_add", "network_scale_add")
 
 
 def load(out_dir: Path) -> dict:

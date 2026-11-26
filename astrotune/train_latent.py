@@ -81,6 +81,7 @@ import os
 import signal
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -181,6 +182,30 @@ class LatentTrainConfig:
     n_hidden: int = 3
     ode_rtol: float = 1e-5
     ode_atol: float = 1e-5
+
+    # Fourier features of the spacetime coordinate (t, x), concatenated to the input
+    # of the first dense layer. The modes are separable -- one ladder of wavelengths
+    # per axis -- and fixed, so there is nothing to learn and nothing random. See
+    # astrotune/model/fourier.py for why this is worth having.
+    #
+    # Off by default. Two harmonics of the flow parameter left a visible imprint on
+    # the map: in the videos of the step-6,648 checkpoint of
+    # latent_student_t_iter1_11m24d_lr1e4_bt, several catalogs swung through two
+    # full oscillations on the way to their fixed point, and nothing in the loss
+    # prefers a monotone path -- the data constrain where the flow ends, not how it
+    # gets there. The parameter ladders never showed anything like that, so the
+    # block is worth keeping as an option; it just should not be the default.
+    #: Wavelengths per parameter axis, log-spaced from ``lam_max`` down to ``lam_min``
+    #: in the units of that coordinate: six of them between 8 and 0.25 are exact
+    #: octaves. 0 turns the parameter axes off, which is the default.
+    fourier_n_modes: int = 0
+    fourier_lam_min: float = 0.25
+    fourier_lam_max: float = 8.0
+    #: Harmonics of the flow parameter, with wavelengths ``1, 1/2, 1/4 ...``: a
+    #: frequency along ``t`` is a frequency along the integration, which the solver
+    #: has to resolve, so it is capped rather than log-spaced. 0 leaves ``t`` out,
+    #: which is the default.
+    fourier_time_harmonics: int = 0
 
     # Optimization
     #: Observations per batch: 2**16, the size every production run has used. The
@@ -395,6 +420,24 @@ class LatentTrainConfig:
     #: checkpoints (~1.8 GB).
     keep_milestones: int = 32
 
+    # --- backtracking on a spike -----------------------------------------
+    #: A sustained jump in the training loss is the signature of the blow-ups these
+    #: runs occasionally hit: the loss sits at a level for thousands of steps, then
+    #: climbs by tens of per cent within a few steps and never comes back (the
+    #: penalties go up with it and the fit settles into a worse regime). The
+    #: detector looks at the median of the last ``backtrack_sliding_window`` steps
+    #: and fires when it exceeds ``1 + backtrack_loss_trigger`` times the smallest
+    #: median seen so far, so a steady descent never triggers and a single bad batch
+    #: inside an otherwise healthy window does not either.
+    backtrack_sliding_window: int = 16
+    backtrack_loss_trigger: float = 0.1
+    #: How many times a run may roll back before it stops trying. Each attempt halves
+    #: the remaining learning rate (``backtrack_lr_factor``), which is the part that
+    #: makes the second attempt succeed where the first failed: the rollback changes
+    #: the path, the smaller rate makes the new one stable.
+    backtrack_max_attempts: int = 4
+    backtrack_lr_factor: float = 0.5
+
 
 #: Settings that may differ when resuming a run; everything else must match
 RESUME_MUTABLE = (
@@ -589,6 +632,115 @@ def _warmup_and_decay(decay, peak: float, warmup_steps: int):
     return _WarmupAndDecay(decay, peak, warmup_steps)
 
 
+def prune_checkpoints(run_dir: Path, step: int) -> int:
+    """Delete the checkpoints written after ``step``; return how many went.
+
+    A rollback decides that the steps after ``step`` are not to be continued from,
+    and ``load_state`` takes the newest checkpoint it finds: leaving the ones
+    written inside the spike would make a crash just after the rollback resume into
+    exactly the state the rollback refused.
+    """
+    ckpt_dir = Path(run_dir) / "checkpoints"
+    pruned = 0
+    for path in sorted(ckpt_dir.glob("state-*.npz")):
+        s = int(path.stem.split("-", 1)[1])
+        if s > step:
+            path.unlink()
+            for f in ckpt_dir.glob(f"ckpt-{s}.*"):
+                f.unlink()
+            pruned += 1
+    return pruned
+
+
+class _ScaledRate(keras.optimizers.schedules.LearningRateSchedule):
+    """A schedule times a variable factor.
+
+    A backtrack damps the learning rate, and it has to do so inside the traced
+    step, where ``apply_gradients`` reads the rate: a Python float would be frozen
+    into the graph at trace time. Hence the factor is a variable, and the schedule
+    is a ``LearningRateSchedule`` for the reason given in ``_WarmupAndDecay`` --
+    Keras calls a callable rate without arguments otherwise.
+    """
+
+    def __init__(self, base, scale):
+        super().__init__()
+        self.base = base
+        self.scale = scale
+
+    def __call__(self, step):
+        return self.base(step) * self.scale
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(base=self.base, scale=float(self.scale.numpy()))
+        return config
+
+
+class SpikeMonitor:
+    """Detects a sustained jump in the training loss.
+
+    The reference is the smallest sliding-window median seen so far, not the
+    previous window: a run that is descending steadily (or improving in steps)
+    never fires, while a jump of ``trigger`` on top of the best level reached so
+    far does. The window does the rest -- a single hard batch lifts one step and
+    leaves the median alone, whereas the blow-ups seen in practice move the whole
+    level within a dozen steps.
+
+    ``update`` is fed the per-step training losses; it returns True at most once
+    per call and only when the recorded history justifies a rollback.
+    """
+
+    def __init__(self, window: int = 16, trigger: float = 0.1):
+        if window < 2:
+            raise ValueError(f"the sliding window must be at least 2, not {window}")
+        if not trigger > 0:
+            raise ValueError(f"the trigger must be positive, not {trigger}")
+        self.window = int(window)
+        self.trigger = float(trigger)
+        self.best = float("inf")
+
+    def update(self, losses) -> bool:
+        """``True`` when the current window is ``trigger`` above the best so far."""
+        if len(losses) < self.window:
+            return False
+        level = float(np.median(losses[-self.window:]))
+        if not np.isfinite(level):
+            return False
+        if not np.isfinite(self.best):
+            self.best = level
+            return False
+        if level > self.best * (1.0 + self.trigger):
+            return True
+        self.best = min(self.best, level)
+        return False
+
+    def prime(self, losses) -> None:
+        """Adopt the level the history ends at, without firing on it.
+
+        Used on a resume and after a rollback. The reference has to be the current
+        level, not the best the run ever reached: a run that is restarted after a
+        blow-up cannot undo it, so its only useful detector is one that fires on a
+        *further* rise.
+        """
+        self.best = float("inf")
+        if len(losses):
+            level = float(np.median(losses[-self.window:]))
+            if np.isfinite(level):
+                self.best = level
+
+
+def fourier_kwargs(cfg: "LatentTrainConfig") -> Optional[dict]:
+    """The Fourier-block arguments for the bijector, or ``None`` when it is off."""
+    if cfg.fourier_n_modes <= 0 and cfg.fourier_time_harmonics <= 0:
+        return None
+    return dict(
+        n_modes=cfg.fourier_n_modes,
+        lam_min=cfg.fourier_lam_min,
+        lam_max=cfg.fourier_lam_max,
+        time_harmonics=cfg.fourier_time_harmonics,
+    )
+
+
 def lr_schedule(cfg: "LatentTrainConfig", n_steps: int):
     """The learning-rate schedule of a run, as a Keras schedule over ``n_steps``.
 
@@ -712,10 +864,18 @@ class LatentTrainer:
             rtol=cfg.ode_rtol,
             atol=cfg.ode_atol,
             vector_network_kwargs=dict(use_residual=True, use_film=True, use_layer_norm=True),
+            fourier=fourier_kwargs(cfg),
         )
         self.variables = list(self.bij.trainable_variables)
         n_vars = sum(int(np.prod(v.shape)) for v in self.variables)
         log.info("%d variables in bijector model.", n_vars)
+        if self.bij.v.n_features:
+            lam = self.bij.v.fourier.wavelengths()
+            log.info(
+                "Fourier features: %d (x: %d modes per axis, t: %d harmonics)",
+                self.bij.v.n_features, cfg.fourier_n_modes,
+                cfg.fourier_time_harmonics,
+            )
 
         # One gradient norm per parameter group, per step. Memory and the
         # checkpoint history are unchanged for one run, the pair of run-to-run
@@ -760,7 +920,16 @@ class LatentTrainer:
         n = max(8, self.n_steps)
         decay = lr_schedule(cfg, n)
         warmup_steps = int(cfg.lr_warmup_frac * n)
-        self.learning_rate = _warmup_and_decay(decay, cfg.learning_rate, warmup_steps)
+        self._base_learning_rate = _warmup_and_decay(decay, cfg.learning_rate, warmup_steps)
+        # A backtrack multiplies the schedule by a factor. It lives in a variable and
+        # not in Python: the optimizer's ``apply_gradients`` runs inside a traced
+        # step, so a float read here would be baked into the graph at trace time and
+        # the factor would never take effect.
+        self.lr_scale = tf.Variable(1.0, trainable=False, dtype=tf.float32,
+                                    name="lr_scale")
+        self.learning_rate = _ScaledRate(self._base_learning_rate, self.lr_scale)
+        self.backtracks: list = []
+        self._snapshots: "deque" = deque(maxlen=3)
         log.info("Learning-rate schedule: %s", cfg.lr_schedule)
         if warmup_steps:
             log.info(
@@ -847,23 +1016,17 @@ class LatentTrainer:
         if cfg.max_steps is not None:
             self.n_steps = min(self.n_steps, cfg.max_steps)
 
-        ds = tf.data.Dataset.from_tensor_slices(train_rows.astype("i4"))
-        ds = ds.batch(cfg.batch_size, drop_remainder=cfg.drop_remainder)
-        ds = ds.repeat(cfg.n_epochs).shuffle(max(1, min(n_batches, 256)), seed=cfg.seed)
-
         ctrl_keys = ("x_control", "xe_control", "c_control")
         n_val = int(len(ctrl_dict["x_control"]) * cfg.val_frac)
+        # What the training stream is built from, kept so that ``train`` can rebuild
+        # it after a backtrack (see ``make_train_stream``).
+        self._train_rows = train_rows
+        self._n_batches = n_batches
+        self._ctrl_train = [ctrl_dict[k][n_val:] for k in ctrl_keys]
         # The control points repeat for ever; zipping the two streams gives one
         # iterator that yields a batch of observations and a batch of control
         # points per step, which is what the graph loop consumes.
-        self.data = tf.data.Dataset.zip(
-            (
-                ds,
-                _make_ctrl_dataset(
-                    [ctrl_dict[k][n_val:] for k in ctrl_keys], cfg.batch_size, cfg.seed
-                ),
-            )
-        ).prefetch(2)
+        self.data = self.make_train_stream()
 
         # Validation: sweep the whole held-out set once per epoch, in batches as
         # close to the training size as the arithmetic allows.
@@ -1414,6 +1577,65 @@ class LatentTrainer:
 
         return res
 
+    # -- learning rate and backtracking -------------------------------------
+    def make_train_stream(self, seed: Optional[int] = None) -> tf.data.Dataset:
+        """The training stream: one batch of observations and one of control points.
+
+        ``seed`` sets both shuffles, so that ``train`` can restart the stream after a
+        backtrack with a different order instead of replaying the batches that
+        produced the spike.
+        """
+        cfg = self.cfg
+        seed = cfg.seed if seed is None else int(seed)
+        ds = tf.data.Dataset.from_tensor_slices(self._train_rows.astype("i4"))
+        ds = ds.batch(cfg.batch_size, drop_remainder=cfg.drop_remainder)
+        ds = ds.repeat(cfg.n_epochs).shuffle(
+            max(1, min(self._n_batches, 256)), seed=seed
+        )
+        return tf.data.Dataset.zip(
+            (ds, _make_ctrl_dataset(self._ctrl_train, cfg.batch_size, seed))
+        ).prefetch(2)
+
+    # ``self.learning_rate`` is not a method: it is a ``_ScaledRate`` schedule
+    # bound in ``__init__`` (the base schedule times the backtrack factor).
+
+    def snapshot_state(self, step: int) -> None:
+        """Keep a copy of everything a rollback has to put back, in memory.
+
+        Four arrays of ``self.y``/``self.y_val`` plus the weights and the optimizer
+        slots: ~40 MB for the 2.3 M-star runs, which is why a snapshot every
+        ``backtrack_sliding_window`` steps costs nothing next to a 3 s step. The
+        on-disk checkpoints would do as well but are 256 steps apart, and a blow-up
+        develops in about a dozen, so the newest one is typically already inside the
+        spike.
+        """
+        self._snapshots.append(dict(
+            step=step,
+            bij=[np.array(v) for v in self.bij.variables],
+            y=None if self.y is None else np.array(self.y),
+            y_val=None if self.y_val is None else np.array(self.y_val),
+            opt=[np.array(v) for v in self.opt.variables],
+        ))
+
+    def rollback(self, step: int) -> Optional[dict]:
+        """Put the model back to the newest snapshot at or before ``step``."""
+        for snap in reversed(self._snapshots):
+            if snap["step"] <= step:
+                for var, value in zip(self.bij.variables, snap["bij"]):
+                    var.assign(value)
+                if self.y is not None and snap["y"] is not None:
+                    self.y.assign(snap["y"])
+                if self.y_val is not None and snap["y_val"] is not None:
+                    self.y_val.assign(snap["y_val"])
+                for var, value in zip(self.opt.variables, snap["opt"]):
+                    var.assign(value)
+                # Drop the snapshots at or after the one we restored, so a later
+                # rollback cannot jump forward into the state we just abandoned.
+                while self._snapshots and self._snapshots[-1]["step"] >= snap["step"]:
+                    self._snapshots.pop()
+                return snap
+        return None
+
     # -- resumable state ----------------------------------------------------
     @staticmethod
     def _checkpoint_paths(run_dir: Path) -> list:
@@ -1449,6 +1671,9 @@ class LatentTrainer:
         meta = dict(
             step=step, n_figs=n_figs, elapsed=elapsed, complete=complete,
             metrics=metrics, agreement=agreement,
+            # So that a resumed run does not get a fresh set of attempts and its
+            # full learning rate back after it has already backtracked.
+            backtracks=list(self.backtracks), lr_scale=float(self.lr_scale.numpy()),
         )
         arrays = {f"opt_{i}": np.asarray(v) for i, v in enumerate(self.opt.variables)}
         # Saved by name as well as by position: adding AMSGrad adds a slot per
@@ -1549,6 +1774,7 @@ class LatentTrainer:
         n_figs = 0
         elapsed_prev = 0.0
         start = 0
+        self.backtracks = []
         if resume:
             meta = self.load_state(run_dir)
             if meta is None:
@@ -1563,6 +1789,8 @@ class LatentTrainer:
             for key in self.metric_keys:
                 metrics.setdefault(key, [float("nan")] * n_have)
             n_figs, elapsed_prev, start = meta["n_figs"], meta["elapsed"], meta["step"]
+            self.backtracks = list(meta.get("backtracks", []))
+            self.lr_scale.assign(meta.get("lr_scale", 1.0))
             tf.random.set_seed(cfg.seed + start)
 
         t_start = time.monotonic() - elapsed_prev
@@ -1631,6 +1859,22 @@ class LatentTrainer:
             self._val_it = iter(self.val_data)
         step_last_val = metrics["step_val"][-1] if metrics["step_val"] else 0
 
+        # Backtracking. The detector watches the total training loss: the data term
+        # and the penalties rise together in a blow-up, so the total is the
+        # sensitive one. The reference level is re-primed from the history on a
+        # resume, so a run that is restarted does not have its own past mistaken for
+        # a spike.
+        monitor = SpikeMonitor(cfg.backtrack_sliding_window, cfg.backtrack_loss_trigger)
+        monitor.prime(metrics.get("loss", ()))
+        attempts_left = max(0, cfg.backtrack_max_attempts - len(self.backtracks))
+        next_snapshot = start
+        if start:
+            # The state the run resumed from is a legitimate place to come back to,
+            # and without this the first window after a resume has nothing to go
+            # back to but the (later) chunk-boundary snapshots.
+            self.snapshot_state(start)
+            next_snapshot += cfg.backtrack_sliding_window
+
         def _on_sigterm(signum, frame):
             raise KeyboardInterrupt
 
@@ -1659,6 +1903,27 @@ class LatentTrainer:
             logged = len(metrics["loss"])
             last = {name: metrics[key][-1] for key, name in BAR_KEYS if metrics.get(key)}
             pbar.set_postfix({**last, "lr": float(self.learning_rate(step))}, refresh=True)
+
+        def truncate(step):
+            """Drop the history after a rollback back to ``step``.
+
+            The log lines, the progress figures and anything reading the saved state
+            are derived from these lists, so a rollback that left the steps of the
+            spike behind would describe a run that no longer exists.
+            """
+            nonlocal logged
+            for key, values in metrics.items():
+                if key == "step_val" or key.endswith("_val"):
+                    continue
+                del values[step:]
+            # The validation series are indexed by call, not by step: keep the
+            # calls whose step survives.
+            keep = [i for i, s in enumerate(metrics["step_val"]) if s <= step]
+            for key in [k for k in metrics if k.endswith("_val")]:
+                metrics[key] = [metrics[key][i] for i in keep if i < len(metrics[key])]
+            metrics["step_val"] = [metrics["step_val"][i] for i in keep]
+            agreement[:] = [a for a in agreement if a.get("step", 0) <= step]
+            logged = len(metrics.get("loss", ()))
 
         # Steps per graph call. A chunk costs one host round trip and is not
         # interruptible, so it is kept near a couple of seconds.
@@ -1691,6 +1956,75 @@ class LatentTrainer:
                         "Step %d: pre-training done, y starts being fitted (%s)",
                         done, cfg.y_solver,
                     )
+
+                # Keep a snapshot of the state a future spike would be rolled back
+                # to. Every window of steps is often enough: any snapshot at or
+                # before ``done - window`` is usable, and the deque holds three.
+                if done >= next_snapshot:
+                    self.snapshot_state(done)
+                    next_snapshot = done + cfg.backtrack_sliding_window
+
+                if attempts_left and monitor.update(metrics["loss"]):
+                    level = float(np.median(metrics["loss"][-cfg.backtrack_sliding_window:]))
+                    snap = self.rollback(done - cfg.backtrack_sliding_window)
+                    if snap is None:
+                        # Only possible in the first window of a run. Take the new
+                        # level as the reference and carry on as before.
+                        log.warning(
+                            "Step %d: training loss rose to %.4g from a best window of "
+                            "%.4g, but there is no snapshot old enough to roll back to.",
+                            done, level, monitor.best,
+                        )
+                        monitor.prime(metrics["loss"])
+                    else:
+                        restored = snap["step"]
+                        attempts_left -= 1
+                        self.lr_scale.assign(self.lr_scale * cfg.backtrack_lr_factor)
+                        self.backtracks.append(dict(
+                            step=done, restored=restored, level=level, best=monitor.best,
+                            lr_scale=float(self.lr_scale.numpy()),
+                            window=cfg.backtrack_sliding_window,
+                        ))
+                        log.warning(
+                            "Step %d: training loss reached %.4g, %.1f%% above the best "
+                            "window of %.4g; rolled back to step %d and scaled the "
+                            "learning rate to %.3g (%d attempt%s left).",
+                            done, level, 100 * (level / monitor.best - 1), monitor.best,
+                            restored, float(self.lr_scale.numpy()),
+                            attempts_left, "" if attempts_left == 1 else "s",
+                        )
+                        truncate(restored)
+                        monitor.prime(metrics["loss"])
+                        done = step_last_val = restored
+                        # Snapshot the restored state straight away: the rollback
+                        # emptied the deque of everything at or after it, and a
+                        # second attempt needs somewhere to go back to.
+                        self.snapshot_state(restored)
+                        next_snapshot = restored + cfg.backtrack_sliding_window
+                        if freeze_step is not None and restored < freeze_step:
+                            freeze_list = ()
+                        pbar.n = pbar.last_print_n = restored
+                        pbar.refresh()
+                        # A new iterator with a different shuffle seed: replaying the
+                        # batches that produced the spike is the one thing a rollback
+                        # must not do. The graph holds the old iterator, so the step
+                        # function is rebuilt, and ``tf.random`` is reseeded so the
+                        # noise stream does not repeat the abandoned one either.
+                        self._it = iter(self.make_train_stream(
+                            seed=cfg.seed + 1000 * len(self.backtracks)
+                        ))
+                        self._run_steps = tf.function(
+                            self._run_steps_graph, reduce_retracing=True
+                        )
+                        tf.random.set_seed(cfg.seed + restored + 7 * len(self.backtracks))
+                        pruned = prune_checkpoints(run_dir, restored)
+                        if pruned:
+                            log.info(
+                                "Dropped %d checkpoint(s) written after step %d.",
+                                pruned, restored,
+                            )
+                        checkpoint(restored)
+                        continue
 
                 if self._val_it is not None and done - step_last_val >= self.val_every:
                     try:
@@ -1790,6 +2124,10 @@ def _config_from_json(d: dict) -> dict:
     # Likewise a run that saved ``lr_schedule_phases`` and no ``lr_schedule`` spent
     # its life on the discrete schedule, whatever the default is now.
     d.setdefault("lr_schedule", "discrete" if "lr_schedule_phases" in d else "cosine")
+    # And a run that predates the Fourier block had no features.
+    if "fourier_n_modes" not in d:
+        d.setdefault("fourier_n_modes", 0)
+        d.setdefault("fourier_time_harmonics", 0)
     return d
 
 

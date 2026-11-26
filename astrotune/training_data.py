@@ -77,6 +77,7 @@ def dedupe_by_id(table: astropy.table.Table) -> astropy.table.Table:
 def load_tables(
     keys: Optional[Sequence[str]] = None, *, dedupe: str = "none",
     sigma_source: str = "floored", delta_dir: Optional[Path] = None,
+    delta_model_type: Optional[str] = None,
 ) -> List[astropy.table.Table]:
     """Load the prepared catalog tables, in registry order.
 
@@ -95,7 +96,9 @@ def load_tables(
         ``<delta-dir>/calibrated_sigma/<key>.npz``
         (:func:`astrotune.delta.feed.calibrated_sigma`). The prepared file is not
         modified; only the in-memory column is replaced, so ``sigma_x_raw`` stays
-        available.
+        available. ``delta_model_type`` picks among the models saved under one
+        run's ``delta/`` (``const_scale_add``, ``network_scale_add``, ...); when
+        it is not given, a directory holding exactly one model resolves to it.
     """
     if dedupe not in ("none", "first"):
         raise ValueError(f"dedupe must be 'none' or 'first', not {dedupe!r}")
@@ -106,7 +109,8 @@ def load_tables(
     if sigma_source == "delta":
         from .delta.feed import calibrated_sigma
 
-        calibrated = calibrated_sigma(delta_dir or config.MODELS_DIR, keys=keys)
+        calibrated = calibrated_sigma(delta_dir or config.MODELS_DIR, keys=keys,
+                                      model_type=delta_model_type)
     tables = []
     for key in keys:
         t = load_catalog(key)
@@ -149,7 +153,8 @@ def ids_in_several_catalogs(tables) -> np.ndarray:
 
 
 def delta_nu(
-    run_dir, keys: Optional[Sequence[str]] = None, out_dir: Optional[Path] = None
+    run_dir, keys: Optional[Sequence[str]] = None, out_dir: Optional[Path] = None,
+    model_type: Optional[str] = None,
 ) -> Dict[str, float]:
     """``{catalog key: nu}`` from a trained delta model, expanded over its groups.
 
@@ -165,12 +170,14 @@ def delta_nu(
     how often a measurement is far off. Reading the scale without the tail would
     apply the delta model's correction through a nearly Gaussian likelihood.
     """
+    from .delta.feed import resolve_delta_model_dir
     from .delta.model import load_delta_model, model_nu
 
     run_dir = Path(run_dir)
     keys = tuple(keys) if keys is not None else registry.keys()
-    delta_dir = Path(out_dir) if out_dir else run_dir / "delta"
-    nu = model_nu(load_delta_model(delta_dir, keys=keys))
+    root = Path(out_dir) if out_dir else run_dir / "delta"
+    model_dir = resolve_delta_model_dir(root, model_type)
+    nu = model_nu(load_delta_model(model_dir, keys=keys))
     if nu is None:
         return {}
     g = registry.group_index(keys)
@@ -374,6 +381,7 @@ def build_training_data(
     dispersed_xerr: str = "per-catalog",
     sigma_source: str = "floored",
     delta_dir: Optional[Path] = None,
+    delta_model_type: Optional[str] = None,
 ) -> Tuple[dict, dict]:
     """Build ``(obs_dict, ctrl_dict)`` from the catalogs.
 
@@ -391,7 +399,7 @@ def build_training_data(
     if tables is None:
         keys = registry.keys()
         tables = load_tables(keys, dedupe=dedupe, sigma_source=sigma_source,
-                             delta_dir=delta_dir)
+                             delta_dir=delta_dir, delta_model_type=delta_model_type)
     rng = np.random.default_rng(seed)
     obs_dict = build_observations(tables)
     ctrl_dict = build_control_points(
@@ -526,17 +534,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--delta-dir", type=Path, default=None,
-        help="run directory of the delta model for --sigma-source delta "
-        "(it holds delta/delta_model.*)",
+        help="run directory of the delta model for --sigma-source delta (or its "
+        "delta/ directory); it holds delta_model.* either directly or in one "
+        "subdirectory per model type",
+    )
+    parser.add_argument(
+        "--delta-model-type", default=None,
+        help="which delta model to use from --delta-dir: const_add, "
+        "const_scale_add or network_scale_add. Optional when that directory holds "
+        "exactly one model; if the requested type is not there, the available ones "
+        "are listed",
     )
     args = parser.parse_args(argv)
 
     if args.sigma_source == "delta" and args.delta_dir is None:
         parser.error("--sigma-source delta needs --delta-dir")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    model_type = ""
+    if args.sigma_source == "delta":
+        from .delta.feed import resolve_delta_model_dir
+        from .delta.model import delta_model_type as saved_model_type
+
+        try:
+            model_dir = resolve_delta_model_dir(args.delta_dir, args.delta_model_type)
+        except ValueError as exc:
+            parser.error(str(exc))
+        model_type = saved_model_type(model_dir)
+        log.info("delta model: %s in %s", model_type, model_dir)
     obs_dict, ctrl_dict = build_training_data(
         seed=args.seed, dedupe=args.dedupe, dispersed_xerr=args.dispersed_xerr,
         sigma_source=args.sigma_source, delta_dir=args.delta_dir,
+        delta_model_type=model_type or None,
     )
     n_stars = len(np.unique(obs_dict["id"]))
     log.info(
@@ -549,6 +577,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         seed=args.seed, dedupe=args.dedupe, dispersed_xerr=args.dispersed_xerr,
         sigma_source=args.sigma_source,
         delta_dir=str(args.delta_dir) if args.delta_dir else "",
+        # Which variant produced these sigmas: a constant per catalog cannot absorb
+        # structure in the stellar parameters, a network can, and later analysis
+        # needs to know which one it is looking at.
+        delta_model_type=model_type,
         catalogs=",".join(registry.keys()),
         error_floors=",".join(f"{v:g}" for v in config.ERROR_FLOORS),
         n_stars=n_stars,
@@ -557,7 +589,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # The tail that was fitted together with the sigma, so that the latent
         # stage reads the calibrated sigmas through the likelihood they were
         # calibrated under (see ``astrotune.train_latent.resolve_nu``).
-        nus = delta_nu(args.delta_dir, keys=registry.keys())
+        nus = delta_nu(args.delta_dir, keys=registry.keys(), model_type=model_type)
         if nus:
             attrs["nu"] = ",".join(f"{nus[k]:.6g}" for k in registry.keys())
             log.info(

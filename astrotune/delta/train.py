@@ -1,23 +1,26 @@
 """Train and evaluate the delta model on stars.
 
-    astrotune-delta-train --run-dir models/my_run
+    astrotune-delta-train --run-dir models/my_run --model-type const_scale_add
 
 needs the cache written by ``astrotune-apply --run-dir models/my_run``. It
 
 1. builds (or loads) the star table (:mod:`astrotune.delta.stars`) and splits it by star,
-2. evaluates the baselines on the validation stars: no added variance, the 0.03
-   floor that the merge uses, and one constant ``ln_delta`` per catalog and parameter,
-3. trains the network with the star likelihood of :mod:`astrotune.delta.model`
-   (the latent-``y`` likelihood, with each star's common value integrated out),
-4. measures calibration with and without the learned variances, and writes
-   everything to ``<run-dir>/delta/``:
+2. trains the model(s) asked for -- a constant scale and add per catalog, or a
+   network of them, or ``all`` -- with the star likelihood of
+   :mod:`astrotune.delta.model` (the latent-``y`` likelihood, with each star's
+   common value integrated out),
+3. measures calibration against the quoted errors and writes everything to
+   ``<run-dir>/delta/``:
 
-    star_table.npz               the entries of every star (cache)
-    diagnostics/                 calibration of the quoted errors (no delta)
-    delta_model.*, delta_model_config.json   the trained network
-    evaluation/                  baselines, calibration after the fit, figures
-    kiel/                        per-catalog Kiel maps of the learned correction
-    uncertainty_distribution/    quoted vs calibrated uncertainties, per catalog
+    star_table.npz                     the entries of every star (cache, shared)
+    <model type>/delta_model.*         the trained model
+    <model type>/delta_model_config.json   its type, its configuration, its history
+    <model type>/evaluation/           calibration after the fit, tables, figures
+    <model type>/kiel/                 per-catalog Kiel maps of the learned correction
+    <model type>/uncertainty_distribution/   quoted vs calibrated, per catalog
+
+One subdirectory per model type, so several can be fitted from one run and
+``astrotune-observations --delta-model-type`` picks between them later.
 
 Every number in the loss and in the validation metric is **per star**, not per
 pair, so a star in nine catalogs counts once.
@@ -50,6 +53,14 @@ log = logging.getLogger(__name__)
 class DeltaConfig:
     hidden_size: int = 64
     n_hidden: int = 3
+    #: Which delta model to train: ``const_scale_add`` (the default), ``const_add``,
+    #: ``network_scale_add``, or ``all`` for one of each. Each type is written to its
+    #: own subdirectory of the delta directory; ``astrotune-observations
+    #: --delta-model-type`` picks which one produces the next iteration's sigmas.
+    #: A constant model carries one scale and one additive term per group and
+    #: parameter, so it cannot absorb structure in the stellar parameters; the
+    #: network can, which is faster to fit badly and slower to trust.
+    model_type: str = "const_scale_add"
     epochs: int = 20
     #: Entries per training block. Blocks are cut on star boundaries, so the number
     #: of entries varies by the entries of the last star in each block.
@@ -133,14 +144,17 @@ def _spec(tf):
 
 
 def mean_star_nll(stars, delta_fn, batch_size: int = 131072, max_stars: Optional[int] = None) -> float:
-    """Mean negative log likelihood per star over ``stars`` (a proper likelihood)."""
+    """Mean negative log likelihood per star over ``stars`` (a proper likelihood).
+
+    ``max_stars`` caps the cost by taking every k-th star rather than the first
+    ``max_stars`` rows -- see :func:`_evenly_spaced_stars`.
+    """
     import tensorflow as tf
 
     from .model import make_batch, star_nll
     from .stars import block_indices
 
-    if max_stars is not None and len(stars["id"]) > max_stars:
-        stars = _first_stars(stars, max_stars)
+    stars = _evenly_spaced_stars(stars, max_stars)
     n_group, shared = _group_state(delta_fn)
     total, n = 0.0, 0
     nu = delta_fn.nu() if hasattr(delta_fn, "nu") else None
@@ -169,9 +183,23 @@ def _group_state(model):
     return int(shared_mod.multi.shape[0]), shared_mod.variance()  # len == n_group
 
 
-def _first_stars(stars, n_star: int):
-    keep = np.zeros(len(stars["id"]), dtype=bool)
-    keep[:n_star] = True
+def _evenly_spaced_stars(stars, n_star: Optional[int]):
+    """At most ``n_star`` stars spread evenly through the table.
+
+    Taking the first ``n_star`` rows instead costs the same and is wrong: the star
+    table is sorted by Gaia id, whose leading digits are the HEALPix index, so a
+    contiguous slice is a patch of sky rather than a sample of the survey. In the
+    20-catalog table the mean per-star NLL runs from -6.5 in the first tenth of the
+    rows to -4.4 in the last, so a truncated validation set read about 0.7 nats
+    better than the training set it was supposed to be compared with. Every k-th
+    star keeps the subsample uniform in id, and therefore on the sky.
+    """
+    n = len(stars["id"])
+    if n_star is None or n <= n_star:
+        return stars
+    step = int(np.ceil(n / n_star))
+    keep = np.zeros(n, dtype=bool)
+    keep[::step] = True
     from .stars import subset
 
     return subset(stars, keep)
@@ -571,21 +599,55 @@ def compare(results: Dict[str, dict], nll: Dict[str, float]) -> str:
     return "\n".join(lines)
 
 
+def parse_model_types(value) -> Tuple[str, ...]:
+    """Which delta models ``value`` asks for.
+
+    ``all`` (or nothing) means one of each of :data:`~astrotune.delta.model.
+    ALL_MODEL_TYPES`; otherwise a single type, or a comma-separated list of them.
+    Names are canonicalised, so the legacy ``add``/``scale_add`` still work.
+    """
+    from .model import ALL_MODEL_TYPES, canonical_model_type
+
+    if value is None or str(value).strip().lower() in ("", "all"):
+        return ALL_MODEL_TYPES
+    kinds: list = []
+    for part in str(value).split(","):
+        kind = canonical_model_type(part)
+        if kind not in kinds:
+            kinds.append(kind)
+    return tuple(kinds)
+
+
 def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig] = None,
-        rebuild: bool = False, min_entries: int = 1000) -> dict:
+        rebuild: bool = False, min_entries: int = 1000,
+        model_types=None) -> Dict[str, dict]:
+    """Train the delta model(s) asked for and evaluate each of them.
+
+    Every model type lives in its own subdirectory of the delta directory, so the
+    one a later ``astrotune-observations`` should apply is chosen by name rather
+    than implied:
+
+    .. code-block:: text
+
+        <run-dir>/delta/star_table.npz          the entries of every star (shared)
+        <run-dir>/delta/<model type>/           delta_model.*, evaluation/, kiel/, ...
+
+    Returns ``{model type: its summary}``.
+    """
     import tensorflow as tf
 
-    from .model import (ConstDelta, ConstScaleAdd, ScaleAddNetwork, control_points, fixed_delta,
-                        model_nu, model_shared, numpy_delta_fn, save_delta_model)
+    from .model import control_points
 
     cfg = cfg or DeltaConfig()
+    kinds = parse_model_types(model_types if model_types is not None else cfg.model_type)
     run_dir = Path(run_dir)
-    out_dir = Path(out_dir) if out_dir else run_dir / "delta"
-    ev_dir = out_dir / "evaluation"
-    ev_dir.mkdir(parents=True, exist_ok=True)
+    delta_root = Path(out_dir) if out_dir else run_dir / "delta"
+    delta_root.mkdir(parents=True, exist_ok=True)
     tf.random.set_seed(cfg.seed)
 
-    stars, keys = get_star_table(run_dir, out_dir, rebuild)
+    # The star table is the input to every model type, so it is built once at the root
+    # of the delta directory and shared.
+    stars, keys = get_star_table(run_dir, delta_root, rebuild)
     labels = [registry.get_spec(k).label for k in keys]
     n_cat = len(keys)
     # The model's category is the group: catalogs that run the same pipeline on the
@@ -608,48 +670,67 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
     # The reference arm is the covariance the pipeline propagates *today* -- quoted,
     # scaled by the catalog's UNC_SCALES and floored by ERROR_FLOORS -- while the model
     # is fitted on the raw quoted sigma, so the two live on different tables.
-    ref = as_prepared(val)
-    models = {"quoted (as prepared)": fixed_delta(0.0)}
-    tables_for = {"quoted (as prepared)": ref}
-    # Every arm starts its tail weight at the prior mean of nu, in whichever space the
-    # prior is stated: the arbitrary nu = 8 that TailWeight is built with is only a
-    # fallback, and starting a 32 +- 16 fit at 8 spends the first epochs travelling.
+    shared = dict(cfg=cfg, run_dir=run_dir, delta_root=delta_root, keys=keys,
+                  labels=labels, train=train, val=val, ref=as_prepared(val), ctrl=ctrl,
+                  n_cat=n_cat, n_group=n_group, multiplicity=multiplicity,
+                  group_labels=group_labels, min_entries=min_entries)
+    log.info("training %s", ", ".join(kinds))
+    return {kind: fit_and_evaluate(kind, shared) for kind in kinds}
+
+
+def fit_and_evaluate(model_type: str, shared: dict) -> dict:
+    """Fit one delta model and write its tables and figures under its own directory."""
+    from .model import (build_delta_model, fixed_delta, model_nu, model_shared,
+                        numpy_delta_fn, save_delta_model)
+
+    cfg = shared["cfg"]
+    run_dir, delta_root = shared["run_dir"], shared["delta_root"]
+    keys, labels = shared["keys"], shared["labels"]
+    train, val, ref, ctrl = shared["train"], shared["val"], shared["ref"], shared["ctrl"]
+    n_cat, n_group = shared["n_cat"], shared["n_group"]
+    multiplicity, group_labels = shared["multiplicity"], shared["group_labels"]
+    min_entries = shared["min_entries"]
+
+    model_dir = delta_root / model_type
+    ev_dir = model_dir / "evaluation"
+    ev_dir.mkdir(parents=True, exist_ok=True)
+    log.info("=== %s: %s", model_type, model_dir)
+
+    # Every model starts its tail weight at the prior mean of nu, in whichever space
+    # the prior is stated: the arbitrary nu = 8 that TailWeight is built with is only
+    # a fallback, and starting a 32 +- 16 fit at 8 spends the first epochs travelling.
     nu0, raw0 = nu_init(cfg)
+    model = build_delta_model(model_type, n_group, cfg.hidden_size, cfg.n_hidden,
+                              multiplicity)
+    model.tail.raw.assign(np.full(n_group, raw0, dtype="f4"))
+    log.info("%s: nu starts at %.2f (the prior mean)", model_type, nu0)
 
-    def start_at_the_prior(m):
-        """Put the model's tail weight on the prior mean."""
-        m.tail.raw.assign(np.full(n_group, raw0, dtype="f4"))
-        return m
+    # The constant models are eight numbers per group; the network has to be trained
+    # for the same value of what an epoch costs, which is why they have their own
+    # rate and count.
+    const = model_type.startswith("const")
+    epochs = cfg.const_epochs if const else cfg.epochs
+    learning_rate = cfg.const_learning_rate if const else cfg.learning_rate
+    hist = fit(model, train, cfg, epochs, learning_rate, val, desc=model_type, control=ctrl)
 
-    log.info("nu starts at %.2f (the prior mean)", nu0)
-    const_add = start_at_the_prior(ConstDelta(n_group, multiplicity))
-    hist_const = fit(const_add, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
-                     desc="const add", control=ctrl)
-    models["constant add"] = const_add
-
-    const = start_at_the_prior(ConstScaleAdd(n_group, multiplicity))
-    hist_const_sa = fit(const, train, cfg, cfg.const_epochs, cfg.const_learning_rate, val,
-                        desc="const scale+add", control=ctrl)
-    models["constant scale+add"] = const
-
-    net = start_at_the_prior(ScaleAddNetwork(n_group, cfg.hidden_size, cfg.n_hidden,
-                                             multiplicity))
-    hist = fit(net, train, cfg, cfg.epochs, cfg.learning_rate, val, desc="network", control=ctrl)
-    models["network scale+add"] = net
-
-    save_delta_model(out_dir, net, dict(
+    save_delta_model(model_dir, model, dict(
         n_cat=n_group, hidden_size=cfg.hidden_size, n_hidden=cfg.n_hidden, keys=list(keys),
         multiplicity=list(multiplicity), group_labels=list(group_labels),
-        model_type="scale_add", config=dataclasses.asdict(cfg), val_history=hist,
+        model_type=model_type, config=dataclasses.asdict(cfg), val_history=hist,
         nu_init=nu0,
     ))
-    # Before the diagnostics, so the training traces survive a failure in them.
+    # Before the diagnostics, so the training trace survives a failure in them.
     plot_training_history(
-        {"const add": hist_const, "const scale+add": hist_const_sa, "network": hist},
+        {model_type: hist},
         ev_dir / "training_history.png",
-        title=f"{run_dir.name}: delta model training",
+        title=f"{run_dir.name}: {model_type}",
     )
     log.info("wrote %s", ev_dir / "training_history.png")
+
+    # The reference has no parameters to train, so it is always available; the model
+    # fitted above is the only other row in the tables.
+    models = {"quoted (as prepared)": fixed_delta(0.0), model_type: model}
+    tables_for = {"quoted (as prepared)": ref}
 
     nll, results, nus, shareds = {}, {}, {}, {}
     for name, fn in models.items():
@@ -681,37 +762,39 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         (ev_dir / "shared.txt").write_text(shared_table + "\n")
     # One line per catalog: what the fit did to it, in the four numbers that describe
     # an entry's covariance (size, sigma scale, additive sigma, tail weight, volume).
-    cat_table = per_catalog_table(net, val, keys)
+    cat_table = per_catalog_table(model, val, keys)
     log.info("\n%s", cat_table)
     (ev_dir / "per_catalog.txt").write_text(cat_table + "\n")
     # The same numbers as a picture: does the group that asks for heavy tails also
     # have its covariance inflated (or shrunk) most?
-    plot_nu_det_c(catalog_summary(net, val, keys), ev_dir / "nu_det_c.png",
-                  title=f"{run_dir.name}: nu against the volume of the corrected covariance")
-    # The additive-only constant model is the maximum-likelihood three-cornered hat:
-    # one excess variance per catalog and parameter that makes the entries agree.
-    const_sigma = np.exp(0.5 * const_add.raw.numpy())
-    np.savez(ev_dir / "const_delta.npz", sigma=const_sigma, keys=list(keys),
-             scale=const.scale_sigma(), add_sigma=const.add_sigma(),
-             shared=model_shared(net), multiplicity=np.asarray(multiplicity),
-             group_labels=np.asarray(group_labels, dtype=object))
+    plot_nu_det_c(catalog_summary(model, val, keys), ev_dir / "nu_det_c.png",
+                  title=f"{run_dir.name}: {model_type}, nu against the volume")
+    # The constant models' own numbers: one value per group and parameter, which is
+    # the whole of what they say about a catalog.
+    const_terms = {}
+    if hasattr(model, "scale_sigma"):
+        const_terms = dict(scale=model.scale_sigma(), add_sigma=model.add_sigma())
+    elif hasattr(model, "raw"):
+        const_terms = dict(sigma=np.exp(0.5 * model.raw.numpy()))
+    if const_terms:
+        np.savez(ev_dir / "const_delta.npz", keys=list(keys), **const_terms,
+                 shared=model_shared(model), multiplicity=np.asarray(multiplicity),
+                 group_labels=np.asarray(group_labels, dtype=object))
     with open(ev_dir / "comparison.json", "w") as f:
         json.dump(to_json(dict(nll=nll, results={k: {kk: vv for kk, vv in v.items() if kk != "entries"}
                                                    for k, v in results.items()},
                                nus=nus, shared=shareds, keys=list(keys),
                                group_labels=list(group_labels),
-                               multiplicity=list(multiplicity),
-                               const_sigma=const_sigma, const_scale=const.scale_sigma(),
-                               const_add=const.add_sigma(), history=hist,
-                               const_history=hist_const, const_scale_add_history=hist_const_sa)),
+                               multiplicity=list(multiplicity), model_type=model_type,
+                               history=hist, **const_terms)),
                   f, indent=1)
-    plot_diagnostics(results["network scale+add"], labels, ev_dir, "_network")
+    plot_diagnostics(results[model_type], labels, ev_dir, f"_{model_type}")
     plot_diagnostics(results["quoted (as prepared)"], labels, ev_dir, "_none")
-    plot_learned_delta(net, val, labels, ev_dir / "learned_delta.png")
+    plot_learned_delta(model, val, labels, ev_dir / "learned_delta.png")
     # The prior on nu with every group's learned value on it: how much of each nu
     # was the prior, and how much the data.
-    if nus.get("network scale+add") is not None:
-        plot_nu_prior(nus["network scale+add"], keys, cfg.nu_prior_mean, cfg.nu_prior_sd,
+    if nus.get(model_type) is not None:
+        plot_nu_prior(nus[model_type], keys, cfg.nu_prior_mean, cfg.nu_prior_sd,
                       ev_dir / "nu_prior.png",
                       title=(f"{run_dir.name}: prior on nu "
                              f"({cfg.nu_prior_mean:g} $\\pm$ {cfg.nu_prior_sd:g}"
@@ -723,20 +806,22 @@ def run(run_dir: Path, out_dir: Optional[Path] = None, cfg: Optional[DeltaConfig
         from .diagnostics import pair_chi2, pair_chi2_text, plot_pair_chi2
 
         before = pair_chi2(ref, None, max_pairs=cfg.pair_chi2_max)
-        after = pair_chi2(val, numpy_delta_fn(net), max_pairs=cfg.pair_chi2_max,
-                          nu=nus["network scale+add"], group_cov=shareds["network scale+add"])
+        after = pair_chi2(val, numpy_delta_fn(model), max_pairs=cfg.pair_chi2_max,
+                          nu=nus[model_type], group_cov=shareds[model_type])
         text = pair_chi2_text(before, after)
         log.info("\n%s", text)
         (ev_dir / "pair_chi2.txt").write_text(text + "\n")
         plot_pair_chi2(before, after, ev_dir / "pair_chi2.png")
     if cfg.kiel_sample != "none":
         # Where in the Kiel diagram the correction sits, one page pair per catalog.
-        make_kiel_figures(run_dir, out_dir / "kiel", model=net, sample=cfg.kiel_sample, keys=keys)
+        make_kiel_figures(run_dir, model_dir / "kiel", model=model, sample=cfg.kiel_sample,
+                          keys=keys)
     if cfg.uncertainty_plots:
         # Quoted against calibrated uncertainties: is the corrected error plausible?
-        make_uncertainty_plots(run_dir, out_dir / "uncertainty_distribution", model=net,
+        make_uncertainty_plots(run_dir, model_dir / "uncertainty_distribution", model=model,
                                sample="train", keys=keys)
-    return dict(nll=nll, table=table, scale_add=sa_table)
+    return dict(nll=nll, table=table, scale_add=sa_table, model_type=model_type,
+                model_dir=model_dir)
 
 
 def _group_map(keys) -> np.ndarray:
@@ -1150,7 +1235,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--cpu", action="store_true", help="do not use the GPU")
     for f in dataclasses.fields(DeltaConfig):
         flag = "--" + f.name.replace("_", "-")
-        if isinstance(f.default, bool):  # --flag / --no-flag, not bool("False")
+        if f.name == "model_type":
+            parser.add_argument(flag, default=f.default,
+                                help="which delta model to train: const_add, "
+                                     "const_scale_add (default), network_scale_add, or "
+                                     "'all' for one of each; a comma-separated list "
+                                     "works too. Each is written to its own "
+                                     "subdirectory of the delta directory")
+        elif isinstance(f.default, bool):  # --flag / --no-flag, not bool("False")
             parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=f.default)
         else:
             parser.add_argument(flag, type=type(f.default), default=f.default)
@@ -1166,8 +1258,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         enable_memory_growth()
     cfg = DeltaConfig(**{f.name: getattr(args, f.name) for f in dataclasses.fields(DeltaConfig)})
+    try:
+        kinds = parse_model_types(cfg.model_type)
+    except ValueError as exc:
+        parser.error(str(exc))
+    log.info("model type(s): %s", ", ".join(kinds))
     res = run(args.run_dir, args.out_dir, cfg, args.rebuild, args.min_entries)
-    print(res["table"])
+    for kind, summary in res.items():
+        if len(res) > 1:
+            print(f"\n=== {kind} ({summary['model_dir']})")
+        print(summary["table"])
     return 0
 
 

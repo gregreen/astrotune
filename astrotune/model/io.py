@@ -4,11 +4,33 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Optional
 
 import tensorflow as tf
 
 from .. import registry
 from .ode_bijector import ODEBijector
+
+
+def fourier_kwargs(cfg: dict) -> Optional[dict]:
+    """The Fourier-block arguments recorded in a run's ``config.json``.
+
+    A run trained with Fourier features has a wider first network layer (the
+    features are concatenated to the inputs), so restoring it without them binds
+    nothing but also computes the wrong function -- and in practice fails, since
+    the layer's shape no longer matches. Runs from before the block existed have
+    no keys; those need ``None``.
+    """
+    n_modes = int(cfg.get("fourier_n_modes", 0) or 0)
+    harmonics = int(cfg.get("fourier_time_harmonics", 0) or 0)
+    if n_modes <= 0 and harmonics <= 0:
+        return None
+    return dict(
+        n_modes=n_modes,
+        lam_min=float(cfg.get("fourier_lam_min", 0.25)),
+        lam_max=float(cfg.get("fourier_lam_max", 8.0)),
+        time_harmonics=harmonics,
+    )
 
 
 def enable_memory_growth() -> None:
@@ -51,6 +73,7 @@ def load_bijector(run_dir, rtol=None, atol=None) -> ODEBijector:
         rtol=cfg["ode_rtol"] if rtol is None else rtol,
         atol=cfg["ode_atol"] if atol is None else atol,
         vector_network_kwargs=dict(use_residual=True, use_film=True, use_layer_norm=True),
+        fourier=fourier_kwargs(cfg),
     )
     # The checkpoint directory is scanned rather than read through
     # ``tf.train.latest_checkpoint``: the trainer writes ``Checkpoint`` objects

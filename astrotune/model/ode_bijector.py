@@ -42,16 +42,22 @@ class ODEBijector(tfb.Bijector):
         rtol=1e-5,
         atol=1e-5,
         vector_network_kwargs=None,
+        fourier=None,
         validate_args=False,
         name="ode_bijector",
     ):
         super().__init__(validate_args=validate_args, forward_min_event_ndims=0, name=name)
 
         self.n_dim = n_dim
-        self.v = VectorNetwork(
-            n_cond, n_dim, n_hidden, hidden_size, **(vector_network_kwargs or {})
-        )
-        self.v(tf.zeros([1, 1 + n_dim]), tf.zeros([1], dtype=tf.int32))  # create variables
+        kwargs = dict(vector_network_kwargs or {})
+        if fourier:
+            # The network's coordinate is ``(t, x)``, so the flow parameter is column 0
+            # and the width of that coordinate is one more than the position dimension.
+            kwargs["fourier"] = dict(fourier, n_in=1 + n_dim, time_axis=0)
+        self.v = VectorNetwork(n_cond, n_dim, n_hidden, hidden_size, **kwargs)
+        # Create variables. The argument is the raw spacetime coordinate; the network
+        # appends the Fourier block itself.
+        self.v(tf.zeros([1, 1 + n_dim]), tf.zeros([1], dtype=tf.int32))
 
         self.ode_solver = tfp.math.ode.DormandPrince(rtol=rtol, atol=atol)
 

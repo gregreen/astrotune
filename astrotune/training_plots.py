@@ -18,6 +18,7 @@ if not os.environ.get("DISPLAY"):  # headless by default
     matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import scipy.ndimage
 from matplotlib.ticker import AutoMinorLocator
@@ -190,7 +191,14 @@ def plot_transformed_params(
             ax.set_xlim(lim[:, p0])
             ax.set_ylim(lim[:, p1])
 
-    ax_arr[0, 0].legend(loc="upper left", markerscale=3, fontsize=5)
+    # Proxy handles rather than the scatters themselves: a scatter's handle is the
+    # scatter, so raising its alpha would raise the alpha of the plotted points too.
+    handles = [
+        Line2D([], [], marker="o", linestyle="", markersize=2, color=colors[k],
+               label=label, alpha=1.0)
+        for k, label in enumerate(labels)
+    ]
+    ax_arr[0, 0].legend(handles=handles, loc="upper left", markerscale=3, fontsize=5)
     ax_arr[0, 0].set_title("Original", fontsize=9)
     ax_arr[0, 1].set_title("Transformed", fontsize=9)
 

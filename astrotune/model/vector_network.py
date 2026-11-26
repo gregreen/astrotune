@@ -8,6 +8,8 @@ import numpy as np
 import sonnet as snt
 import tensorflow as tf
 
+from .fourier import FourierFeatures
+
 log = logging.getLogger(__name__)
 
 
@@ -39,6 +41,7 @@ class VectorNetwork(snt.Module):
         use_residual=True,
         output_scale=1e-5,
         output_bias=0,
+        fourier=None,
         name=None,
     ):
         """
@@ -53,6 +56,10 @@ class VectorNetwork(snt.Module):
             small value makes the initial velocity field ~0, i.e. the
             bijection starts out as the identity.
           output_bias: initial value of the output bias.
+          fourier: keyword arguments for
+            :class:`astrotune.model.fourier.FourierFeatures`, which are
+            concatenated to the input of the *first* dense layer (``None``: no
+            features, which is what every run before this option used).
         """
         super().__init__(name=name)
 
@@ -61,6 +68,12 @@ class VectorNetwork(snt.Module):
             log.info("Using %d-dim embedding for %d categories.", embed_dim, n_cat)
         self.embed = snt.Embed(vocab_size=n_cat, embed_dim=embed_dim, name="embedding")
 
+        # The Fourier block widens the input of the first dense layer only; the
+        # layers after it keep ``hidden_size``. The first layer is built lazily, so
+        # the caller's variable-creating call must pass the widened width -- see
+        # ``n_features``.
+        self.fourier = FourierFeatures(**fourier) if fourier else None
+        self.n_features = self.fourier.n_features if self.fourier is not None else 0
         self.hidden = [snt.Linear(hidden_size, name=f"hidden_{i}") for i in range(n_hidden)]
         if use_layer_norm:
             self.norm = [
@@ -108,6 +121,12 @@ class VectorNetwork(snt.Module):
         self.n_calls.assign_add(1)
 
         e = self.embed(c)  # (b, embed_dim)
+
+        if self.fourier is not None:
+            # The raw coordinate stays in the input: the large-scale trend is then
+            # representable at low frequency instead of having to be assembled out
+            # of oscillations.
+            x = tf.concat([x, self.fourier(x)], axis=-1)
 
         for i, dense in enumerate(self.hidden):
             h = self.activation(dense(x))

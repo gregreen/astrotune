@@ -42,17 +42,81 @@ def model_checksum(model, keys: Sequence[str]) -> int:
     return crc
 
 
+def installed_models(path) -> Dict[str, Path]:
+    """``{model type: directory}`` for the delta models rooted at ``path``.
+
+    ``path`` may be a run directory (whose ``delta/`` holds one subdirectory per
+    type), that ``delta/`` directory itself, or a single model directory. The older
+    flat layout -- ``delta_model.*`` sitting directly in the root -- is read too, so
+    runs trained before the type directories existed still resolve.
+    """
+    from .model import delta_model_type
+
+    root = Path(path)
+    found: Dict[str, Path] = {}
+
+    def add(directory: Path) -> None:
+        if (directory / "delta_model_config.json").exists():
+            found.setdefault(delta_model_type(directory), directory)
+
+    for base in (root, root / "delta"):
+        if (base / "delta_model_config.json").exists():
+            add(base)  # the legacy flat layout
+        if base.is_dir():
+            for sub in sorted(p for p in base.iterdir() if p.is_dir()):
+                add(sub)
+
+    return found
+
+
+def resolve_delta_model_dir(path, model_type: Optional[str] = None) -> Path:
+    """The directory holding ``delta_model.*``, from any of the accepted layouts.
+
+    With ``model_type`` unset the choice is made for the caller only when it is
+    unambiguous: a directory holding one model resolves to it, and one holding
+    several raises with the list, because silently picking the alphabetically first
+    would apply the wrong recalibration.
+    """
+    from .model import canonical_model_type
+
+    found = installed_models(path)
+    root = Path(path)
+    if not found:
+        raise ValueError(
+            f"no delta model under {root}: expected <type>/delta_model_config.json, "
+            f"delta/<type>/delta_model_config.json, or the older flat "
+            f"delta_model_config.json"
+        )
+    if model_type is None:
+        if len(found) == 1:
+            return next(iter(found.values()))
+        raise ValueError(
+            f"{root} holds several delta models ({sorted(found)}); say which one to "
+            f"use with --delta-model-type"
+        )
+    kind = canonical_model_type(model_type)
+    if kind not in found:
+        raise ValueError(
+            f"no {kind} delta model under {root}; found {sorted(found)}. Train it with "
+            f"astrotune-delta-train --model-type {kind}"
+        )
+    return found[kind]
+
+
 def calibrated_sigma(run_dir, keys: Optional[Sequence[str]] = None,
                      out_dir: Optional[Path] = None,
-                     batch_size: int = 262_144, model=None) -> Dict[str, np.ndarray]:
+                     batch_size: int = 262_144, model=None,
+                     model_type: Optional[str] = None) -> Dict[str, np.ndarray]:
     """``{catalog key: sigma_cal}``, ``(n, d)`` in the catalog's own units.
 
     Rows line up with the prepared table of that catalog (``load_catalog(key)``),
     before any deduplication, so the caller may dedupe afterwards. A parameter a
     catalog does not measure keeps its placeholder value, so it stays unmeasured.
 
-    The result is cached per catalog in ``<out-dir>/calibrated_sigma/``; the cache
-    is regenerated when the delta model or the catalog list changes.
+    Which model is used follows :func:`resolve_delta_model_dir`: pass ``model_type``
+    to choose among the models saved under one run's ``delta/``. The result is
+    cached per catalog in ``<model dir>/calibrated_sigma/``; the cache is
+    regenerated when the model or the catalog list changes.
     """
     from ..apply import padded_inputs
     from ..prep.io import load_catalog
@@ -62,11 +126,18 @@ def calibrated_sigma(run_dir, keys: Optional[Sequence[str]] = None,
     from .stars import raw_sigma
 
     run_dir = Path(run_dir)
-    delta_dir = Path(out_dir) if out_dir else run_dir / "delta"
+    root = Path(out_dir) if out_dir else run_dir / "delta"
     keys = tuple(keys) if keys is not None else registry.run_keys(run_dir)
-    cache_dir = delta_dir / "calibrated_sigma"
-
-    model = model if model is not None else load_delta_model(delta_dir, keys=keys)
+    if model is None:
+        model_dir = resolve_delta_model_dir(root, model_type)
+        model = load_delta_model(model_dir, keys=keys)
+    else:
+        try:
+            model_dir = resolve_delta_model_dir(root, model_type)
+        except ValueError:
+            # An explicitly given model with nothing on disk: cache beside it.
+            model_dir = root
+    cache_dir = model_dir / "calibrated_sigma"
     fn = numpy_delta_fn(model, batch_size=batch_size)
     group_of = registry.group_index(keys)
     checksum = model_checksum(model, keys)
