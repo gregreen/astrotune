@@ -1,12 +1,42 @@
 Data
 ====
 
-* SAGA:
-  - Low-metallicity stars
-  - URL: http://sagadatabase.jp/Data/txt_table_recommended.tsv
-  - References: https://ui.adsabs.harvard.edu/abs/2008PASJ...60.1159S/abstract,
-                https://ui.adsabs.harvard.edu/abs/2022ApJ...931..147L/abstract,
-                https://ui.adsabs.harvard.edu/abs/2022ApJ...931..146A/abstract
+* SAGA — **investigated 2026-11-26, not worth it as a model catalog** (branch
+  `saga` deleted; nothing was built).
+  - Low-metallicity stars. URL:
+    http://sagadatabase.jp/Data/txt_table_recommended.tsv (10 MB, HTTP only,
+    latin-1, tab separated, 636 columns, 13,414 stars). References:
+    https://ui.adsabs.harvard.edu/abs/2008PASJ...60.1159S/abstract,
+    https://ui.adsabs.harvard.edu/abs/2022ApJ...931..147L/abstract,
+    https://ui.adsabs.harvard.edu/abs/2022ApJ...931..146A/abstract
+  - The difficulties:
+    * The host has an A record (153.126.128.103, a sakura VPS) but *our* resolver
+      does not see it: `curl` needs `--doh-url https://dns.google/dns-query` (or
+      the same IP in /etc/hosts). Everything after that is ordinary HTTP.
+    * Coverage is thin: RA/Dec in only 47.8% of the rows (6,403), Teff/log g/
+      [M/H] in ~50%, [Fe/H] in 33%, [Mg/H] in 25%. There are **no uncertainties
+      at all** for Teff, log g or [Fe/H]; the `d(X)` columns only cover the
+      individual abundances. Coordinates + Teff + log g + [Fe/H] leaves 3,693
+      stars, and only 2,467 of those have an alpha element (1,854 with an error),
+      so a four-parameter catalog would be ~2,500 stars with invented error bars.
+    * **It is a meta-catalog, and its "recommended" values are copied verbatim
+      from the source papers.** Li et al. (2022, ApJ 931, 147) *is* our
+      `vmp_stars_li2022`: 280 of its 298 prepared stars (94%) are in SAGA within
+      2" (median 0.25"), SAGA's Teff and log g are *identical* to VMP's (median
+      difference 0.0 K / 0.00 dex, scatter 0.0), and its [M/H] equals VMP's
+      [Fe/H] (median 0.000, 89% within 0.05 dex). The individual abundances of
+      that paper are *not* in the recommended table for those stars ([Mg/H] 6.8%,
+      [Si/H] 2.1%), so SAGA does not even hand us VMP's alpha.
+  - What it would add: the other 6,123 coordinate-bearing rows, a 2008-onward
+    literature compilation (2MASS names) spanning [Fe/H] -7.1..+0.55, median
+    -0.90 — the metal-poor end the model is thinnest in, but again as copies of
+    other surveys' values, with no errors, and overlapping whatever we already
+    have.
+  - If it is ever revisited the only defensible form is a **deduplicated
+    residual** sample: crossmatch to Gaia (GAVO), drop every star whose id is
+    already in a prepared table, and keep what is left. That is cheap to test
+    *after* the crossmatch, but the expected yield (~2,500 stars, mostly with no
+    alpha) does not justify the work now.
 
 * MaStar:
   - Description: https://www.sdss4.org/dr17/mastar/
