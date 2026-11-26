@@ -1,7 +1,21 @@
 Data
 ====
 
-* GALAH: Remove [O/Fe] from [alpha/Fe] calculation? It correlates terribly with the other alpha elements.
+* SAGA:
+  - Low-metallicity stars
+  - URL: http://sagadatabase.jp/Data/txt_table_recommended.tsv
+  - References: https://ui.adsabs.harvard.edu/abs/2008PASJ...60.1159S/abstract,
+                https://ui.adsabs.harvard.edu/abs/2022ApJ...931..147L/abstract,
+                https://ui.adsabs.harvard.edu/abs/2022ApJ...931..146A/abstract
+
+* MaStar:
+  - Description: https://www.sdss4.org/dr17/mastar/
+  - Data model: https://data.sdss.org/datamodel/files/MANGA_SPECTRO_MASTAR/DRPVER/MPROCVER/vac/parameters/VER/mastar-goodstars-DRPVER-MPROCVER-params-VER.html
+  - Download URL: https://data.sdss.org/sas/dr17/manga/spectro/mastar/v3_1_1/v1_7_7/vac/parameters/v2/mastar-goodstars-v3_1_1-v1_7_7-params-v2.fits
+  - Info about stellar parameters: https://www.sdss4.org/dr17/mastar/mastar-stellar-parameters/
+  - References: https://scixplorer.org/abs/2022MNRAS.509.4308H/abstract?fromADS=true&ads_compat=1,
+                https://scixplorer.org/abs/2022AJ....163...56I/abstract?fromADS=true&ads_compat=1
+
 
 Error floor in the merged catalog
 =================================
