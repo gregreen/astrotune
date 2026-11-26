@@ -569,6 +569,81 @@ excess grows with Teff. Also: against SLAM/MDC/ASPCAP Li's Teff is high by
 APOGEE DR17 to 0.004: APOGEE DR17 and SDSS-V ASPCAP differ by ≈ 4% in Teff for
 these cool stars, which is not a Li problem.
 
+**`mastar` — MaStar (candidate)**, the SDSS DR17 MaStar stellar-parameter
+value-added catalog (v3_1_1 / v1_7_7, parameters v2: Yan et al. in preparation,
+with Hill et al. 2022, MNRAS 509, 4308 and Imig et al. 2022, AJ 163, 56 for two
+of the four methods). **It is a candidate and not part of the model** (§5.6);
+20 catalogs is what the current models were trained with. Raw file:
+`data/raw/mastar/mastar-goodstars-v3_1_1-v1_7_7-params-v2.fits` (7.9 MB,
+public, one row per star). Prepared table: `data/training/mastar/`
+(**18,141 stars**).
+
+- **Why it is interesting**: it is a *library*, not a survey — a magnitude-
+  selected sample of stars with high-SNR flux-calibrated SDSS BOSS spectra, each
+  fit by **four independent methods** (JI: neural network trained on ASPCAP
+  labels plus model spectra; DL: MCMC with BOSZ including the continuum shape;
+  LH: pPXF + MCMC with BOSZ/MARCS; YC: BOSZ + MARCS Bayesian average). Only the
+  [Fe/H] calibration uses ASPCAP, so a MaStar entry is a genuinely independent
+  measurement of stars that APOGEE, ASPCAP, the LAMOST pipelines and CLAM have
+  also analysed, with useful leverage on *between-catalog* systematics. It
+  shares 3,924 stars with LAMOST DD-Payne and 2,156 with SDSS-V APOGEENet.
+- **Parameters**: the `*_MED` columns are the median over the methods that are
+  valid for that star, and `NGROUPS` / `NALPHAGROUPS` count how many contributed
+  ([α/Fe] is filtered separately and usually by fewer methods, so it is the
+  column to look at when judging an alpha value). [Fe/H] is `FEH_CAL_MED`, the
+  ASPCAP-calibrated median (the calibration is a quadratic per method; the
+  per-method columns carry uncalibrated values); there is no calibrated [α/Fe],
+  so `ALPHA_MED` is used. Missing is the sentinel `-999` in every column,
+  errors included.
+- **No Gaia ids** (positions only, from the MaStar targeting), so it is
+  crossmatched through GAVO — the ESA archive was down when this was added —
+  and cached in `data/interim/mastar/crossmatched.h5`: 24,290 rows -> 23,927
+  within the 1" search radius -> 22,144 within the catalog's 0.5" limit.
+  **Open point:** the 7.5% of matches between 0.5" and 1.0" follow a radial
+  density that keeps falling (median separation 0.125", p90 0.44"), so they
+  look like real matches displaced by proper motion between the MaStar epoch
+  and Gaia J2016 rather than blends; raising `MAX_SEPARATION` to 1" would
+  recover them. Not changed (0.5" is what `lamost_ddp_dr9`, `desi_ddp` and
+  `lamost_csn_dr10` use).
+- **Cuts** (in order; stars left): Gaia crossmatch 22,144; `NGROUPS >= 2`
+  21,457; `NALPHAGROUPS >= 2` 20,142 (a single method's value has had no
+  cross-check); four parameters finite 20,142; Teff in (3500, 30,000) 19,776;
+  log g in (-0.5, 5.0) 19,738; [Fe/H] in (-3.5, 0.7) 19,738; [α/Fe] in
+  (-0.5, 0.8) 19,726; uncertainty limits (Teff < 500 K, log g < 0.5,
+  [Fe/H] < 0.5, [α/Fe] < 0.4) **18,141**. The uncertainty limits are by far the
+  largest cut (1,585 stars) and that is where most of the hot tail goes: the
+  failed fits at the hot edge quote errors of several dex.
+- **Grid edges**: 110 stars sit exactly on 3500 K and 458 below it, 12 exactly
+  on 30,000 K and 7 above, 157 exactly at log g = 5.000 — the boundaries of the
+  fitting grids. The Teff ceiling was first drawn at 8000 K on the (wrong)
+  assumption that the model has no hot data; it has plenty (`lamost_hotpayne`
+  supplies 20,546 observations above 8000 K), and once the uncertainty limits
+  are applied only 388 hot stars were being thrown away, so the ceiling was
+  relaxed to 30,000 K (keeps 358, of which 2 are above 20,000 K). What is left
+  is a smooth hot sequence, not a pile-up.
+- **Uncertainties** are not rescaled yet (`UNC_SCALES` absent) and the floors
+  are the default `(0.01, 0.01, 0.04, 0.02)`. Quoted medians: 104 K, 0.23 in
+  log g, 0.21 in [Fe/H], 0.11 in [α/Fe] (0.45 and 0.20 for the hot stars).
+  `X_ERR = (0.1,)*4` is a first guess — nothing is known yet about how this
+  catalog's systematics compare with ours; the overlap comparison is the next
+  step if it is promoted.
+- **A bug worth remembering**: `PARAM_COLS` was first declared in the file's
+  column order (Teff, log g, [Fe/H], [α/Fe]) instead of the canonical order
+  (Teff, [Fe/H], log g, [α/Fe]). Nothing failed: the table was written, the
+  uncertainties were swapped consistently with the values, and the pipeline
+  validation passed. Only the Kiel diagram gave it away, with log g spanning
+  -2.5...0.4 (a metallicity range). The prepared table was rebuilt.
+- 25 duplicate Gaia ids remain (two MaStar entries for the same star in the
+  input file); kept, as everywhere else (§5.4).
+
+**Overlaps** (`astrotune-overlaps mastar`; unique shared stars, "both [α/Fe]"
+in parentheses): LAMOST DD-Payne 3,924 (3,924), SDSS-V APOGEENet 2,156 (0, it has
+no [α/Fe]), APOGEE 1,522 (1,522), DESI DR1 1,434 (1,434), SDSS-V ASPCAP 1,361
+(1,361), SDSS-V BOSSNet 1,317 (0), LAMOST MRS 785 (785), CLAM 777 (777), LAMOST
+M-Stars (Li) 535 (535), M-Stars (Ding) 431 (0), GALAH 414 (414), HotPayne 238
+(0), M-Dwarfs (Zhang) 173 (0), DESI (Zhang) 163 (163), SLAM 121 (121), MDC 66
+(66), DESI (Nagaraj) 27 (27), RAVE 16 (16), VMP 4 (0), PIGS 0.
+
 ---
 
 ### 5.6 How to add a new catalog
@@ -616,7 +691,12 @@ cannot overlap the cool stars it was hoped to constrain).
      `N_PARAMS = 3` is only for a catalog **lacking the last parameter**,
      [α/Fe]; it is padded to 4 later, at the pair stage. A missing parameter in
      any other position needs an explicit dummy axis (`x = 0`,
-     `sigma_x = x_err = 1e9`), as in `sdssv_mdc`.
+     `sigma_x = x_err = 1e9`), as in `sdssv_mdc`. **Declaring `PARAM_COLS` in
+     the order the file happens to use is silent**: nothing fails, and the
+     parameters are swapped in the prepared table (this happened in `mastar`,
+     §5.5). The check is cheap and worth doing on every new table — the medians
+     of `x[:, 1]` and `x[:, 2]` must be a metallicity and a log g, and the Kiel
+     diagram must look like a Kiel diagram.
    - `ID_COL` must hold Gaia DR3 source ids; rows with `id <= 0` are dropped
      automatically. Duplicate ids are **kept** (§5.4); the validator only warns.
    - `sigma_x` (statistical errors, drives the pair χ²) gets the default error
