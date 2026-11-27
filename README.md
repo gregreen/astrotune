@@ -204,6 +204,7 @@ assemble → validate → save → diagnostics → parity check.
 | `id` | Gaia DR3 source id (int64) |
 | `x` | `(n, d)` parameters, in the frozen order |
 | `sigma_x` | `(n, d)` quoted σ, rescaled by the catalog's `UNC_SCALES`, then floored |
+| `cov_x` | `(n, d, d)` the same uncertainties as a covariance, carrying the catalog's own correlations. Present only for catalogs that quote them (`sdssv_clam` so far); `sigma_x` is always its marginal. |
 | `sigma_x_raw` | `(n, d)` quoted σ in our units, no rescale, no floor |
 | `x_err` | `(n, d)` regularization error: a prior on how far the map may move a star |
 | extras | e.g. `ra_gdr3`, `dec_gdr3`, `ra`, `dec` |
@@ -219,10 +220,18 @@ Decisions that matter:
   range, SLAM's Teff range, ...).
 * **Error floors** (0.01, 0.01, 0.04, 0.02) are *regularization*, not physics:
   they keep a catalog quoting a nearly zero uncertainty from claiming infinite
-  weight. Applied in quadrature, `σ = hypot(s·q, floor)`.
+  weight. Applied in quadrature, `σ = hypot(s·q, floor)`. On a covariance the
+  same two numbers act as a congruence and a diagonal,
+  `C' = diag(s) C diag(s) + diag(floor²)`: positive-definiteness is preserved,
+  the congruence leaves every correlation coefficient unchanged (`s_i s_j`
+  cancels), and the floor — being uncorrelated noise — dilutes them. With the
+  floors at about half of a catalog's variance, roughly half of a quoted
+  correlation survives into `cov_x`.
 * **`UNC_SCALES`** lets a catalog admit its quoted errors are off by a constant
   factor (SLAM's Teff errors by 5) before the floors. `astrotune-error-scale`
-  measures that factor from the data.
+  measures that factor from the data. A catalog that carries a covariance must
+  express its rescale this way rather than as a function, because the
+  covariance is scaled by a congruence and not by an opaque per-row call.
 * **Two sigmas.** The bijector trains on `sigma_x` (scaled and floored); the
   delta model learns from `sigma_x_raw` (quoted only), because its job is to
   discover the scale and the additive term itself. Mixing them up gives a

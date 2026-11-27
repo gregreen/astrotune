@@ -111,6 +111,9 @@ FILENAME = "boss_clam_lite-1.0.0.h5"
 ID_COL = "id"
 PARAM_COLS = ("teff", "fe_h", "logg", "alpha_m")
 UNC_COLS = ("e_teff", "e_fe_h", "e_logg", "e_alpha_m")
+#: The catalog ships a full 4x4 parameter covariance, so it is the first one to
+#: carry ``cov_x`` (the off-diagonals are the point: see the notes above).
+COV_COLS = "cov"
 EXTRA_COLS = ("ra", "dec", "flag_warn")
 
 #: Bit positions in ``clam_flags`` (for the diagnostics)
@@ -158,8 +161,17 @@ def load(ctx) -> Table:
         clam, meta = f["clam"], f["meta"]
         # Variances are the diagonal of the covariance in the order
         # [teff, logg, fe_h, alpha_m]; a non-positive variance is invalid.
-        variance = np.einsum("nii->ni", clam["param_covariance"][:])
+        cov = np.asarray(clam["param_covariance"][:], dtype="f8")
+        variance = np.einsum("nii->ni", cov)
         err = np.sqrt(np.where(variance > 0, variance, np.nan))
+        # The parameters are stored as (teff, logg, fe_h, alpha_m) and ours are
+        # (teff, fe_h, logg, alpha): permute both axes of every block. Kept in
+        # float64: the blocks still hold Teff variances in K^2 (~1e4) against
+        # [Fe/H] variances of ~1e-3, and float32 loses enough absolute precision
+        # there to make a block look indefinite. The pipeline casts after the
+        # Teff transform, when every entry is O(1e-3..1e-1).
+        perm = [0, 2, 1, 3]
+        cov = cov[:, perm][:, :, perm]
         t = Table(
             {
                 "id": meta["gaia_dr3_source_id"][:].astype("i8"),
@@ -175,6 +187,7 @@ def load(ctx) -> Table:
                 "e_logg": err[:, 1],
                 "e_fe_h": err[:, 2],
                 "e_alpha_m": err[:, 3],
+                "cov": cov,
                 "rchi2": clam["rchi2"][:],
                 "clam_flags": clam["clam_flags"][:],
                 "flag_bad": clam["flag_bad"][:],
@@ -182,14 +195,6 @@ def load(ctx) -> Table:
             }
         )
     return t
-
-
-def unc_transf(d: int):
-    """Scale the catalog uncertainties before the floors are applied."""
-    return [
-        (lambda x, xs, f=f, s=s: f(x, s * xs))
-        for f, s in zip(PARAM_UNC_TRANSF[:d], UNC_SCALES[:d])
-    ]
 
 
 def measured(t: Table) -> dict:

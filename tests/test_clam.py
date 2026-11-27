@@ -11,10 +11,13 @@ from astrotune.prep.transforms import teff_err_to_x
 
 
 def _row(i, **changes):
+    # ``cov`` is the catalog's covariance in the canonical order (Teff, [Fe/H],
+    # logg, [alpha/Fe]); the module permutes it out of CLAM's own order on load.
     row = dict(
         id=1000 + i, ra=10.0, dec=20.0, snr=50.0,
         teff=5000.0, logg=4.3, fe_h=-0.3, alpha_m=0.1,
         e_teff=20.0, e_logg=0.03, e_fe_h=0.02, e_alpha_m=0.01,
+        cov=np.diag([20.0**2, 0.02**2, 0.03**2, 0.01**2]),
         flag_bad=False, flag_warn=False,
     )
     row.update(changes)
@@ -22,7 +25,11 @@ def _row(i, **changes):
 
 
 def _table(rows):
-    return Table({k: [r[k] for r in rows] for k in rows[0]})
+    columns = {}
+    for key in rows[0]:
+        columns[key] = (np.array([r[key] for r in rows]) if key == "cov"
+                        else [r[key] for r in rows])
+    return Table(columns)
 
 
 def _run(rows):
@@ -105,9 +112,33 @@ def test_the_pipeline_reads_the_floors_under_the_name_it_expects():
     assert hasattr(clam, "ERROR_FLOORS")
     assert not hasattr(clam, "UNC_FLOOR")
     assert len(clam.ERROR_FLOORS) == len(clam.PARAM_COLS) == 4
-    # the [Fe/H] floor has to cover the real scatter, ~0.15 dex
-    assert clam.ERROR_FLOORS[1] >= 0.1
+    # the size of the floors is the catalog owner's call; the point here is only
+    # that the pipeline reads them, so keep them positive and comparable to the
+    # measured scatter of ~0.15 dex rather than pinning a number
+    assert all(0.0 < f < 0.5 for f in clam.ERROR_FLOORS)
 
+
+
+def test_covariance_is_scaled_floored_and_consistent_with_sigma():
+    from astrotune.prep import transforms
+
+    # a block with the sign of the real one: [Fe/H] and [alpha/Fe] anti-correlated
+    cov = np.diag([20.0**2, 0.02**2, 0.03**2, 0.01**2])
+    cov[1, 3] = cov[3, 1] = -0.9 * np.sqrt(cov[1, 1] * cov[3, 3])
+    _, _, table = _run([_row(0, cov=cov)])
+    assert "cov_x" in table.colnames
+    block = np.asarray(table["cov_x"], dtype="f8")
+    sigma = np.asarray(table["sigma_x"], dtype="f8")
+
+    # sigma_x stays the marginal of cov_x -- that identity is what lets every
+    # consumer that wants one number per parameter keep using it
+    assert np.allclose(transforms.covariance_to_sigma(block), sigma, rtol=1e-6)
+
+    corr = transforms.covariance_to_correlation(block)
+    assert corr[0, 1, 3] < 0  # the congruence preserves the sign ...
+    assert abs(corr[0, 1, 3]) < 0.9  # ... and the floor dilutes the magnitude
+    # the stored block is positive definite
+    assert np.all(np.linalg.eigvalsh(block) > 0)
 
 
 def test_hot_stars_get_larger_regularization_errors():

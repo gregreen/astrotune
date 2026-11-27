@@ -5,10 +5,13 @@ Every catalog ends up in the same on-disk format:
     id       int64             star identifier (Gaia DR3 source_id)
     x        float (n, d)      transformed stellar parameters
     sigma_x  float (n, d)      transformed statistical uncertainties
+    cov_x    float (n, d, d)   transformed covariance (only for catalogs that have one)
     x_err    float (n, d)      regularization errors (see the paper, App. A)
     <extra>  float (n,)        e.g. ra, dec
 
 ``d`` is 4 (Teff, [Fe/H], logg, [alpha/Fe]) or 3 when [alpha/Fe] is absent.
+``sigma_x`` is always present and always the marginal of ``cov_x`` (where there
+is one): it is what every consumer that wants one number per parameter uses.
 """
 
 from __future__ import annotations
@@ -53,6 +56,29 @@ PARAM_UNC_TRANSF: tuple[Callable, ...] = (
 )
 
 
+def teff_cov_to_x(cov, teff):
+    """Propagate a covariance through x_Teff = 5 ln(Teff/5000 K).
+
+    The transform is nonlinear, so this is the usual first-order propagation
+    ``J C J^T`` with ``J = diag(5 / Teff, 1, 1, ...)`` -- the same linearization
+    that ``teff_err_to_x`` uses for a single uncertainty, applied to the whole
+    block. Everything except the first row and column passes through untouched.
+    """
+    cov = np.array(cov, dtype="f8", copy=True)
+    jac = TEFF_SCALE / np.asarray(teff, dtype="f8")
+    cov[:, 0, :] *= jac[:, None]
+    cov[:, :, 0] *= jac[:, None]
+    return cov
+
+
+PARAM_COV_TRANSF: tuple[Callable, ...] = (
+    teff_cov_to_x,
+    None,
+    None,
+    None,
+)
+
+
 # --- Array helpers ----------------------------------------------------------
 def unmask(values, fill=np.nan) -> np.ndarray:
     """Return a plain ndarray, filling masked entries.
@@ -88,6 +114,63 @@ def apply_err_floors(funcs: Iterable[Callable], floors: Iterable[float]) -> tupl
     return tuple(with_err_floor(f, e) for f, e in zip(funcs, floors))
 
 
+def scale_covariance(cov, scales=None, floors=None, max_condition=1e6):
+    """``a_i C_ij a_j + b_i delta_ij``, the covariance counterpart of the floors.
+
+    ``a = scales`` (the catalog's ``UNC_SCALES``) is applied as a diagonal
+    congruence, which keeps the matrix positive semi-definite and leaves every
+    correlation coefficient unchanged -- ``a_i a_j`` cancels between the numerator
+    and the two variances. ``b = floors**2`` is added on the diagonal only; that
+    is the part that dilutes correlations, as an uncorrelated floor must.
+
+    The result is symmetrized and its smallest eigenvalue is raised to
+    ``largest / max_condition`` when a block is (numerically) singular. Rows that
+    are already invalid (a non-positive variance in the source) stay NaN and are
+    removed by the catalog's cuts.
+    """
+    out = np.array(cov, dtype="f8", copy=True)
+    if scales is not None:
+        a = np.asarray(scales, dtype="f8")
+        out = out * a[:, None] * a[None, :]
+    if floors is not None:
+        b = np.asarray(floors, dtype="f8") ** 2
+        idx = np.arange(out.shape[-1])
+        out[..., idx, idx] += b
+    # symmetrize (the source files are not always exactly symmetric)
+    out = 0.5 * (out + np.swapaxes(out, 1, 2))
+    if max_condition is not None:
+        finite = np.all(np.isfinite(out), axis=(1, 2))
+        if finite.any():
+            block = out[finite]
+            sigma = np.sqrt(np.einsum("nii->ni", block))
+            rho = block / (sigma[:, :, None] * sigma[:, None, :])
+            evals, evecs = np.linalg.eigh(rho)
+            bad = evals[:, 0] < 1.0 / max_condition
+            if bad.any():
+                evals[bad, 0] = 1.0 / max_condition
+                rho = np.einsum("nij,nj,nkj->nik", evecs, evals, evecs)
+                # clipping changes the diagonal; restore it, so that the stored
+                # sigma_x remains exactly the marginal of the stored block
+                d = np.sqrt(np.einsum("nii->ni", rho))
+                rho = rho / (d[:, :, None] * d[:, None, :])
+            out[finite] = rho * sigma[:, :, None] * sigma[:, None, :]
+    return out
+
+
+def covariance_to_sigma(cov) -> np.ndarray:
+    """The marginal uncertainties, ``sqrt(diag(C))``."""
+    return np.sqrt(np.einsum("nii->ni", np.asarray(cov, dtype="f8")))
+
+
+def covariance_to_correlation(cov, max_condition=None) -> np.ndarray:
+    """Correlation matrices, for diagnostics (invalid rows come out as NaN)."""
+    cov = np.asarray(cov, dtype="f8")
+    sigma = covariance_to_sigma(cov)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = cov / (sigma[:, :, None] * sigma[:, None, :])
+    return corr
+
+
 # --- Table assembly ---------------------------------------------------------
 def extract_table(
     t: Table,
@@ -100,6 +183,10 @@ def extract_table(
     param_unc_transf: Optional[Sequence[Callable]] = None,
     param_unc_transf_raw: Optional[Sequence[Callable]] = None,
     param_errs=None,
+    cov_key: Optional[str] = None,
+    param_cov_transf: Optional[Callable] = None,
+    cov_scales=None,
+    cov_floors=None,
     mask=None,
 ) -> Table:
     """Build the standardized table described in the module docstring.
@@ -128,6 +215,12 @@ def extract_table(
         Regularization errors. Either ``(n, d)``-shaped, already aligned with
         the full input table, or a per-parameter sequence of constants. When
         omitted, every axis gets :data:`~astrotune.config.DEFAULT_X_ERR`.
+    cov_key
+        Optional column holding the catalog's ``(n, d, d)`` covariance in the
+        canonical order. When given, ``cov_x`` is written: propagated through
+        ``param_cov_transf``, then scaled and floored by :func:`scale_covariance`
+        with ``cov_scales``/``cov_floors``. ``sigma_x`` is written either way and
+        stays consistent with it (same scales, same floors).
     mask
         Additional boolean mask over the input table (e.g. quality cuts).
     """
@@ -191,6 +284,19 @@ def extract_table(
         out["sigma_x_raw"] = np.asarray(sigma_raw, dtype="f4")
     for k in extra_keys:
         out[k] = unmask(t[k][valid])
+    if cov_key is not None:
+        cov = np.asarray(unmask(t[cov_key][valid]), dtype="f8")
+        if cov.shape[1:] != (d, d):
+            raise ValueError(
+                f"{cov_key} holds covariance blocks of shape {cov.shape[1:]}, "
+                f"expected {(d, d)}"
+            )
+        if param_cov_transf is not None:
+            cov = param_cov_transf(cov, unmask(t[param_keys[0]][valid]))
+        block = scale_covariance(cov, cov_scales, cov_floors)
+        # Store float32, so clamp once more on the rounded values: the storage
+        # precision is what the likelihood will see.
+        out["cov_x"] = scale_covariance(block.astype("f4").astype("f8")).astype("f4")
     return out
 
 

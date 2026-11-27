@@ -89,11 +89,34 @@ def build_table(t: Table, mask: np.ndarray, module, ctx: Context) -> Table:
         param_errs = module.param_errs(t, ctx)
 
     # Catalogs may rescale the statistical uncertainties before the floors are
-    # applied (e.g. SLAM's over-estimated Teff errors).
+    # applied (e.g. SLAM's over-estimated Teff errors). A constant rescale is
+    # ``UNC_SCALES``, which is also what the covariance path needs; ``unc_transf``
+    # remains for the catalogs whose rescale is not a constant.
+    scales = getattr(module, "UNC_SCALES", None)
     if hasattr(module, "unc_transf"):
         unc_funcs = module.unc_transf(d)
+    elif scales is not None:
+        unc_funcs = [
+            (lambda x, xs, f=f, s=s: f(x, s * xs))
+            for f, s in zip(transforms.PARAM_UNC_TRANSF[:d], np.asarray(scales, "f8")[:d])
+        ]
     else:
         unc_funcs = transforms.PARAM_UNC_TRANSF[:d]
+
+    # A catalog with full covariances names the column that holds them. The
+    # congruence needs the rescale factors as numbers rather than as functions, so
+    # such a module expresses its rescale as ``UNC_SCALES``; the two paths then use
+    # the same factors and ``sigma_x`` stays the marginal of ``cov_x``.
+    cov_key = getattr(module, "COV_COLS", None)
+    cov_scales = None
+    if cov_key is not None:
+        if hasattr(module, "unc_transf"):
+            raise ValueError(
+                f"{ctx.key}: a catalog with COV_COLS must express its rescale as "
+                "UNC_SCALES, not unc_transf (the covariance cannot be scaled by an "
+                "opaque function)"
+            )
+        cov_scales = np.asarray(getattr(module, "UNC_SCALES", (1.0,) * d), dtype="f8")[:d]
 
     return transforms.extract_table(
         t,
@@ -107,6 +130,10 @@ def build_table(t: Table, mask: np.ndarray, module, ctx: Context) -> Table:
         # model sees: it learns both of those itself.
         param_unc_transf_raw=transforms.PARAM_UNC_TRANSF[:d],
         param_errs=param_errs,
+        cov_key=cov_key,
+        param_cov_transf=transforms.PARAM_COV_TRANSF[0] if cov_key is not None else None,
+        cov_scales=cov_scales,
+        cov_floors=floors[:d],
         mask=mask,
     )
 
