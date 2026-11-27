@@ -89,12 +89,25 @@ def test_every_kept_row_has_all_four_parameters():
 
 def test_uncertainties_are_scaled_before_the_floors():
     _, _, table = _run([_row(0)])
-    floors = tuple(config.ERROR_FLOORS)  # the default floors, in quadrature
-    assert not hasattr(clam, "ERROR_FLOORS") and clam.UNC_SCALES == (1.5,) * 4
+    floors = clam.ERROR_FLOORS  # the catalog's own floors, in quadrature
+    assert floors != tuple(config.ERROR_FLOORS)  # and not the defaults
     expected_feh = np.hypot(clam.UNC_SCALES[1] * 0.02, floors[1])
     assert table["sigma_x"][0][1] == pytest.approx(expected_feh, rel=1e-4)
     expected_teff = np.hypot(clam.UNC_SCALES[0] * teff_err_to_x(5000.0, 20.0), floors[0])
     assert table["sigma_x"][0][0] == pytest.approx(expected_teff, rel=1e-4)
+
+
+def test_the_pipeline_reads_the_floors_under_the_name_it_expects():
+    # ``ERROR_FLOORS`` is what ``prep.pipeline.build_table`` looks up; a module
+    # that spells it differently (``UNC_FLOOR`` was the mistake) silently falls
+    # back to the defaults, which is how this catalog ended up as 44% of the
+    # training loss.
+    assert hasattr(clam, "ERROR_FLOORS")
+    assert not hasattr(clam, "UNC_FLOOR")
+    assert len(clam.ERROR_FLOORS) == len(clam.PARAM_COLS) == 4
+    # the [Fe/H] floor has to cover the real scatter, ~0.15 dex
+    assert clam.ERROR_FLOORS[1] >= 0.1
+
 
 
 def test_hot_stars_get_larger_regularization_errors():

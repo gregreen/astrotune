@@ -17,13 +17,29 @@ Notes
   is used as the fourth parameter ([alpha/Fe]); the catalog gives no [M/H], so
   the two cannot be told apart, and the difference is small where [M/H] ~ [Fe/H].
 * Uncertainties are the square roots of the diagonal of ``param_covariance``.
-  **They are too small**: the paper's own wide-binary test gives
-  sigma_[Fe/H] ~ 0.15 and sigma_[alpha/M] ~ 0.06 at SNR = 10, 3-4 times the
-  catalog values (0.04 and 0.019 at SNR 10-15). We conservatively scale the reported
-  uncertainties by a factor of 1.5 and apply standard floors; the factor that
-  remains is left to the re-calibration model, which fits one per catalog.
-  ``astrotune-error-scale sdssv_clam`` fits the scale and a systematic plateau
-  against APOGEE, ASPCAP and GALAH if the number is to be re-derived.
+  **They are far too small**, and the diagonal is only half the story.
+  *Scale*: against DESI DR1 and LAMOST DD-Payne the [Fe/H] scatter is 0.25 at
+  SNR 15-22 and 0.18 above SNR 45, where the catalog quotes 0.034 and 0.018;
+  against APOGEE and ASPCAP (bright stars only) it is 0.07-0.10 at 0.013.
+  ``astrotune-error-scale sdssv_clam --partners desi_dr1 lamost_ddp_dr9
+  apogee_dr17 sdssv_aspcap`` fits s = 2.9-3.9 (Teff), 3.5-3.7 ([Fe/H]),
+  2.2-3.9 (logg), 3.5-4.2 ([alpha/M]) with plateaus 0.07-0.13; ``UNC_SCALES``
+  and ``ERROR_FLOORS`` below apply those numbers. The floors are what the bulk
+  of the sample needs -- the overlap sample the fit uses is biased bright.
+  **Why it matters**: with the old 1.5 scale this catalog was **44% of the whole
+  data term** while being 11% of the observations (mean chi^2 per row 183
+  against 6-14 for the large catalogs), so the map and the latent ``y`` were
+  being fitted to its noise; that is what made the map distort and the training
+  loss spike. ``scripts/catalog_loss_weight.py --run-dir RUN`` measures the
+  share for every catalog. Sizing the floors to the measured scatter puts CLAM
+  at ~7%.
+  *Shape*: the quoted covariance is strongly non-diagonal -- corr(Teff, [Fe/H])
+  = +0.85, corr([Fe/H], [alpha/M]) = -0.92, corr(Teff, logg) = +0.70 over the
+  kept rows, with 85-96% of rows above |rho| = 0.5. Only the diagonal is used,
+  and the model's residuals reproduce the tilt (corr(f(x) - y) = 0.91 in
+  Teff-[Fe/H]), which no single smooth map can remove. Correcting the scale
+  makes that a second-order effect; representing the covariance itself needs a
+  full-covariance data term, which the trainer does not have.
 * **Flags.** ``flag_bad`` (the catalog's own bad-fit flags, 43% of the rows)
   removes the star. ``flag_warn`` (``IN_OB`` or ``FE_H_ALPHA_SUSPECT``: every
   star above 6500 K -- all 30,982 of them in the prepared sample -- plus stars
@@ -118,7 +134,11 @@ ALPHA_RANGE = (-0.35, 0.75)
 MAX_ERR = {"e_teff": 300.0, "e_logg": 0.4, "e_fe_h": 0.25, "e_alpha_m": 0.15}
 
 #: Factors applied to the catalog uncertainties before the error floors
-UNC_SCALES = (1.5, 1.5, 1.5, 1.5)
+UNC_SCALES = (3.0, 3.0, 3.0, 4.0)     # Teff, [Fe/H], logg, [alpha/Fe]
+
+#: Floors on uncertainties, added after scaling. Experience shows that the
+#: uncertainties reported by the catalog are too small.
+ERROR_FLOORS = (0.05, 0.05, 0.05, 0.02)
 
 #: Regularization errors: larger for Teff and [Fe/H] above HOT_START, where
 #: CLAM disagrees most with the other catalogs. Tune once it is in the model.
