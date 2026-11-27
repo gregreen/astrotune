@@ -35,6 +35,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from . import config, registry
+from .prep import transforms
 from .prep.io import load_catalog
 
 log = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ N_PARAMS = config.N_PARAMS
 
 #: One row per catalog measurement of a star: Gaia id, parameters,
 #: regularization error (``xe``), statistical uncertainty (``xs``), catalog index
-OBS_KEYS = ("id", "x", "xe", "xs", "c")
+OBS_KEYS = ("id", "x", "xe", "xs", "u", "c")
 CTRL_KEYS = ("x_control", "xe_control", "c_control", "from_catalog")
 
 #: Regularization error substituted for "unknown" (>1e6) values when loading
@@ -65,7 +66,7 @@ SIGMA_SOURCES = ("floored", "delta")
 #: Seed used for the published run
 DEFAULT_SEED = 3
 
-_COLUMNS = ("id", "x", "x_err", "sigma_x", "sigma_x_raw")
+_COLUMNS = ("id", "x", "x_err", "sigma_x", "sigma_x_raw", "cov_x")
 
 
 def dedupe_by_id(table: astropy.table.Table) -> astropy.table.Table:
@@ -127,7 +128,12 @@ def load_tables(
 
 
 def replace_sigma(table: astropy.table.Table, sigma: np.ndarray, key: str = "") -> astropy.table.Table:
-    """A copy of ``table`` whose ``sigma_x`` is ``sigma`` (rows must line up)."""
+    """A copy of ``table`` whose ``sigma_x`` is ``sigma`` (rows must line up).
+
+    A ``cov_x`` column, if there is one, is re-marginalized onto the new sigma
+    (its correlation matrix is kept), so the block and the column cannot
+    disagree about how uncertain a measurement is.
+    """
     sigma = np.asarray(sigma, dtype="f8")
     if sigma.shape[0] != len(table):
         raise ValueError(
@@ -137,6 +143,13 @@ def replace_sigma(table: astropy.table.Table, sigma: np.ndarray, key: str = "") 
     out = table.copy()
     d = np.asarray(table["sigma_x"]).shape[1]
     out["sigma_x"] = sigma[:, :d].astype("f4")
+    if "cov_x" in out.colnames:
+        # The block has to keep saying the same thing as the column: the
+        # calibrated sigma is a new marginal, and what survives of the quoted
+        # covariance is its correlation matrix.
+        out["cov_x"] = transforms.covariance_with_sigma(
+            np.asarray(table["cov_x"]), sigma[:, :d]
+        ).astype("f4")
     return out
 
 
@@ -184,6 +197,17 @@ def delta_nu(
     return {k: float(nu[i]) for k, i in zip(keys, g)}
 
 
+def identity_whitening(n: int) -> np.ndarray:
+    """The whitening factor of ``n`` diagonal blocks: unit diagonal, no correction.
+
+    A catalog that quotes only per-parameter errors has a diagonal covariance,
+    whose whitening factor is the identity, so one code path serves both kinds.
+    """
+    u = np.zeros((n, transforms.WHITENING_SIZE), dtype="f4")
+    u[:, :4] = 1.0
+    return u
+
+
 def extract_observations(table, c: int, ids: np.ndarray) -> Dict[str, np.ndarray]:
     """The rows of ``table`` (catalog ``c``) whose star is in ``ids``.
 
@@ -202,11 +226,16 @@ def extract_observations(table, c: int, ids: np.ndarray) -> Dict[str, np.ndarray
     x[:, :d] = x_in[idx]
     xe[:, :d] = np.asarray(table["x_err"])[idx]
     xs[:, :d] = np.asarray(table["sigma_x"])[idx]
+    # The whitening factor of the covariance; the identity for a diagonal catalog.
+    u = identity_whitening(len(idx))
+    if "cov_x" in table.colnames:
+        u[:] = transforms.covariance_to_whitening(np.asarray(table["cov_x"])[idx])
     return dict(
         id=np.asarray(table["id"], dtype="i8")[idx],
         x=x,
         xe=xe,
         xs=xs,
+        u=u,
         c=np.full(len(idx), c, dtype="i4"),
     )
 
@@ -418,10 +447,18 @@ def build_training_data(
 def save_observations(
     obs_dict, ctrl_dict, path: Optional[Path] = None, attrs: Optional[dict] = None
 ) -> Path:
-    """Write the file; ``attrs`` (seed, dedupe, dispersed_xerr, ...) are stored as attributes."""
+    """Write the file; ``attrs`` (seed, dedupe, dispersed_xerr, ...) are stored as attributes.
+
+    A missing ``u`` is written as the identity, which is what a diagonal
+    ``obs_dict`` means: the reader makes the same substitution for files that
+    predate covariances, so neither side has to know which kind it has.
+    """
     path = Path(path or config.OBSERVATIONS_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     kw = dict(compression="gzip", compression_opts=3, chunks=True)
+    obs_dict = dict(obs_dict)
+    if "u" not in obs_dict:
+        obs_dict["u"] = identity_whitening(len(obs_dict["x"]))
     with h5py.File(path, "w") as f:
         for key, value in (attrs or {}).items():
             f.attrs[key] = value
@@ -459,6 +496,11 @@ def load_observations(
     with h5py.File(path, "r") as f:
         obs_dict = {k: f["obs_dict"][k][:] for k in f["obs_dict"].keys()}
         ctrl_dict = {k: f["ctrl_dict"][k][:] for k in f["ctrl_dict"].keys()}
+
+    # Files built before covariances had no ``u``; their catalogs are all diagonal,
+    # so the identity block is the exact answer rather than a fallback.
+    if "u" not in obs_dict:
+        obs_dict["u"] = identity_whitening(len(obs_dict["id"]))
 
     # The dense index of the free harmonized parameters of every observation.
     obs_dict["star"], obs_dict["n_stars"] = star_index(obs_dict["id"])

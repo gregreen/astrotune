@@ -147,15 +147,23 @@ and not by gradient descent (see the Gauss–Newton step below). This is the
 "latent-y" model: no catalog is regressed onto another, so inverse-variance
 weighting cannot shrink one map towards one survey.
 
-**The data term.** With `σ_a` the per-observation uncertainty (see "two sigmas"
-below) and `d_a` the number of parameters that observation actually measures,
+**The data term.** Each observation carries a covariance over the four
+parameters — the catalog's own when it quotes off-diagonals, its diagonal
+otherwise (see "two sigmas" below). With `r_a = x_a − f_{c(a)}^{-1}(y_{s(a)})`
+and `d_a` the number of parameters that observation actually measures,
 
-    χ²_a = Σ_p ( x_{a,p} − [f_{c(a)}^{-1}(y_{s(a)})]_p )² / σ_{a,p}² ,
+    χ²_a = r_aᵀ C_a⁻¹ r_a ,
     ρ(χ²) = (ν_c + d_a) · log(1 + χ²/ν_c)        ← Student's t, the default
     ρ(χ²) = S · asinh(χ² / S),  S = 50           ← --data-term softened
     L_data = (1/N) Σ_a ρ(χ²_a) .
 
-The t is the deviation of a multivariate t with scale matrix `diag(σ²)` and `ν_c`
+The covariance is never inverted. It is stored as the ten numbers of a
+whitening factor `U` with `C⁻¹ = D⁻¹UᵀUD⁻¹`, `D = diag(σ)`, `U` lower
+triangular: the four diagonal entries (which are `1/L_kk`, not 1) and the six
+strict-lower ones. Then `χ² = |U r / σ|²` is a matvec, and a diagonal catalog
+has `U = 1` exactly, so one code path serves both kinds.
+
+The t is the deviation of a multivariate t with scale matrix `C_a` and `ν_c`
 degrees of freedom, written as twice its exact deviance: that factor makes
 `ρ → χ²` as `ν → ∞`, so the penalties below keep the strength they were tuned
 with, and it lets `ν = chi2_turnover = 50` be the controlled comparison between
@@ -167,9 +175,10 @@ softened form; the derivation is in `notes/gauss_newton_with_students_t.tex`.
 `ν_c` is a per-catalog constant: `--nu` sets it, and observations built from a
 delta model's calibrated sigmas carry the values that model fitted for them,
 which is what makes an iteration use one consistent error model at both stages.
-A parameter that a catalog does not measure carries `σ = 1e9`, so its term is
-~1e-18 and it drops out of the sum without a mask — and it leaves `d` as well,
-since the marginal of a t over an axis known exactly is a t of the same `ν`.
+A parameter that a catalog does not measure carries `σ = 1e9`, so its row and
+column of `C⁻¹` are ~1e-18 and it drops out of the sum without a mask — and it
+leaves `d` as well, since the marginal of a t over an axis known exactly is a t
+of the same `ν`.
 
 **The penalties.** A likelihood alone is degenerate where the data are thin —
 nothing constrains a map in a corner no star occupies. Each catalog is therefore
@@ -263,8 +272,10 @@ astrotune-observations [-o FILE] [--dedupe none|first]
 Writes `data/observations_and_ctrl_points.h5`:
 
 * `obs_dict`: one row per **catalog measurement** of every star that at least
-  two catalogs observe — `id`, `x`, `xe`, `xs`, `c`. Two catalogs ⇒ two rows
-  sharing an `id`, and that id is what ties them to one `y`.
+  two catalogs observe — `id`, `x`, `xe`, `xs`, `c`, and `u` (the whitening
+  factor of the observation's covariance, `(n, 10)`; the identity for a catalog
+  that quotes no off-diagonals). Two catalogs ⇒ two rows sharing an `id`, and
+  that id is what ties them to one `y`.
 * `ctrl_dict`: the control points — `x_control`, `xe_control`, `c_control`,
   `from_catalog` (True for points taken from the catalog, False for the
   dispersed ones).

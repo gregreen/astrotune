@@ -1093,6 +1093,14 @@ class LatentTrainer:
         # GPU copies of the observation columns; a batch is gathered by row index
         self.x_obs = tf.constant(np.asarray(obs_dict["x"]))
         self.xs_obs = tf.constant(np.asarray(obs_dict["xs"]))
+        # The covariance whitening factor: the identity for a catalog that quotes
+        # only per-parameter uncertainties (see ``profile.whiten``).
+        if "u" in obs_dict:
+            self.u_obs = tf.constant(np.asarray(obs_dict["u"]))
+        else:
+            self.u_obs = tf.concat(
+                [tf.ones([len(np.asarray(obs_dict["x"])), 4], tf.float32),
+                 tf.zeros([len(np.asarray(obs_dict["x"])), 6], tf.float32)], axis=1)
         self.c_obs = tf.constant(np.asarray(obs_dict["c"], dtype="int32"))
         self.star_obs = tf.constant(star)
 
@@ -1128,13 +1136,13 @@ class LatentTrainer:
     # an error in the maths here. None of these helpers has data-dependent Python
     # control flow, so autograph has nothing to do for them in the first place.
     @tf.autograph.experimental.do_not_convert
-    def _loss_inputs(self, x, xs, x_pred, c):
+    def _loss_inputs(self, x, xs, x_pred, c, u=None):
         """``(chi2, d, nu)`` of every observation of the batch.
 
         See :func:`astrotune.profile.loss_inputs`; this is the trainer's thin wrapper,
         which supplies the per-catalog degrees of freedom it resolved at startup.
         """
-        return profile.loss_inputs(x, xs, x_pred, c, self.nu_cat)
+        return profile.loss_inputs(x, xs, x_pred, c, self.nu_cat, u=u)
 
     @tf.autograph.experimental.do_not_convert
     def _data_term(self, chi2_obs, d_obs, nu_obs):
@@ -1160,13 +1168,13 @@ class LatentTrainer:
         )
 
     @tf.autograph.experimental.do_not_convert
-    def _normal_equations(self, x, xs, x_pred, jac, weight, star):
+    def _normal_equations(self, x, xs, x_pred, jac, weight, star, u=None):
         """Per-star ``(A, b)`` of the Gauss-Newton step in ``y``.
 
         See :func:`astrotune.profile.normal_equations`; the merge calls the same
         function, so "the merged ``y``" and "the trained ``y``" are one estimator.
         """
-        return profile.normal_equations(x, xs, x_pred, jac, weight, star)
+        return profile.normal_equations(x, xs, x_pred, jac, weight, star, u=u)
 
     @tf.autograph.experimental.do_not_convert
     def _solve_y(self, A, b, return_scale=False):
@@ -1185,7 +1193,7 @@ class LatentTrainer:
             return_scale=return_scale,
         )
 
-    def _fit_y_val(self, x, xs, c, star) -> tf.Tensor:
+    def _fit_y_val(self, x, xs, c, star, u=None) -> tf.Tensor:
         """One Gauss-Newton sweep of the held-out stars' ``y``, kept between calls.
 
         The training ``y`` is re-solved once per epoch and so sits at its running
@@ -1205,9 +1213,9 @@ class LatentTrainer:
         x_pred, _, jac = self.bij.inverse_with_s_and_jac(
             tf.gather(self.y_val, star), c=c
         )
-        chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c)
+        chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c, u=u)
         weight = self._data_weight(chi2_obs, d_obs, nu_obs)
-        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, weight, star)
+        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, weight, star, u=u)
         step = self._solve_y(A, b)
         if cfg.y_learning_rate:
             self.y_val.scatter_nd_add(
@@ -1215,7 +1223,7 @@ class LatentTrainer:
             )
         return tf.gather(self.y_val, star)
 
-    def _gauss_newton_y(self, x, xs, c, star):
+    def _gauss_newton_y(self, x, xs, c, star, u=None):
         """Move ``y`` to the Gauss-Newton optimum of the batch's data term.
 
         Called before the map's gradient step, so the map trains against the
@@ -1239,9 +1247,9 @@ class LatentTrainer:
         if not cfg.y_learning_rate:
             return 1.0, 0.0, 0.0
         x_pred, _, jac = self.bij.inverse_with_s_and_jac(tf.gather(self.y, star), c=c)
-        chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c)
+        chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c, u=u)
         weight = self._data_weight(chi2_obs, d_obs, nu_obs)
-        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, weight, star)
+        A, b, uniq = self._normal_equations(x, xs, x_pred, jac, weight, star, u=u)
         step, allowed = self._solve_y(A, b, return_scale=True)
         self.y.scatter_nd_add(tf.expand_dims(uniq, 1), cfg.y_learning_rate * step)
         return (
@@ -1434,6 +1442,7 @@ class LatentTrainer:
 
         x = tf.gather(self.x_obs, obs_idx)
         xs = tf.gather(self.xs_obs, obs_idx)
+        u = tf.gather(self.u_obs, obs_idx)
         c = tf.gather(self.c_obs, obs_idx)
         star = tf.gather(self.star_obs, obs_idx)
 
@@ -1451,13 +1460,13 @@ class LatentTrainer:
         # the fitted ``y`` rather than at the one about to be replaced.
         trust, capped, dy_max = tf.constant(1.0), tf.constant(0.0), tf.constant(0.0)
         if gauss_newton:
-            trust, capped, dy_max = self._gauss_newton_y(x, xs, c, star)
+            trust, capped, dy_max = self._gauss_newton_y(x, xs, c, star, u=u)
         if apply_grads or not fit_y:
             # A pre-trained run holds every star at its initial guess, held-out or
             # not, so the validation loss measures the objective being trained.
             y = tf.gather(self.y, star)
         else:
-            y = self._fit_y_val(x, xs, c, star)
+            y = self._fit_y_val(x, xs, c, star, u=u)
 
         with tf.GradientTape(watch_accessed_variables=False) as g:
             g.watch(vars_filtered)
@@ -1473,7 +1482,7 @@ class LatentTrainer:
             # sigma = 1e9 and contributes ~1e-18 to chi^2, so no mask is needed;
             # it does leave the t's dimension, which is why ``d`` counts the
             # measured parameters rather than the width of the vector.
-            chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c)
+            chi2_obs, d_obs, nu_obs = self._loss_inputs(x, xs, x_pred, c, u=u)
             chi2 = tf.reduce_mean(self._data_term(chi2_obs, d_obs, nu_obs))
             chi2_raw = tf.reduce_mean(chi2_obs)
 

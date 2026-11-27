@@ -171,6 +171,79 @@ def covariance_to_correlation(cov, max_condition=None) -> np.ndarray:
     return corr
 
 
+def covariance_with_sigma(cov, sigma) -> np.ndarray:
+    """The same correlation matrix, with new marginal uncertainties.
+
+    ``C' = diag(sigma) R diag(sigma)``: what a calibrated (or otherwise
+    re-derived) ``sigma_x`` implies for the block, keeping the correlations the
+    catalog quoted. A pair of parameters whose correlation is undefined -- an
+    unmeasured one has ``sigma = 1e9`` -- comes out uncorrelated, which is the
+    right answer: nothing is known about its correlation either.
+    """
+    corr = covariance_to_correlation(cov)
+    corr = np.where(np.isfinite(corr), corr, 0.0)
+    sigma = np.asarray(sigma, dtype="f8")
+    return corr * sigma[:, :, None] * sigma[:, None, :]
+
+
+#: Positions of the strict lower triangle of a 4x4 matrix, in the order
+#: :func:`covariance_to_whitening` writes them after the four diagonal entries:
+#: (1,0), (2,0), (2,1), (3,0), (3,1), (3,2). The diagonal of ``U = L_R^-1`` is
+#: ``1 / L_kk``, which is 1 only where the block is uncorrelated.
+WHITENING_INDEX = ((1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2))
+#: Number of numbers per observation: 4 diagonal + 6 off-diagonal.
+WHITENING_SIZE = 10
+
+
+def covariance_to_whitening(cov) -> np.ndarray:
+    """``(n, 10)`` lower triangle of ``U = L_R^-1``, ``R = L_R L_R^T``.
+
+    The likelihood is ``chi^2 = ||U (x - x_pred) / sigma||^2``: the diagonal of the
+    covariance is already in ``sigma_x``, so the only thing a covariance adds is this
+    matrix, and it is the identity for a diagonal block -- which is what keeps one
+    code path for catalogs with and without off-diagonals. The four diagonal entries
+    come first, then the six strict-lower ones.
+
+    Rows whose block is not usable (NaN, or not positive definite) come back as the
+    identity of that row, i.e. as its diagonal approximation; the catalog's cuts
+    have already removed the genuinely invalid ones.
+    """
+    cov = np.asarray(cov, dtype="f8")
+    n, d, _ = cov.shape
+    out = np.zeros((n, WHITENING_SIZE), dtype="f8")
+    out[:, :d] = 1.0
+    ok = np.all(np.isfinite(cov), axis=(1, 2))
+    if not ok.any():
+        return out.astype("f4")
+    block = cov[ok]
+    sigma = np.sqrt(np.einsum("nii->ni", block))
+    rho = block / (sigma[:, :, None] * sigma[:, None, :])
+    try:
+        u = np.linalg.inv(np.linalg.cholesky(rho))
+    except np.linalg.LinAlgError:  # pragma: no cover - defensive
+        log.warning("covariance_to_whitening: a batch is not positive definite; "
+                    "falling back to the diagonal for those rows")
+        return out.astype("f4")
+    out[ok, :d] = np.einsum("nii->ni", u)
+    out[ok, d:] = u[:, [i for i, _ in WHITENING_INDEX], [j for _, j in WHITENING_INDEX]]
+    return out.astype("f4")
+
+
+def whitening_to_matrix(u) -> np.ndarray:
+    """Rebuild the lower-triangular ``U`` from the stored numbers."""
+    u = np.asarray(u, dtype="f8")
+    unit = u.ndim == 1
+    if unit:
+        u = u[None, :]
+    d = 4
+    out = np.zeros((len(u), d, d))
+    for k in range(d):
+        out[:, k, k] = u[:, k]
+    for k, (i, j) in enumerate(WHITENING_INDEX):
+        out[:, i, j] = u[:, d + k]
+    return out[0] if unit else out
+
+
 # --- Table assembly ---------------------------------------------------------
 def extract_table(
     t: Table,
@@ -294,8 +367,6 @@ def extract_table(
         if param_cov_transf is not None:
             cov = param_cov_transf(cov, unmask(t[param_keys[0]][valid]))
         block = scale_covariance(cov, cov_scales, cov_floors)
-        # Store float32, so clamp once more on the rounded values: the storage
-        # precision is what the likelihood will see.
         out["cov_x"] = scale_covariance(block.astype("f4").astype("f8")).astype("f4")
     return out
 

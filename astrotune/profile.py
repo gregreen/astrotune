@@ -2,13 +2,22 @@
 
 For one star with observations ``a`` (one per catalog measurement) the data term is
 
-    chi2_a = sum_p ( x_{a,p} - [f_c^-1(y)]_p )^2 / sigma_{a,p}^2
+    r_a    = x_a - f_c^-1(y)
+    chi2_a = r_a^T C_a^-1 r_a
     rho_a  = (nu_c + d_a) log(1 + chi2_a / nu_c)          Student's t (default)
     rho_a  = S asinh(chi2_a / S)                          the pair loss's softening
 
-with ``d_a`` the number of parameters that observation measures and ``nu_c`` the
-catalog's degrees of freedom; see ``notes/gauss_newton_with_students_t.tex`` for the
-derivation of the weight ``w = d rho / d chi2`` that the Gauss-Newton step uses.
+with ``C_a`` the observation's covariance (the catalog's own when it quotes
+off-diagonals, its diagonal otherwise), ``d_a`` the number of parameters that
+observation measures and ``nu_c`` the catalog's degrees of freedom; see
+``notes/gauss_newton_with_students_t.tex`` for the derivation of the weight
+``w = d rho / d chi2`` that the Gauss-Newton step uses.
+
+``C_a^-1`` is never formed. The observation carries the ten numbers of a
+whitening factor ``U`` with ``C^-1 = D^-1 U^T U D^-1``, ``D = diag(sigma)`` and
+``U`` lower triangular, so ``chi2_a = ||U r_a / sigma_a||^2`` is a matvec of four
+terms. A diagonal covariance -- every catalog but ``sdssv_clam`` -- has ``U``
+identically the identity, so one code path serves both kinds of catalog.
 
 Two callers need exactly this likelihood and must not drift apart:
 
@@ -41,14 +50,65 @@ DATA_TERMS = ("student_t", "softened")
 
 
 @tf.autograph.experimental.do_not_convert
-def loss_inputs(x, xs, x_pred, c, nu_cat) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+def whiten(z, u=None):
+    """Apply the lower-triangular whitening ``U`` to ``z = r / sigma``.
+
+    ``u`` holds ``U = L_R^-1`` for a catalog that quotes covariances -- its four
+    diagonal entries followed by the six strict-lower ones (see
+    ``prep.transforms.covariance_to_whitening``). For every other catalog it is the
+    identity: ``m = 1`` on the diagonal and ``0`` off it, so this returns ``z``
+    unchanged (adding 0.0 and multiplying by 1.0 are exact). The diagonal
+    approximation is therefore a special case of the same arithmetic and not a
+    second code path.
+
+    ``U z`` is written out so that nothing is allocated per observation.
+    """
+    if u is None:
+        return z
+    z0 = z[:, 0]
+    z1 = z[:, 1]
+    z2 = z[:, 2]
+    y0 = u[:, 0] * z0
+    y1 = u[:, 4] * z0 + u[:, 1] * z1
+    y2 = u[:, 5] * z0 + u[:, 6] * z1 + u[:, 2] * z2
+    y3 = u[:, 7] * z0 + u[:, 8] * z1 + u[:, 9] * z2 + u[:, 3] * z[:, 3]
+    return tf.stack([y0, y1, y2, y3], axis=1)
+
+
+@tf.autograph.experimental.do_not_convert
+def precision_blocks(xs, u=None):
+    """``C^-1`` of every observation, ``(n, d, d)``, from sigma and the whitening.
+
+    ``C^-1 = D^-1 U^T U D^-1`` with ``D = diag(sigma)``, which for the identity
+    ``U`` is ``diag(1 / sigma^2)``.
+    """
+    inv_sigma = 1.0 / xs
+    if u is None:
+        return tf.linalg.diag(inv_sigma**2)
+    zero = tf.zeros_like(u[:, 0])
+    rows = [
+        [u[:, 0], zero, zero, zero],
+        [u[:, 4], u[:, 1], zero, zero],
+        [u[:, 5], u[:, 6], u[:, 2], zero],
+        [u[:, 7], u[:, 8], u[:, 9], u[:, 3]],
+    ]
+    matrix = tf.stack([tf.stack(row, axis=1) for row in rows], axis=1)  # (n, d, d)
+    q = tf.linalg.matmul(matrix, matrix, transpose_a=True)
+    return q * inv_sigma[:, :, None] * inv_sigma[:, None, :]
+
+
+@tf.autograph.experimental.do_not_convert
+def loss_inputs(x, xs, x_pred, c, nu_cat, u=None) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """``(chi2, d, nu)`` of every observation.
 
-    ``chi2`` is the squared Mahalanobis residual; ``d`` is the number of parameters
-    the catalog measures, which is the dimension of the Student's t; ``nu`` is the
-    catalog's degrees of freedom, gathered by the observation's catalog index.
+    ``chi2`` is the squared Mahalanobis residual, ``r^T C^-1 r`` with
+    ``r = x - x_pred``; ``d`` is the number of parameters the catalog measures,
+    which is the dimension of the Student's t; ``nu`` is the catalog's degrees of
+    freedom, gathered by the observation's catalog index. ``u`` is the whitening
+    correction of a catalog that quotes covariances, and zero (or ``None``) for
+    the rest.
     """
-    chi2_obs = tf.reduce_sum((x - x_pred) ** 2 / xs**2, axis=1)
+    chi2_obs = tf.reduce_sum(whiten((x - x_pred) / xs, u)**2, axis=1)
     d_obs = tf.reduce_sum(tf.cast(xs < MISSING, tf.float32), axis=1)
     return chi2_obs, d_obs, tf.gather(nu_cat, c)
 
@@ -89,23 +149,24 @@ def data_weight(chi2_obs, d_obs, nu_obs, *, data_term: str = "student_t",
 
 
 @tf.autograph.experimental.do_not_convert
-def normal_equations(x, xs, x_pred, jac, weight, star) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+def normal_equations(x, xs, x_pred, jac, weight, star, u=None) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """Per-star ``(A, b)`` of the Gauss-Newton step in ``y``.
 
-    With ``C = diag(sigma^2)`` diagonal, the normal equations of one observation are
-    ``J^T W J`` and ``J^T W (x - x_pred)``, ``W = w / sigma^2`` elementwise, where
-    ``w`` is the curvature of the data term (:func:`data_weight`) so that the step is
-    the exact minimiser of that loss and not merely of a quadratic stand-in. The
-    weight is an argument rather than something recomputed here, so the loss and the
-    step cannot drift apart.
+    The normal equations of one observation are ``J^T w C^-1 J`` and
+    ``J^T w C^-1 (x - x_pred)``, where ``w`` is the curvature of the data term
+    (:func:`data_weight`) so that the step is the exact minimiser of that loss and
+    not merely of a quadratic stand-in, and ``C^-1`` comes from the uncertainty and
+    (for a catalog that quotes one) its covariance. With a diagonal ``C`` this is
+    ``J^T diag(w / sigma^2) J``, exactly as before. The weight is an argument rather
+    than something recomputed here, so the loss and the step cannot drift apart.
 
     Returns the summed matrices ``(n_star, n_dim, n_dim)``, the vectors
     ``(n_star, n_dim)`` and the ``tf.unique`` of the star index.
     """
-    weight = weight[:, None] / xs**2
+    precision = precision_blocks(xs, u) * weight[:, None, None]
     dx = x - x_pred
-    A = tf.einsum("npa,np,npb->nab", jac, weight, jac)
-    b = tf.einsum("npa,np,np->na", jac, weight, dx)
+    A = tf.einsum("npa,npq,nqb->nab", jac, precision, jac)
+    b = tf.einsum("npa,npq,nq->na", jac, precision, dx)
     uniq, inv = tf.unique(star)
     n = tf.size(uniq)
     return (
