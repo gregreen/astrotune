@@ -376,6 +376,7 @@ def build_control_points(
 def build_training_data(
     tables=None,
     *,
+    keys: Optional[Sequence[str]] = None,
     seed: int = DEFAULT_SEED,
     dedupe: str = "none",
     dispersed_xerr: str = "per-catalog",
@@ -390,14 +391,20 @@ def build_training_data(
     ``X_ERR_DISPERSED``, not their errors). ``dispersed_xerr="uniform"`` gives
     the legacy uniform 0.2 instead of the per-catalog values.
 
+    ``keys`` overrides the catalog list and its order, which is what the
+    category index in ``obs_dict["c"]`` refers to. The default is
+    :data:`registry.CATALOGS`, i.e. the catalogs the model has; passing
+    ``registry.keys() + registry.candidate_keys()`` builds the same file with the
+    candidate catalogs included, which is what the catalog graph needs (a trained
+    model cannot use such a file: its category count differs).
+
     ``sigma_source="delta"`` (with ``delta_dir``) replaces each catalog's
     ``sigma_x`` by the calibrated sigma of a trained delta model before the
     observations are built: that is one half of the iteration described in
     ``porting_project.md`` (bijector -> delta -> bijector).
     """
-    keys = None
+    keys = registry.keys() if keys is None else tuple(keys)
     if tables is None:
-        keys = registry.keys()
         tables = load_tables(keys, dedupe=dedupe, sigma_source=sigma_source,
                              delta_dir=delta_dir, delta_model_type=delta_model_type)
     rng = np.random.default_rng(seed)
@@ -545,7 +552,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "exactly one model; if the requested type is not there, the available ones "
         "are listed",
     )
+    parser.add_argument(
+        "--include", nargs="+", default=(), metavar="KEY",
+        help="also add these candidate catalogs, appended after the model's own "
+        "(registry.CANDIDATES). The file then has more categories than the model "
+        "and cannot be used for training; it is for diagnostics such as "
+        "astrotune-catalog-graph",
+    )
     args = parser.parse_args(argv)
+
+    keys = registry.keys() + tuple(args.include)
+    known = set(registry.keys()) | set(registry.candidate_keys())
+    unknown = [k for k in keys if k not in known]
+    if unknown:
+        parser.error(f"unknown catalog(s): {', '.join(unknown)}")
+    for k in args.include:
+        if not config.catalog_path(k).exists():
+            parser.error(f"{k} has no prepared table; run astrotune-prepare {k}")
 
     if args.sigma_source == "delta" and args.delta_dir is None:
         parser.error("--sigma-source delta needs --delta-dir")
@@ -562,6 +585,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         model_type = saved_model_type(model_dir)
         log.info("delta model: %s in %s", model_type, model_dir)
     obs_dict, ctrl_dict = build_training_data(
+        keys=keys,
         seed=args.seed, dedupe=args.dedupe, dispersed_xerr=args.dispersed_xerr,
         sigma_source=args.sigma_source, delta_dir=args.delta_dir,
         delta_model_type=model_type or None,
@@ -581,7 +605,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # structure in the stellar parameters, a network can, and later analysis
         # needs to know which one it is looking at.
         delta_model_type=model_type,
-        catalogs=",".join(registry.keys()),
+        catalogs=",".join(keys),
         error_floors=",".join(f"{v:g}" for v in config.ERROR_FLOORS),
         n_stars=n_stars,
     )
@@ -589,7 +613,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # The tail that was fitted together with the sigma, so that the latent
         # stage reads the calibrated sigmas through the likelihood they were
         # calibrated under (see ``astrotune.train_latent.resolve_nu``).
-        nus = delta_nu(args.delta_dir, keys=registry.keys(), model_type=model_type)
+        nus = delta_nu(args.delta_dir, keys=keys, model_type=model_type)
         if nus:
             attrs["nu"] = ",".join(f"{nus[k]:.6g}" for k in registry.keys())
             log.info(

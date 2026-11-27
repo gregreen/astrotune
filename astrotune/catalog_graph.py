@@ -66,7 +66,7 @@ log = logging.getLogger(__name__)
 #: Which spectra a catalog is based on (nodes of one family share a color)
 FAMILIES: Dict[str, Tuple[str, ...]] = {
     "APOGEE": ("apogee_dr17", "sdssv_aspcap", "sdssv_apogeenet"),
-    "BOSS": ("sdssv_bossnet", "sdssv_slam", "sdssv_mdc", "sdssv_clam"),
+    "BOSS": ("sdssv_bossnet", "sdssv_slam", "sdssv_mdc", "sdssv_clam", "mastar"),
     "LAMOST": (
         "lamost_mrs", "lamost_hotpayne", "lamost_ddp_dr9", "lamost_mstar_ding2022",
         "vmp_stars_li2022", "lamost_csn_dr10", "lamost_mstar_li2025",
@@ -916,6 +916,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="draw straight edges instead of curving them around unrelated nodes")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--recount", action="store_true", help="recompute the counts instead of reusing the JSON")
+    parser.add_argument(
+        "--name", default=None,
+        help="base name of the figure (default: catalog_graph_<layout>); use it to "
+        "write an alternative catalog set next to the canonical one",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -930,7 +935,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if data is None:
         data = compute_overlaps()
         json.dump(data, open(path, "w"))
-    info = plot_graph(data, args.out_dir / f"catalog_graph_{args.layout}", args.min_shared, args.layout,
+    info = plot_graph(data, args.out_dir / (args.name or f"catalog_graph_{args.layout}"),
+                      args.min_shared, args.layout,
                       args.top_k, args.restarts, args.seed, curved=not args.straight_edges)
     plot_matrix(data, args.out_dir / "catalog_matrix")
     table_path = args.out_dir / "catalog_pagerank.ecsv"
