@@ -215,6 +215,7 @@ assemble → validate → save → diagnostics → parity check.
 | `sigma_x` | `(n, d)` quoted σ, rescaled by the catalog's `UNC_SCALES`, then floored |
 | `cov_x` | `(n, d, d)` the same uncertainties as a covariance, carrying the catalog's own correlations. Present only for catalogs that quote them (`sdssv_clam` so far); `sigma_x` is always its marginal. |
 | `sigma_x_raw` | `(n, d)` quoted σ in our units, no rescale, no floor |
+| `cov_x_raw` | `(n, d, d)` the quoted covariance in our units, no rescale, no floor — the counterpart of `sigma_x_raw`, and present exactly when `cov_x` is. `sigma_x_raw` is its marginal. The delta model fits its correlated term from this block: fitted to `cov_x` it would be fitting its own previous output. |
 | `x_err` | `(n, d)` regularization error: a prior on how far the map may move a star |
 | extras | e.g. `ra_gdr3`, `dec_gdr3`, `ra`, `dec` |
 
@@ -243,8 +244,11 @@ Decisions that matter:
   covariance is scaled by a congruence and not by an opaque per-row call.
 * **Two sigmas.** The bijector trains on `sigma_x` (scaled and floored); the
   delta model learns from `sigma_x_raw` (quoted only), because its job is to
-  discover the scale and the additive term itself. Mixing them up gives a
-  silently biased answer and no error message.
+  discover the scale and the additive term itself. The same split holds for a
+  covariance: `cov_x_raw` is what the catalog quoted and `cov_x` is that block
+  after the rescale and the floors, and the delta model reads the raw one — a
+  model that fitted `cov_x` would be fitting its own previous output. Mixing
+  the two up gives a silently biased answer and no error message.
 * **Unmeasured parameters** are `x = 0`, `sigma_x = x_err = 1e9` — never 0 — so
   they vanish from quadratic forms without masks; `1e6` is the "missing"
   threshold on the evidence side.

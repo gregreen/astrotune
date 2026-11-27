@@ -141,6 +141,31 @@ def test_covariance_is_scaled_floored_and_consistent_with_sigma():
     assert np.all(np.linalg.eigvalsh(block) > 0)
 
 
+def test_the_quoted_covariance_is_kept_unscaled_as_cov_x_raw():
+    """``cov_x_raw`` is what the catalog quoted, in our units, and is what the
+    delta model fits its correlated term from. It must therefore be free of the
+    rescale and of the floors -- a delta model fitted to ``cov_x`` would be
+    fitting its own previous output -- while still being safe to invert."""
+    from astrotune.prep import transforms
+
+    cov = np.diag([20.0**2, 0.02**2, 0.03**2, 0.01**2])
+    cov[1, 3] = cov[3, 1] = -0.9 * np.sqrt(cov[1, 1] * cov[3, 3])
+    _, _, table = _run([_row(0, cov=cov)])
+    assert "cov_x_raw" in table.colnames
+    raw = np.asarray(table["cov_x_raw"], dtype="f8")
+    sigma_raw = np.asarray(table["sigma_x_raw"], dtype="f8")
+
+    # The quoted errors, untouched: the same marginals as sigma_x_raw ...
+    assert np.allclose(transforms.covariance_to_sigma(raw), sigma_raw, rtol=1e-6)
+    # ... and the quoted correlation, undiluted by the floors.
+    corr = transforms.covariance_to_correlation(raw)
+    assert abs(corr[0, 1, 3] + 0.9) < 1e-4
+    # The rescale and the floors do show up in cov_x, so the two differ.
+    floored = np.asarray(table["cov_x"], dtype="f8")
+    assert not np.allclose(raw, floored)
+    assert np.all(np.linalg.eigvalsh(raw) > 0)
+
+
 def test_hot_stars_get_larger_regularization_errors():
     _, _, table = _run([_row(0), _row(1, teff=7000.0)])
     cool, hot = table["x_err"][0], table["x_err"][1]

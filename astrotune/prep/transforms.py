@@ -12,6 +12,11 @@ Every catalog ends up in the same on-disk format:
 ``d`` is 4 (Teff, [Fe/H], logg, [alpha/Fe]) or 3 when [alpha/Fe] is absent.
 ``sigma_x`` is always present and always the marginal of ``cov_x`` (where there
 is one): it is what every consumer that wants one number per parameter uses.
+
+The same pair exists without the catalog's own rescale and without the error
+floors -- ``sigma_x_raw`` and ``cov_x_raw`` -- because the delta model's job is
+to discover those two things and it cannot discover them from its own output.
+The bijector reads the scaled-and-floored pair, the delta model the raw one.
 """
 
 from __future__ import annotations
@@ -292,8 +297,11 @@ def extract_table(
         Optional column holding the catalog's ``(n, d, d)`` covariance in the
         canonical order. When given, ``cov_x`` is written: propagated through
         ``param_cov_transf``, then scaled and floored by :func:`scale_covariance`
-        with ``cov_scales``/``cov_floors``. ``sigma_x`` is written either way and
-        stays consistent with it (same scales, same floors).
+        with ``cov_scales``/``cov_floors``. ``cov_x_raw`` is the same block
+        before either, in our parameter units -- what the catalog actually
+        quoted, and what the delta model fits its correlated term from.
+        ``sigma_x`` is written either way and stays consistent with ``cov_x``
+        (same scales, same floors).
     mask
         Additional boolean mask over the input table (e.g. quality cuts).
     """
@@ -366,6 +374,12 @@ def extract_table(
             )
         if param_cov_transf is not None:
             cov = param_cov_transf(cov, unmask(t[param_keys[0]][valid]))
+        # What the catalog reported, in our units: no rescale, no floor. Stored
+        # as float32 and clamped once more on the rounded values, because that
+        # is what every later reader will see (the same two steps as ``cov_x``).
+        out["cov_x_raw"] = scale_covariance(
+            scale_covariance(cov).astype("f4").astype("f8")
+        ).astype("f4")
         block = scale_covariance(cov, cov_scales, cov_floors)
         out["cov_x"] = scale_covariance(block.astype("f4").astype("f8")).astype("f4")
     return out
